@@ -17,7 +17,9 @@ from ...sim import (
 )
 from ..solver import SolverBase
 from .ipbf_kernels import (
+    compute_density_and_neighbor_count,
     initialize_guess_positions,
+    initialize_density_and_neighbor_count,
     predict_inertial_positions,
     update_velocity_from_positions,
 )
@@ -85,6 +87,7 @@ class SolverIPBF(SolverBase):
             - ``ipbf:x_guess``: Current relaxed Jacobi iterate
             - ``ipbf:x_new``: Updated relaxed Jacobi iterate
             - ``ipbf:density``: Current SPH density estimate :math:`\\rho_i` [kg/m^3]
+            - ``ipbf:neighbor_count``: Number of active neighboring particles inside the support radius
             - ``ipbf:hessian``: Local 3x3 Hessian approximation :math:`H_i`
             - ``ipbf:delta_q``: Local position increment :math:`\\Delta x_i`
         """
@@ -149,6 +152,14 @@ class SolverIPBF(SolverBase):
                 assignment=Model.AttributeAssignment.STATE,
                 dtype=wp.float32,
                 default=0.0,
+                namespace="ipbf",
+            ),
+            ModelBuilder.CustomAttribute(
+                name="neighbor_count",
+                frequency=Model.AttributeFrequency.PARTICLE,
+                assignment=Model.AttributeAssignment.STATE,
+                dtype=wp.int32,
+                default=0,
                 namespace="ipbf",
             ),
             ModelBuilder.CustomAttribute(
@@ -233,6 +244,10 @@ class SolverIPBF(SolverBase):
             device=self.model.device,
         )
 
+        state_out.ipbf.density.zero_()
+        state_out.ipbf.neighbor_count.zero_()
+        state_out.ipbf.delta_q.zero_()
+
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
             with wp.ScopedDevice(self.model.device):
                 self.model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
@@ -252,8 +267,9 @@ class SolverIPBF(SolverBase):
             1. Compute inertial target positions ``y``.
             2. Initialize ``x_guess <- y``.
             3. Build/update the particle hash grid from ``x_guess``.
-            4. Run relaxed Jacobi iterations to compute densities, Hessians, and
-               local updates ``delta_q``.
+            4. Query neighbors and compute density estimates from the hash grid.
+            5. Run relaxed Jacobi iterations to compute Hessians and local
+               updates ``delta_q``.
             5. Commit ``x_new`` to ``state_out.particle_q``.
             6. Reconstruct velocities from position changes and apply optional
                artificial damping.
@@ -263,11 +279,13 @@ class SolverIPBF(SolverBase):
 
         1. Predict inertial target positions ``y``.
         2. Initialize ``x_guess`` and ``x_new`` from ``y``.
-        3. Commit ``x_new`` to ``state_out.particle_q``.
-        4. Reconstruct ``state_out.particle_qd`` from position changes.
+        3. Build/update the particle hash grid from ``x_guess``.
+        4. Compute neighbor counts and SPH density estimates.
+        5. Commit ``x_new`` to ``state_out.particle_q``.
+        6. Reconstruct ``state_out.particle_qd`` from position changes.
 
-        Pressure iterations, density evaluation, Hessian assembly, and relaxed
-        Jacobi updates will be added on top of this scaffold.
+        Hessian assembly, pressure iterations, and relaxed Jacobi updates will
+        be added on top of this scaffold.
         """
         if state_in.particle_q is None or state_in.particle_qd is None:
             raise ValueError("SolverIPBF requires particle positions and velocities.")
@@ -314,6 +332,33 @@ class SolverIPBF(SolverBase):
             with wp.ScopedDevice(model.device):
                 model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
 
+            wp.launch(
+                compute_density_and_neighbor_count,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    state_out.ipbf.x_guess,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    self.smoothing_radius,
+                ],
+                outputs=[state_out.ipbf.density, state_out.ipbf.neighbor_count],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                initialize_density_and_neighbor_count,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_mass,
+                    model.particle_flags,
+                    self.smoothing_radius,
+                ],
+                outputs=[state_out.ipbf.density, state_out.ipbf.neighbor_count],
+                device=model.device,
+            )
+
         state_out.particle_q.assign(state_out.ipbf.x_new)
         wp.launch(
             update_velocity_from_positions,
@@ -328,5 +373,4 @@ class SolverIPBF(SolverBase):
             device=model.device,
         )
 
-        state_out.ipbf.density.zero_()
         state_out.ipbf.delta_q.zero_()

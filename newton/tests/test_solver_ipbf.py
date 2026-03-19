@@ -8,6 +8,16 @@ from newton.solvers import SolverIPBF
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
+def poly6_density(mass: float, support_radius: float, distance: float) -> float:
+    """Reference 3D poly6 density contribution used by the IPBF kernels."""
+    if support_radius <= 0.0 or distance >= support_radius:
+        return 0.0
+
+    support_radius2 = support_radius * support_radius
+    x = support_radius2 - distance * distance
+    return mass * 315.0 / (64.0 * np.pi * support_radius**9) * x**3
+
+
 def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
@@ -45,13 +55,15 @@ def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device)
 
     expected_y = np.array([0.0, 1.0 - 9.81 * dt * dt, 0.0], dtype=np.float32)
     expected_v = np.array([0.0, -9.81 * dt, 0.0], dtype=np.float32)
+    expected_density = poly6_density(2.0, config.smoothing_radius, 0.0)
 
     np.testing.assert_allclose(state_1.ipbf.y.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.ipbf.x_guess.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.ipbf.x_new.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.particle_q.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.particle_qd.numpy()[0], expected_v, rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(state_1.ipbf.density.numpy(), np.zeros(1, dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(state_1.ipbf.density.numpy(), np.array([expected_density], dtype=np.float32), rtol=1e-5, atol=1e-5)
+    np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.array([0], dtype=np.int32))
     np.testing.assert_allclose(state_1.ipbf.delta_q.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
 
 
@@ -110,6 +122,8 @@ def test_ipbf_multi_particle_shell_step_builds_neighbor_search(test, device):
 
     q = state_0.particle_q.numpy()
     qd = state_0.particle_qd.numpy()
+    density = state_0.ipbf.density.numpy()
+    neighbor_count = state_0.ipbf.neighbor_count.numpy()
 
     test.assertEqual(q.shape, (2, 3))
     test.assertEqual(qd.shape, (2, 3))
@@ -119,6 +133,9 @@ def test_ipbf_multi_particle_shell_step_builds_neighbor_search(test, device):
     test.assertAlmostEqual(q[1, 0], 0.05, places=5)
     test.assertAlmostEqual(q[0, 1], q[1, 1], places=5)
     test.assertAlmostEqual(qd[0, 1], qd[1, 1], places=5)
+    np.testing.assert_array_equal(neighbor_count, np.array([1, 1], dtype=np.int32))
+    np.testing.assert_allclose(density[0], density[1], rtol=1e-5, atol=1e-5)
+    test.assertGreater(float(density[0]), 0.0)
 
 
 def test_ipbf_reset_restores_initial_particle_state(test, device):
@@ -163,6 +180,7 @@ def test_ipbf_reset_restores_initial_particle_state(test, device):
     np.testing.assert_allclose(state_1.ipbf.x_guess.numpy(), q_initial, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.x_new.numpy(), q_initial, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.density.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.zeros(2, dtype=np.int32))
     np.testing.assert_allclose(state_1.ipbf.delta_q.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
 
 
