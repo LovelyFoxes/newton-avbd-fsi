@@ -199,6 +199,44 @@ class SolverIPBF(SolverBase):
         model.ipbf.smoothing_radius.fill_(self.smoothing_radius)
         model.ipbf.compliance.fill_(self.compliance)
 
+        self._initial_state = model.state()
+
+        if model.particle_count > 1 and model.particle_grid is not None:
+            with wp.ScopedDevice(model.device):
+                model.particle_grid.reserve(model.particle_count)
+
+    def reset(self, state_out: State) -> None:
+        """Reset a state to the solver's initial particle configuration.
+
+        Args:
+            state_out: State to overwrite with the initial particle positions [m],
+                velocities [m/s], zeroed forces [N], and initialized IPBF
+                scratch buffers.
+        """
+        if state_out.particle_q is None or state_out.particle_qd is None or state_out.particle_f is None:
+            raise ValueError("SolverIPBF.reset() requires a writable particle state.")
+
+        if not hasattr(state_out, "ipbf"):
+            raise ValueError(
+                "State is missing IPBF attributes. "
+                "Rebuild the model with SolverIPBF.register_custom_attributes()."
+            )
+
+        state_out.assign(self._initial_state)
+        state_out.ipbf.y.assign(state_out.particle_q)
+
+        wp.launch(
+            initialize_guess_positions,
+            dim=self.model.particle_count,
+            inputs=[state_out.ipbf.y],
+            outputs=[state_out.ipbf.x_guess, state_out.ipbf.x_new],
+            device=self.model.device,
+        )
+
+        if self.model.particle_count > 1 and self.model.particle_grid is not None:
+            with wp.ScopedDevice(self.model.device):
+                self.model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
+
     @override
     def step(
         self,
@@ -271,6 +309,10 @@ class SolverIPBF(SolverBase):
             outputs=[state_out.ipbf.x_guess, state_out.ipbf.x_new],
             device=model.device,
         )
+
+        if model.particle_count > 1 and model.particle_grid is not None:
+            with wp.ScopedDevice(model.device):
+                model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
 
         state_out.particle_q.assign(state_out.ipbf.x_new)
         wp.launch(
