@@ -1,4 +1,4 @@
-"""Implicit Position-Based Fluids solver."""
+﻿"""Implicit Position-Based Fluids solver."""
 
 from __future__ import annotations
 
@@ -16,6 +16,11 @@ from ...sim import (
     State,
 )
 from ..solver import SolverBase
+from .ipbf_kernels import (
+    initialize_guess_positions,
+    predict_inertial_positions,
+    update_velocity_from_positions,
+)
 
 __all__ = ["SolverIPBF"]
 
@@ -184,13 +189,15 @@ class SolverIPBF(SolverBase):
         self.damping_compliance = float(self.config.damping_compliance)
         self.damping_beta = float(self.config.damping_beta)
 
-        if hasattr(model, "ipbf"):
-            if hasattr(model.ipbf, "rest_density"):
-                model.ipbf.rest_density.fill_(self.rest_density)
-            if hasattr(model.ipbf, "smoothing_radius"):
-                model.ipbf.smoothing_radius.fill_(self.smoothing_radius)
-            if hasattr(model.ipbf, "compliance"):
-                model.ipbf.compliance.fill_(self.compliance)
+        if not hasattr(model, "ipbf"):
+            raise ValueError(
+                "SolverIPBF requires IPBF custom attributes. "
+                "Call SolverIPBF.register_custom_attributes(builder) before finalize()."
+            )
+
+        model.ipbf.rest_density.fill_(self.rest_density)
+        model.ipbf.smoothing_radius.fill_(self.smoothing_radius)
+        model.ipbf.compliance.fill_(self.compliance)
 
     @override
     def step(
@@ -203,16 +210,81 @@ class SolverIPBF(SolverBase):
     ) -> None:
         """Advance the simulation by one timestep.
 
-        This is intentionally a minimal placeholder. A practical first
-        implementation usually follows this structure:
+        TODO:
+            1. Compute inertial target positions ``y``.
+            2. Initialize ``x_guess <- y``.
+            3. Build/update the particle hash grid from ``x_guess``.
+            4. Run relaxed Jacobi iterations to compute densities, Hessians, and
+               local updates ``delta_q``.
+            5. Commit ``x_new`` to ``state_out.particle_q``.
+            6. Reconstruct velocities from position changes and apply optional
+               artificial damping.
 
-        1. Compute inertial target positions ``y``.
-        2. Initialize ``x_guess <- y``.
-        3. Build/update the particle hash grid from ``x_guess``.
-        4. Run relaxed Jacobi iterations to compute densities, Hessians, and
-           local updates ``delta_q``.
-        5. Commit ``x_new`` to ``state_out.particle_q``.
-        6. Reconstruct velocities from position changes and apply optional
-           artificial damping.
+        The current implementation is intentionally minimal and only executes
+        the shell of an IPBF step:
+
+        1. Predict inertial target positions ``y``.
+        2. Initialize ``x_guess`` and ``x_new`` from ``y``.
+        3. Commit ``x_new`` to ``state_out.particle_q``.
+        4. Reconstruct ``state_out.particle_qd`` from position changes.
+
+        Pressure iterations, density evaluation, Hessian assembly, and relaxed
+        Jacobi updates will be added on top of this scaffold.
         """
-        raise NotImplementedError("SolverIPBF.step() has not been implemented yet.")
+        if state_in.particle_q is None or state_in.particle_qd is None:
+            raise ValueError("SolverIPBF requires particle positions and velocities.")
+
+        if state_in.particle_f is None or state_out.particle_q is None or state_out.particle_qd is None:
+            raise ValueError("SolverIPBF requires particle forces and writable output particle state.")
+
+        if not hasattr(state_out, "ipbf"):
+            raise ValueError("State is missing IPBF attributes. Rebuild the model with SolverIPBF.register_custom_attributes().")
+
+        model = self.model
+        if model.particle_count == 0:
+            return
+
+        state_out.particle_q.assign(state_in.particle_q)
+        state_out.particle_qd.assign(state_in.particle_qd)
+
+        wp.launch(
+            predict_inertial_positions,
+            dim=model.particle_count,
+            inputs=[
+                state_in.particle_q,
+                state_in.particle_qd,
+                state_in.particle_f,
+                model.particle_inv_mass,
+                model.particle_flags,
+                model.particle_world,
+                model.gravity,
+                dt,
+            ],
+            outputs=[state_out.ipbf.y],
+            device=model.device,
+        )
+
+        wp.launch(
+            initialize_guess_positions,
+            dim=model.particle_count,
+            inputs=[state_out.ipbf.y],
+            outputs=[state_out.ipbf.x_guess, state_out.ipbf.x_new],
+            device=model.device,
+        )
+
+        state_out.particle_q.assign(state_out.ipbf.x_new)
+        wp.launch(
+            update_velocity_from_positions,
+            dim=model.particle_count,
+            inputs=[
+                state_out.ipbf.x_new,
+                state_in.particle_q,
+                model.particle_flags,
+                dt,
+            ],
+            outputs=[state_out.particle_qd],
+            device=model.device,
+        )
+
+        state_out.ipbf.density.zero_()
+        state_out.ipbf.delta_q.zero_()

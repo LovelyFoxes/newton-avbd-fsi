@@ -12,6 +12,7 @@ wheels/
 # Tool cache
 .cache/
 .thumbs/
+.warp-cache/
 
 # Coverage reports
 .coverage
