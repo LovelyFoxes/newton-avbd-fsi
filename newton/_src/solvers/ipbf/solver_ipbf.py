@@ -17,6 +17,7 @@ from ...sim import (
 )
 from ..solver import SolverBase
 from .ipbf_kernels import (
+    apply_relaxed_jacobi_update,
     compute_constraint_and_gradient,
     compute_density_and_neighbor_count,
     compute_force,
@@ -25,6 +26,7 @@ from .ipbf_kernels import (
     initialize_constraint_and_gradient,
     initialize_density_and_neighbor_count,
     predict_inertial_positions,
+    solve_local_system,
     update_velocity_from_positions,
 )
 
@@ -290,6 +292,116 @@ class SolverIPBF(SolverBase):
             with wp.ScopedDevice(self.model.device):
                 self.model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
 
+    def _compute_iteration_fields(
+        self,
+        state: State,
+        particle_q: wp.array(dtype=wp.vec3),
+        dt: float,
+    ) -> None:
+        """Assemble IPBF local solve quantities for the given particle positions.
+
+        Args:
+            state: State whose ``ipbf`` buffers receive the assembled quantities.
+            particle_q: Current particle positions [m] used to build the local
+                IPBF system.
+            dt: Timestep size [s].
+        """
+        model = self.model
+
+        if model.particle_count > 1 and model.particle_grid is not None:
+            with wp.ScopedDevice(model.device):
+                model.particle_grid.build(particle_q, radius=self.smoothing_radius)
+
+            wp.launch(
+                compute_density_and_neighbor_count,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    particle_q,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    self.smoothing_radius,
+                ],
+                outputs=[state.ipbf.density, state.ipbf.neighbor_count],
+                device=model.device,
+            )
+
+            wp.launch(
+                compute_constraint_and_gradient,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    particle_q,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    state.ipbf.density,
+                    self.rest_density,
+                    self.smoothing_radius,
+                    int(self.use_constraint_clamp),
+                ],
+                outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                initialize_density_and_neighbor_count,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_mass,
+                    model.particle_flags,
+                    self.smoothing_radius,
+                ],
+                outputs=[state.ipbf.density, state.ipbf.neighbor_count],
+                device=model.device,
+            )
+
+            wp.launch(
+                initialize_constraint_and_gradient,
+                dim=model.particle_count,
+                inputs=[
+                    state.ipbf.density,
+                    model.particle_flags,
+                    self.rest_density,
+                    int(self.use_constraint_clamp),
+                ],
+                outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
+                device=model.device,
+            )
+
+        wp.launch(
+            compute_force,
+            dim=model.particle_count,
+            inputs=[
+                particle_q,
+                state.ipbf.y,
+                model.particle_mass,
+                model.particle_flags,
+                state.ipbf.constraint,
+                state.ipbf.constraint_gradient,
+                self.compliance,
+                dt,
+            ],
+            outputs=[state.ipbf.force],
+            device=model.device,
+        )
+
+        wp.launch(
+            compute_hessian,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_mass,
+                model.particle_flags,
+                state.ipbf.constraint_gradient,
+                self.compliance,
+                dt,
+                self.hessian_regularization,
+            ],
+            outputs=[state.ipbf.hessian],
+            device=model.device,
+        )
+
     @override
     def step(
         self,
@@ -301,32 +413,20 @@ class SolverIPBF(SolverBase):
     ) -> None:
         """Advance the simulation by one timestep.
 
-        TODO:
-            1. Compute inertial target positions ``y``.
-            2. Initialize ``x_guess <- y``.
-            3. Build/update the particle hash grid from ``x_guess``.
-            4. Query neighbors and compute density estimates from the hash grid.
-            5. Compute density constraints and constraint gradients.
-            6. Assemble local force and Hessian terms.
-            7. Run relaxed Jacobi iterations to solve for local updates ``delta_q``.
-            8. Commit ``x_new`` to ``state_out.particle_q``.
-            9. Reconstruct velocities from position changes and apply optional
-               artificial damping.
-
-        The current implementation is intentionally minimal and only executes
-        the shell of an IPBF step:
+        The current implementation follows the first iterative IPBF scaffold:
 
         1. Predict inertial target positions ``y``.
         2. Initialize ``x_guess`` and ``x_new`` from ``y``.
-        3. Build/update the particle hash grid from ``x_guess``.
-        4. Compute neighbor counts and SPH density estimates.
-        5. Compute density constraints and constraint gradients.
-        6. Assemble local force and Hessian terms.
-        7. Commit ``x_new`` to ``state_out.particle_q``.
-        8. Reconstruct ``state_out.particle_qd`` from position changes.
+        3. Assemble density, constraint, force, and Hessian terms on ``x_guess``.
+        4. Solve the local 3x3 system for ``delta_q``.
+        5. Apply a relaxed Jacobi position update to form ``x_new``.
+        6. Repeat for ``iterations`` rounds.
+        7. Recompute the diagnostic fields on the final positions.
+        8. Commit the converged positions and reconstruct velocities.
 
-        The local solve for ``delta_q`` and the relaxed Jacobi iteration loop
-        will be added on top of this scaffold.
+        The current force and Hessian use a first-pass stable approximation.
+        The full paper-specific Hessian refinement and artificial damping are
+        still to be added.
         """
         if state_in.particle_q is None or state_in.particle_qd is None:
             raise ValueError("SolverIPBF requires particle positions and velocities.")
@@ -369,106 +469,48 @@ class SolverIPBF(SolverBase):
             device=model.device,
         )
 
-        if model.particle_count > 1 and model.particle_grid is not None:
-            with wp.ScopedDevice(model.device):
-                model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
-
-            wp.launch(
-                compute_density_and_neighbor_count,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_grid.id,
-                    state_out.ipbf.x_guess,
-                    model.particle_mass,
-                    model.particle_flags,
-                    model.particle_world,
-                    self.smoothing_radius,
-                ],
-                outputs=[state_out.ipbf.density, state_out.ipbf.neighbor_count],
-                device=model.device,
-            )
-
-            wp.launch(
-                compute_constraint_and_gradient,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_grid.id,
-                    state_out.ipbf.x_guess,
-                    model.particle_mass,
-                    model.particle_flags,
-                    model.particle_world,
-                    state_out.ipbf.density,
-                    self.rest_density,
-                    self.smoothing_radius,
-                    int(self.use_constraint_clamp),
-                ],
-                outputs=[state_out.ipbf.constraint, state_out.ipbf.constraint_gradient],
-                device=model.device,
-            )
+        if self.iterations <= 0:
+            self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
+            state_out.ipbf.delta_q.zero_()
         else:
-            wp.launch(
-                initialize_density_and_neighbor_count,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_mass,
-                    model.particle_flags,
-                    self.smoothing_radius,
-                ],
-                outputs=[state_out.ipbf.density, state_out.ipbf.neighbor_count],
-                device=model.device,
-            )
+            for _ in range(self.iterations):
+                self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
 
-            wp.launch(
-                initialize_constraint_and_gradient,
-                dim=model.particle_count,
-                inputs=[
-                    state_out.ipbf.density,
-                    model.particle_flags,
-                    self.rest_density,
-                    int(self.use_constraint_clamp),
-                ],
-                outputs=[state_out.ipbf.constraint, state_out.ipbf.constraint_gradient],
-                device=model.device,
-            )
+                wp.launch(
+                    solve_local_system,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_flags,
+                        state_out.ipbf.force,
+                        state_out.ipbf.hessian,
+                    ],
+                    outputs=[state_out.ipbf.delta_q],
+                    device=model.device,
+                )
 
-        wp.launch(
-            compute_force,
-            dim=model.particle_count,
-            inputs=[
-                state_out.ipbf.x_guess,
-                state_out.ipbf.y,
-                model.particle_mass,
-                model.particle_flags,
-                state_out.ipbf.constraint,
-                state_out.ipbf.constraint_gradient,
-                self.compliance,
-                dt,
-            ],
-            outputs=[state_out.ipbf.force],
-            device=model.device,
-        )
+                wp.launch(
+                    apply_relaxed_jacobi_update,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_flags,
+                        state_out.ipbf.x_guess,
+                        state_out.ipbf.delta_q,
+                        self.relaxation,
+                    ],
+                    outputs=[state_out.ipbf.x_new],
+                    device=model.device,
+                )
 
-        wp.launch(
-            compute_hessian,
-            dim=model.particle_count,
-            inputs=[
-                model.particle_mass,
-                model.particle_flags,
-                state_out.ipbf.constraint_gradient,
-                self.compliance,
-                dt,
-                self.hessian_regularization,
-            ],
-            outputs=[state_out.ipbf.hessian],
-            device=model.device,
-        )
+                state_out.ipbf.x_guess.assign(state_out.ipbf.x_new)
 
-        state_out.particle_q.assign(state_out.ipbf.x_new)
+            self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
+
+        state_out.particle_q.assign(state_out.ipbf.x_guess)
         wp.launch(
             update_velocity_from_positions,
             dim=model.particle_count,
             inputs=[
-                state_out.ipbf.x_new,
+                state_out.ipbf.x_guess,
                 state_in.particle_q,
                 model.particle_flags,
                 dt,
@@ -476,5 +518,3 @@ class SolverIPBF(SolverBase):
             outputs=[state_out.particle_qd],
             device=model.device,
         )
-
-        state_out.ipbf.delta_q.zero_()

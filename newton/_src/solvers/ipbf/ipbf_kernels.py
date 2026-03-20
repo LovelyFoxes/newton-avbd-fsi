@@ -289,6 +289,46 @@ def compute_hessian(
 
 
 @wp.kernel
+def solve_local_system(
+    particle_flags: wp.array(dtype=wp.int32),
+    force: wp.array(dtype=wp.vec3),
+    hessian: wp.array(dtype=wp.mat33),
+    delta_q: wp.array(dtype=wp.vec3),
+):
+    """Solve the per-particle 3x3 linear system for the local position update."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        delta_q[tid] = wp.vec3(0.0)
+        return
+
+    h = hessian[tid]
+    if abs(wp.determinant(h)) <= 1.0e-8:
+        delta_q[tid] = wp.vec3(0.0)
+        return
+
+    delta_q[tid] = wp.inverse(h) * force[tid]
+
+
+@wp.kernel
+def apply_relaxed_jacobi_update(
+    particle_flags: wp.array(dtype=wp.int32),
+    x_guess: wp.array(dtype=wp.vec3),
+    delta_q: wp.array(dtype=wp.vec3),
+    relaxation: float,
+    x_new: wp.array(dtype=wp.vec3),
+):
+    """Apply a relaxed Jacobi position update to form the next iterate."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        x_new[tid] = x_guess[tid]
+        return
+
+    x_new[tid] = x_guess[tid] + relaxation * delta_q[tid]
+
+
+@wp.kernel
 def update_velocity_from_positions(
     x_new: wp.array(dtype=wp.vec3),
     x_old: wp.array(dtype=wp.vec3),

@@ -1,10 +1,9 @@
 ###########################################################################
 # Example Basic IPBF Particles
 #
-# Minimal viewer example for the current IPBF solver shell.
-# At this stage the solver only performs inertial prediction, initializes
-# iterative buffers, builds the particle hash grid, and writes the predicted
-# positions/velocities back to the output state.
+# Minimal viewer example for the current IPBF solver prototype.
+# The current implementation performs inertial prediction and a first-pass
+# relaxed Jacobi local solve using the IPBF scaffolding.
 #
 # Command: python -m newton.examples basic_ipbf_particles
 #

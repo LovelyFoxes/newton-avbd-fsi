@@ -43,6 +43,14 @@ def expected_ipbf_hessian(
     )
 
 
+def expected_ipbf_delta(force: np.ndarray, hessian: np.ndarray) -> np.ndarray:
+    """Reference local IPBF position update used by the current skeleton."""
+    if abs(float(np.linalg.det(hessian))) <= 1.0e-8:
+        return np.zeros(3, dtype=np.float32)
+
+    return np.linalg.solve(hessian, force).astype(np.float32)
+
+
 def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
@@ -142,7 +150,7 @@ def test_ipbf_multi_particle_shell_step_builds_neighbor_search(test, device):
         model,
         SolverIPBF.Config(
             smoothing_radius=0.2,
-            iterations=2,
+            iterations=0,
         ),
     )
 
@@ -207,6 +215,7 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
             rest_density=rest_density,
             smoothing_radius=support_radius,
             hessian_regularization=regularization,
+            iterations=0,
             use_constraint_clamp=False,
         ),
     )
@@ -263,6 +272,94 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
     np.testing.assert_allclose(hessian[0], expected_hessian_0, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(hessian[1], expected_hessian_1, rtol=1e-5, atol=1e-5)
     test.assertGreater(float(constraint[0]), 0.0)
+
+
+def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(-0.05, 1.0, 0.0),
+            wp.vec3(0.05, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0],
+        radius=[0.05, 0.05],
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    rest_density = 1.0
+    support_radius = 0.2
+    relaxation = 0.5
+    regularization = 1.0e-6
+    dt = 0.05
+
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=rest_density,
+            smoothing_radius=support_radius,
+            hessian_regularization=regularization,
+            iterations=1,
+            relaxation=relaxation,
+            use_constraint_clamp=False,
+        ),
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+
+    distance = 0.1
+    expected_density = poly6_density(1.0, support_radius, 0.0) + poly6_density(1.0, support_radius, distance)
+    expected_constraint = expected_density / rest_density - 1.0
+    expected_gradient_0 = poly6_gradient_contribution(
+        1.0,
+        support_radius,
+        np.array([-distance, 0.0, 0.0], dtype=np.float32),
+    ) / rest_density
+    expected_gradient_1 = -expected_gradient_0
+    expected_force_0 = -expected_constraint * expected_gradient_0
+    expected_force_1 = -expected_constraint * expected_gradient_1
+    expected_hessian_0 = expected_ipbf_hessian(
+        expected_gradient_0,
+        mass=1.0,
+        compliance=0.0,
+        dt=dt,
+        regularization=regularization,
+    )
+    expected_hessian_1 = expected_ipbf_hessian(
+        expected_gradient_1,
+        mass=1.0,
+        compliance=0.0,
+        dt=dt,
+        regularization=regularization,
+    )
+    expected_delta_0 = expected_ipbf_delta(expected_force_0, expected_hessian_0)
+    expected_delta_1 = expected_ipbf_delta(expected_force_1, expected_hessian_1)
+    expected_q_0 = np.array([-0.05, 1.0, 0.0], dtype=np.float32) + relaxation * expected_delta_0
+    expected_q_1 = np.array([0.05, 1.0, 0.0], dtype=np.float32) + relaxation * expected_delta_1
+    expected_qd_0 = relaxation * expected_delta_0 / dt
+    expected_qd_1 = relaxation * expected_delta_1 / dt
+
+    np.testing.assert_allclose(state_1.ipbf.delta_q.numpy()[0], expected_delta_0, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(state_1.ipbf.delta_q.numpy()[1], expected_delta_1, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(state_1.particle_q.numpy()[0], expected_q_0, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(state_1.particle_q.numpy()[1], expected_q_1, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(state_1.ipbf.x_guess.numpy()[0], expected_q_0, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(state_1.ipbf.x_guess.numpy()[1], expected_q_1, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(state_1.particle_qd.numpy()[0], expected_qd_0, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(state_1.particle_qd.numpy()[1], expected_qd_1, rtol=1e-5, atol=1e-5)
+    test.assertLess(float(state_1.particle_q.numpy()[0, 0]), -0.05)
+    test.assertGreater(float(state_1.particle_q.numpy()[1, 0]), 0.05)
 
 
 def test_ipbf_reset_restores_initial_particle_state(test, device):
@@ -349,6 +446,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_computes_constraint_and_gradient",
     test_ipbf_computes_constraint_and_gradient,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_single_iteration_applies_relaxed_jacobi_update",
+    test_ipbf_single_iteration_applies_relaxed_jacobi_update,
     devices=devices,
     check_output=False,
 )
