@@ -29,6 +29,20 @@ def poly6_gradient_contribution(mass: float, support_radius: float, displacement
     return (mass * scale * displacement).astype(np.float32)
 
 
+def expected_ipbf_hessian(
+    gradient: np.ndarray,
+    mass: float,
+    compliance: float,
+    dt: float,
+    regularization: float,
+) -> np.ndarray:
+    """Reference first-pass IPBF Hessian used by the current skeleton."""
+    inertia_scale = 0.0 if dt <= 0.0 else compliance * mass / (dt * dt)
+    return ((inertia_scale + regularization) * np.eye(3, dtype=np.float32) + np.outer(gradient, gradient)).astype(
+        np.float32
+    )
+
+
 def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device):
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
@@ -47,6 +61,7 @@ def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device)
         rest_density=1234.0,
         smoothing_radius=0.25,
         compliance=0.125,
+        hessian_regularization=1.0e-6,
     )
     solver = SolverIPBF(model, config)
 
@@ -67,6 +82,13 @@ def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device)
     expected_y = np.array([0.0, 1.0 - 9.81 * dt * dt, 0.0], dtype=np.float32)
     expected_v = np.array([0.0, -9.81 * dt, 0.0], dtype=np.float32)
     expected_density = poly6_density(2.0, config.smoothing_radius, 0.0)
+    expected_hessian = expected_ipbf_hessian(
+        np.zeros(3, dtype=np.float32),
+        mass=2.0,
+        compliance=config.compliance,
+        dt=dt,
+        regularization=config.hessian_regularization,
+    )
 
     np.testing.assert_allclose(state_1.ipbf.y.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.ipbf.x_guess.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
@@ -77,6 +99,8 @@ def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device)
     np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.array([0], dtype=np.int32))
     np.testing.assert_allclose(state_1.ipbf.constraint.numpy(), np.zeros(1, dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.constraint_gradient.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(state_1.ipbf.force.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(state_1.ipbf.hessian.numpy()[0], expected_hessian, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.ipbf.delta_q.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
 
 
@@ -151,6 +175,7 @@ def test_ipbf_multi_particle_shell_step_builds_neighbor_search(test, device):
     test.assertGreater(float(density[0]), 0.0)
     np.testing.assert_allclose(state_0.ipbf.constraint.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_0.ipbf.constraint_gradient.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(state_0.ipbf.force.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
 
 
 def test_ipbf_computes_constraint_and_gradient(test, device):
@@ -175,11 +200,13 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
 
     rest_density = 1.0
     support_radius = 0.2
+    regularization = 1.0e-6
     solver = SolverIPBF(
         model,
         SolverIPBF.Config(
             rest_density=rest_density,
             smoothing_radius=support_radius,
+            hessian_regularization=regularization,
             use_constraint_clamp=False,
         ),
     )
@@ -193,6 +220,8 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
     density = state_1.ipbf.density.numpy()
     constraint = state_1.ipbf.constraint.numpy()
     constraint_gradient = state_1.ipbf.constraint_gradient.numpy()
+    force = state_1.ipbf.force.numpy()
+    hessian = state_1.ipbf.hessian.numpy()
 
     distance = 0.1
     expected_density = poly6_density(1.0, support_radius, 0.0) + poly6_density(1.0, support_radius, distance)
@@ -203,6 +232,22 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         np.array([-distance, 0.0, 0.0], dtype=np.float32),
     ) / rest_density
     expected_gradient_1 = -expected_gradient_0
+    expected_force_0 = -expected_constraint * expected_gradient_0
+    expected_force_1 = -expected_constraint * expected_gradient_1
+    expected_hessian_0 = expected_ipbf_hessian(
+        expected_gradient_0,
+        mass=1.0,
+        compliance=0.0,
+        dt=0.05,
+        regularization=regularization,
+    )
+    expected_hessian_1 = expected_ipbf_hessian(
+        expected_gradient_1,
+        mass=1.0,
+        compliance=0.0,
+        dt=0.05,
+        regularization=regularization,
+    )
 
     np.testing.assert_allclose(density, np.array([expected_density, expected_density], dtype=np.float32), rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(
@@ -213,6 +258,10 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
     )
     np.testing.assert_allclose(constraint_gradient[0], expected_gradient_0, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(constraint_gradient[1], expected_gradient_1, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(force[0], expected_force_0, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(force[1], expected_force_1, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(hessian[0], expected_hessian_0, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(hessian[1], expected_hessian_1, rtol=1e-5, atol=1e-5)
     test.assertGreater(float(constraint[0]), 0.0)
 
 
@@ -261,6 +310,7 @@ def test_ipbf_reset_restores_initial_particle_state(test, device):
     np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.zeros(2, dtype=np.int32))
     np.testing.assert_allclose(state_1.ipbf.constraint.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.constraint_gradient.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(state_1.ipbf.force.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.delta_q.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
 
 

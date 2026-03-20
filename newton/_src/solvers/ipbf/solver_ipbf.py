@@ -19,6 +19,8 @@ from ..solver import SolverBase
 from .ipbf_kernels import (
     compute_constraint_and_gradient,
     compute_density_and_neighbor_count,
+    compute_force,
+    compute_hessian,
     initialize_guess_positions,
     initialize_constraint_and_gradient,
     initialize_density_and_neighbor_count,
@@ -53,6 +55,8 @@ class SolverIPBF(SolverBase):
             rest_density: Fluid rest density [kg/m^3].
             smoothing_radius: SPH kernel support radius [m].
             compliance: Normalized compliance parameter ``alpha = 1 / k``.
+            hessian_regularization: Small diagonal regularization added to the
+                local Hessian to keep it invertible.
             iterations: Number of relaxed Jacobi iterations.
             relaxation: Position update relaxation factor. The paper uses 0.5.
             use_constraint_clamp: Clamp negative density constraints at free
@@ -65,6 +69,7 @@ class SolverIPBF(SolverBase):
         rest_density: float = 1000.0
         smoothing_radius: float = 0.1
         compliance: float = 0.0
+        hessian_regularization: float = 1.0e-6
         iterations: int = 3
         relaxation: float = 0.5
         use_constraint_clamp: bool = True
@@ -92,6 +97,7 @@ class SolverIPBF(SolverBase):
             - ``ipbf:neighbor_count``: Number of active neighboring particles inside the support radius
             - ``ipbf:constraint``: Density constraint value :math:`C_i = \\rho_i / \\rho_0 - 1`
             - ``ipbf:constraint_gradient``: Local constraint gradient :math:`\\partial C_i / \\partial x_i`
+            - ``ipbf:force``: Local Newton-step force term :math:`f_i`
             - ``ipbf:hessian``: Local 3x3 Hessian approximation :math:`H_i`
             - ``ipbf:delta_q``: Local position increment :math:`\\Delta x_i`
         """
@@ -183,6 +189,14 @@ class SolverIPBF(SolverBase):
                 namespace="ipbf",
             ),
             ModelBuilder.CustomAttribute(
+                name="force",
+                frequency=Model.AttributeFrequency.PARTICLE,
+                assignment=Model.AttributeAssignment.STATE,
+                dtype=wp.vec3,
+                default=wp.vec3(0.0),
+                namespace="ipbf",
+            ),
+            ModelBuilder.CustomAttribute(
                 name="hessian",
                 frequency=Model.AttributeFrequency.PARTICLE,
                 assignment=Model.AttributeAssignment.STATE,
@@ -214,6 +228,7 @@ class SolverIPBF(SolverBase):
         self.rest_density = float(self.config.rest_density)
         self.smoothing_radius = float(self.config.smoothing_radius)
         self.compliance = float(self.config.compliance)
+        self.hessian_regularization = float(self.config.hessian_regularization)
         self.iterations = int(self.config.iterations)
         self.relaxation = float(self.config.relaxation)
         self.use_constraint_clamp = bool(self.config.use_constraint_clamp)
@@ -268,6 +283,7 @@ class SolverIPBF(SolverBase):
         state_out.ipbf.neighbor_count.zero_()
         state_out.ipbf.constraint.zero_()
         state_out.ipbf.constraint_gradient.zero_()
+        state_out.ipbf.force.zero_()
         state_out.ipbf.delta_q.zero_()
 
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
@@ -291,10 +307,10 @@ class SolverIPBF(SolverBase):
             3. Build/update the particle hash grid from ``x_guess``.
             4. Query neighbors and compute density estimates from the hash grid.
             5. Compute density constraints and constraint gradients.
-            6. Run relaxed Jacobi iterations to compute Hessians and local
-               updates ``delta_q``.
-            7. Commit ``x_new`` to ``state_out.particle_q``.
-            8. Reconstruct velocities from position changes and apply optional
+            6. Assemble local force and Hessian terms.
+            7. Run relaxed Jacobi iterations to solve for local updates ``delta_q``.
+            8. Commit ``x_new`` to ``state_out.particle_q``.
+            9. Reconstruct velocities from position changes and apply optional
                artificial damping.
 
         The current implementation is intentionally minimal and only executes
@@ -305,11 +321,12 @@ class SolverIPBF(SolverBase):
         3. Build/update the particle hash grid from ``x_guess``.
         4. Compute neighbor counts and SPH density estimates.
         5. Compute density constraints and constraint gradients.
-        6. Commit ``x_new`` to ``state_out.particle_q``.
-        7. Reconstruct ``state_out.particle_qd`` from position changes.
+        6. Assemble local force and Hessian terms.
+        7. Commit ``x_new`` to ``state_out.particle_q``.
+        8. Reconstruct ``state_out.particle_qd`` from position changes.
 
-        Hessian assembly, pressure iterations, and relaxed Jacobi updates will
-        be added on top of this scaffold.
+        The local solve for ``delta_q`` and the relaxed Jacobi iteration loop
+        will be added on top of this scaffold.
         """
         if state_in.particle_q is None or state_in.particle_qd is None:
             raise ValueError("SolverIPBF requires particle positions and velocities.")
@@ -413,6 +430,38 @@ class SolverIPBF(SolverBase):
                 outputs=[state_out.ipbf.constraint, state_out.ipbf.constraint_gradient],
                 device=model.device,
             )
+
+        wp.launch(
+            compute_force,
+            dim=model.particle_count,
+            inputs=[
+                state_out.ipbf.x_guess,
+                state_out.ipbf.y,
+                model.particle_mass,
+                model.particle_flags,
+                state_out.ipbf.constraint,
+                state_out.ipbf.constraint_gradient,
+                self.compliance,
+                dt,
+            ],
+            outputs=[state_out.ipbf.force],
+            device=model.device,
+        )
+
+        wp.launch(
+            compute_hessian,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_mass,
+                model.particle_flags,
+                state_out.ipbf.constraint_gradient,
+                self.compliance,
+                dt,
+                self.hessian_regularization,
+            ],
+            outputs=[state_out.ipbf.hessian],
+            device=model.device,
+        )
 
         state_out.particle_q.assign(state_out.ipbf.x_new)
         wp.launch(

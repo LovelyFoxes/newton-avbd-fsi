@@ -237,6 +237,58 @@ def compute_constraint_and_gradient(
 
 
 @wp.kernel
+def compute_force(
+    x_guess: wp.array(dtype=wp.vec3),
+    y: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    constraint: wp.array(dtype=float),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+    compliance: float,
+    dt: float,
+    force: wp.array(dtype=wp.vec3),
+):
+    """Compute the local IPBF force term used by the per-particle Newton step."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or dt <= 0.0:
+        force[tid] = wp.vec3(0.0)
+        return
+
+    inertia_scale = compliance * particle_mass[tid] / (dt * dt)
+    inertial_force = -inertia_scale * (x_guess[tid] - y[tid])
+    pressure_force = -constraint[tid] * constraint_gradient[tid]
+
+    force[tid] = inertial_force + pressure_force
+
+
+@wp.kernel
+def compute_hessian(
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+    compliance: float,
+    dt: float,
+    regularization: float,
+    hessian: wp.array(dtype=wp.mat33),
+):
+    """Compute a first SPD Hessian approximation for the local IPBF solve."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        hessian[tid] = wp.mat33(0.0)
+        return
+
+    inertia_scale = float(0.0)
+    if dt > 0.0:
+        inertia_scale = compliance * particle_mass[tid] / (dt * dt)
+
+    grad = constraint_gradient[tid]
+    identity = wp.identity(n=3, dtype=float)
+    hessian[tid] = (inertia_scale + regularization) * identity + wp.outer(grad, grad)
+
+
+@wp.kernel
 def update_velocity_from_positions(
     x_new: wp.array(dtype=wp.vec3),
     x_old: wp.array(dtype=wp.vec3),
