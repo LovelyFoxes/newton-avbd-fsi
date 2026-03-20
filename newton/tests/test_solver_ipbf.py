@@ -45,18 +45,42 @@ def kernel_hessian_reference(support_radius: float, displacement: np.ndarray) ->
     ).astype(np.float32)
 
 
+def expected_constraint_hessian(
+    masses: list[float],
+    support_radius: float,
+    displacements: list[np.ndarray],
+    rest_density: float,
+) -> np.ndarray:
+    """Reference constraint Hessian built from kernel Hessian contributions."""
+    if rest_density <= 0.0:
+        return np.zeros((3, 3), dtype=np.float32)
+
+    hessian = np.zeros((3, 3), dtype=np.float32)
+    for mass, displacement in zip(masses, displacements, strict=True):
+        hessian += mass * kernel_hessian_reference(support_radius, displacement)
+
+    return (hessian / rest_density).astype(np.float32)
+
+
 def expected_ipbf_hessian(
     gradient: np.ndarray,
     mass: float,
     compliance: float,
     dt: float,
     regularization: float,
+    constraint: float = 0.0,
+    constraint_hessian: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Reference first-pass IPBF Hessian used by the current skeleton."""
+    """Reference IPBF Hessian used by the current skeleton."""
     inertia_scale = 0.0 if dt <= 0.0 else compliance * mass / (dt * dt)
-    return ((inertia_scale + regularization) * np.eye(3, dtype=np.float32) + np.outer(gradient, gradient)).astype(
+    hessian = ((inertia_scale + regularization) * np.eye(3, dtype=np.float32) + np.outer(gradient, gradient)).astype(
         np.float32
     )
+
+    if constraint_hessian is not None and constraint != 0.0:
+        hessian += abs(constraint) * np.diag(np.linalg.norm(constraint_hessian, axis=0).astype(np.float32))
+
+    return hessian.astype(np.float32)
 
 
 def expected_ipbf_delta(force: np.ndarray, hessian: np.ndarray) -> np.ndarray:
@@ -323,6 +347,24 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         np.array([-distance, 0.0, 0.0], dtype=np.float32),
     ) / rest_density
     expected_gradient_1 = -expected_gradient_0
+    expected_constraint_hessian_0 = expected_constraint_hessian(
+        [1.0, 1.0],
+        support_radius,
+        [
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        ],
+        rest_density,
+    )
+    expected_constraint_hessian_1 = expected_constraint_hessian(
+        [1.0, 1.0],
+        support_radius,
+        [
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([distance, 0.0, 0.0], dtype=np.float32),
+        ],
+        rest_density,
+    )
     expected_force_0 = -expected_constraint * expected_gradient_0
     expected_force_1 = -expected_constraint * expected_gradient_1
     expected_hessian_0 = expected_ipbf_hessian(
@@ -331,6 +373,8 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         compliance=0.0,
         dt=0.05,
         regularization=regularization,
+        constraint=expected_constraint,
+        constraint_hessian=expected_constraint_hessian_0,
     )
     expected_hessian_1 = expected_ipbf_hessian(
         expected_gradient_1,
@@ -338,6 +382,8 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         compliance=0.0,
         dt=0.05,
         regularization=regularization,
+        constraint=expected_constraint,
+        constraint_hessian=expected_constraint_hessian_1,
     )
 
     np.testing.assert_allclose(density, np.array([expected_density, expected_density], dtype=np.float32), rtol=1e-5, atol=1e-5)
@@ -382,6 +428,24 @@ def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
         np.array([-distance, 0.0, 0.0], dtype=np.float32),
     ) / rest_density
     expected_gradient_1 = -expected_gradient_0
+    expected_constraint_hessian_0 = expected_constraint_hessian(
+        [1.0, 1.0],
+        support_radius,
+        [
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        ],
+        rest_density,
+    )
+    expected_constraint_hessian_1 = expected_constraint_hessian(
+        [1.0, 1.0],
+        support_radius,
+        [
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([distance, 0.0, 0.0], dtype=np.float32),
+        ],
+        rest_density,
+    )
     expected_force_0 = -expected_constraint * expected_gradient_0
     expected_force_1 = -expected_constraint * expected_gradient_1
     expected_hessian_0 = expected_ipbf_hessian(
@@ -390,6 +454,8 @@ def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
         compliance=0.0,
         dt=dt,
         regularization=regularization,
+        constraint=expected_constraint,
+        constraint_hessian=expected_constraint_hessian_0,
     )
     expected_hessian_1 = expected_ipbf_hessian(
         expected_gradient_1,
@@ -397,6 +463,8 @@ def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
         compliance=0.0,
         dt=dt,
         regularization=regularization,
+        constraint=expected_constraint,
+        constraint_hessian=expected_constraint_hessian_1,
     )
     expected_delta_0 = expected_ipbf_delta(expected_force_0, expected_hessian_0)
     expected_delta_1 = expected_ipbf_delta(expected_force_1, expected_hessian_1)

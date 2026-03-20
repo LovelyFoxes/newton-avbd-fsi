@@ -65,6 +65,15 @@ def kernel_hessian(displacement: wp.vec3, support_radius: float) -> wp.mat33:
     )
 
 
+@wp.func
+def diagonal_from_column_norms(matrix: wp.mat33) -> wp.mat33:
+    """Return a diagonal matrix whose entries are the Euclidean column norms."""
+    col0 = wp.sqrt(matrix[0, 0] * matrix[0, 0] + matrix[1, 0] * matrix[1, 0] + matrix[2, 0] * matrix[2, 0])
+    col1 = wp.sqrt(matrix[0, 1] * matrix[0, 1] + matrix[1, 1] * matrix[1, 1] + matrix[2, 1] * matrix[2, 1])
+    col2 = wp.sqrt(matrix[0, 2] * matrix[0, 2] + matrix[1, 2] * matrix[1, 2] + matrix[2, 2] * matrix[2, 2])
+    return wp.mat33(col0, 0.0, 0.0, 0.0, col1, 0.0, 0.0, 0.0, col2)
+
+
 @wp.kernel
 def predict_inertial_positions(
     particle_q: wp.array(dtype=wp.vec3),
@@ -289,15 +298,26 @@ def compute_force(
 
 @wp.kernel
 def compute_hessian(
+    grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    support_radius: float,
     compliance: float,
     dt: float,
     regularization: float,
     hessian: wp.array(dtype=wp.mat33),
 ):
-    """Compute a first SPD Hessian approximation for the local IPBF solve."""
+    """Compute a stable IPBF Hessian approximation for the local solve.
+
+    The current approximation keeps the Gauss-Newton term
+    ``grad(C_i) grad(C_i)^T`` and adds a positive diagonal approximation of the
+    second-order term based on the column norms of ``∇²C_i``.
+    """
     tid = wp.tid()
 
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
@@ -310,7 +330,68 @@ def compute_hessian(
 
     grad = constraint_gradient[tid]
     identity = wp.identity(n=3, dtype=float)
-    hessian[tid] = (inertia_scale + regularization) * identity + wp.outer(grad, grad)
+    h = (inertia_scale + regularization) * identity + wp.outer(grad, grad)
+
+    if rest_density <= 0.0 or constraint[tid] == 0.0:
+        hessian[tid] = h
+        return
+
+    xi = particle_q[tid]
+    world_i = particle_world[tid]
+    constraint_hessian = wp.mat33(0.0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+
+        world_j = particle_world[index]
+        if world_i >= 0 and world_j >= 0 and world_i != world_j:
+            continue
+
+        displacement = xi - particle_q[index]
+        constraint_hessian += particle_mass[index] * kernel_hessian(displacement, support_radius)
+
+    constraint_hessian = constraint_hessian / rest_density
+    h += wp.abs(constraint[tid]) * diagonal_from_column_norms(constraint_hessian)
+    hessian[tid] = h
+
+
+@wp.kernel
+def compute_hessian_without_grid(
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    constraint: wp.array(dtype=float),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    support_radius: float,
+    compliance: float,
+    dt: float,
+    regularization: float,
+    hessian: wp.array(dtype=wp.mat33),
+):
+    """Compute the local Hessian approximation for cases without a hash grid."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        hessian[tid] = wp.mat33(0.0)
+        return
+
+    inertia_scale = float(0.0)
+    if dt > 0.0:
+        inertia_scale = compliance * particle_mass[tid] / (dt * dt)
+
+    grad = constraint_gradient[tid]
+    identity = wp.identity(n=3, dtype=float)
+    h = (inertia_scale + regularization) * identity + wp.outer(grad, grad)
+
+    if rest_density > 0.0 and constraint[tid] != 0.0:
+        constraint_hessian = particle_mass[tid] * kernel_hessian(wp.vec3(0.0), support_radius) / rest_density
+        h += wp.abs(constraint[tid]) * diagonal_from_column_norms(constraint_hessian)
+
+    hessian[tid] = h
 
 
 @wp.kernel

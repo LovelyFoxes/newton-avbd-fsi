@@ -22,6 +22,7 @@ from .ipbf_kernels import (
     compute_density_and_neighbor_count,
     compute_force,
     compute_hessian,
+    compute_hessian_without_grid,
     initialize_guess_positions,
     initialize_constraint_and_gradient,
     initialize_density_and_neighbor_count,
@@ -387,20 +388,45 @@ class SolverIPBF(SolverBase):
             device=model.device,
         )
 
-        wp.launch(
-            compute_hessian,
-            dim=model.particle_count,
-            inputs=[
-                model.particle_mass,
-                model.particle_flags,
-                state.ipbf.constraint_gradient,
-                self.compliance,
-                dt,
-                self.hessian_regularization,
-            ],
-            outputs=[state.ipbf.hessian],
-            device=model.device,
-        )
+        if model.particle_count > 1 and model.particle_grid is not None:
+            wp.launch(
+                compute_hessian,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    particle_q,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    state.ipbf.constraint,
+                    state.ipbf.constraint_gradient,
+                    self.rest_density,
+                    self.smoothing_radius,
+                    self.compliance,
+                    dt,
+                    self.hessian_regularization,
+                ],
+                outputs=[state.ipbf.hessian],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                compute_hessian_without_grid,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_mass,
+                    model.particle_flags,
+                    state.ipbf.constraint,
+                    state.ipbf.constraint_gradient,
+                    self.rest_density,
+                    self.smoothing_radius,
+                    self.compliance,
+                    dt,
+                    self.hessian_regularization,
+                ],
+                outputs=[state.ipbf.hessian],
+                device=model.device,
+            )
 
     @override
     def step(
