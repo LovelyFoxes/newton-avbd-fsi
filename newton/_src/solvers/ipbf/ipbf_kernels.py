@@ -8,8 +8,11 @@ from ...geometry import ParticleFlags
 
 
 @wp.func
-def poly6_kernel(dist2: float, support_radius: float) -> float:
-    """Evaluate the 3D poly6 SPH kernel with compact support ``support_radius``."""
+def kernel_value(dist2: float, support_radius: float) -> float:
+    """Evaluate the current scalar SPH kernel value.
+
+    The current implementation uses the 3D poly6 kernel
+    """
     if support_radius <= 0.0:
         return 0.0
 
@@ -24,8 +27,8 @@ def poly6_kernel(dist2: float, support_radius: float) -> float:
 
 
 @wp.func
-def poly6_kernel_gradient(displacement: wp.vec3, support_radius: float) -> wp.vec3:
-    """Evaluate the spatial gradient of the 3D poly6 SPH kernel."""
+def kernel_gradient(displacement: wp.vec3, support_radius: float) -> wp.vec3:
+    """Evaluate the spatial gradient of the current SPH kernel."""
     if support_radius <= 0.0:
         return wp.vec3(0.0)
 
@@ -38,6 +41,28 @@ def poly6_kernel_gradient(displacement: wp.vec3, support_radius: float) -> wp.ve
     h9 = h3 * h3 * h3
     x = h2 - dist2
     return displacement * (-945.0 / (32.0 * wp.pi * h9) * x * x)
+
+
+@wp.func
+def kernel_hessian(displacement: wp.vec3, support_radius: float) -> wp.mat33:
+    """Evaluate the spatial Hessian of the current scalar SPH kernel."""
+    if support_radius <= 0.0:
+        return wp.mat33(0.0)
+
+    dist2 = wp.dot(displacement, displacement)
+    h2 = support_radius * support_radius
+    if dist2 >= h2:
+        return wp.mat33(0.0)
+
+    h3 = h2 * support_radius
+    h9 = h3 * h3 * h3
+    x = h2 - dist2
+    identity = wp.identity(n=3, dtype=float)
+
+    return (
+        -945.0 / (32.0 * wp.pi * h9) * x * x * identity
+        + 945.0 / (8.0 * wp.pi * h9) * x * wp.outer(displacement, displacement)
+    )
 
 
 @wp.kernel
@@ -108,7 +133,7 @@ def initialize_density_and_neighbor_count(
         neighbor_count[tid] = 0
         return
 
-    density[tid] = particle_mass[tid] * poly6_kernel(0.0, support_radius)
+    density[tid] = particle_mass[tid] * kernel_value(0.0, support_radius)
     neighbor_count[tid] = 0
 
 
@@ -174,7 +199,7 @@ def compute_density_and_neighbor_count(
 
         dist = xi - particle_q[index]
         dist2 = wp.dot(dist, dist)
-        kernel = poly6_kernel(dist2, support_radius)
+        kernel = kernel_value(dist2, support_radius)
         if kernel <= 0.0:
             continue
 
@@ -230,7 +255,7 @@ def compute_constraint_and_gradient(
             continue
 
         displacement = xi - particle_q[index]
-        grad += particle_mass[index] * poly6_kernel_gradient(displacement, support_radius)
+        grad += particle_mass[index] * kernel_gradient(displacement, support_radius)
 
     constraint[tid] = c
     constraint_gradient[tid] = grad / rest_density

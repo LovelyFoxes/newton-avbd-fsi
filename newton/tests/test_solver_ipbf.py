@@ -4,12 +4,13 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.solvers.ipbf.ipbf_kernels import kernel_gradient, kernel_hessian, kernel_value
 from newton.solvers import SolverIPBF
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
-def poly6_density(mass: float, support_radius: float, distance: float) -> float:
-    """Reference 3D poly6 density contribution used by the IPBF kernels."""
+def kernel_density_contribution(mass: float, support_radius: float, distance: float) -> float:
+    """Reference scalar kernel density contribution used by the IPBF kernels."""
     if support_radius <= 0.0 or distance >= support_radius:
         return 0.0
 
@@ -18,8 +19,8 @@ def poly6_density(mass: float, support_radius: float, distance: float) -> float:
     return mass * 315.0 / (64.0 * np.pi * support_radius**9) * x**3
 
 
-def poly6_gradient_contribution(mass: float, support_radius: float, displacement: np.ndarray) -> np.ndarray:
-    """Reference 3D poly6 gradient contribution used by the IPBF kernels."""
+def kernel_gradient_contribution(mass: float, support_radius: float, displacement: np.ndarray) -> np.ndarray:
+    """Reference spatial kernel gradient contribution used by the IPBF kernels."""
     distance2 = float(np.dot(displacement, displacement))
     if support_radius <= 0.0 or distance2 >= support_radius * support_radius or distance2 == 0.0:
         return np.zeros(3, dtype=np.float32)
@@ -27,6 +28,21 @@ def poly6_gradient_contribution(mass: float, support_radius: float, displacement
     x = support_radius * support_radius - distance2
     scale = -945.0 / (32.0 * np.pi * support_radius**9) * x * x
     return (mass * scale * displacement).astype(np.float32)
+
+
+def kernel_hessian_reference(support_radius: float, displacement: np.ndarray) -> np.ndarray:
+    """Reference spatial kernel Hessian used by the IPBF kernels."""
+    distance2 = float(np.dot(displacement, displacement))
+    if support_radius <= 0.0 or distance2 >= support_radius * support_radius:
+        return np.zeros((3, 3), dtype=np.float32)
+
+    x = support_radius * support_radius - distance2
+    identity = np.eye(3, dtype=np.float32)
+    outer = np.outer(displacement, displacement)
+    return (
+        -945.0 / (32.0 * np.pi * support_radius**9) * x * x * identity
+        + 945.0 / (8.0 * np.pi * support_radius**9) * x * outer
+    ).astype(np.float32)
 
 
 def expected_ipbf_hessian(
@@ -49,6 +65,70 @@ def expected_ipbf_delta(force: np.ndarray, hessian: np.ndarray) -> np.ndarray:
         return np.zeros(3, dtype=np.float32)
 
     return np.linalg.solve(hessian, force).astype(np.float32)
+
+
+@wp.kernel
+def evaluate_kernel_interface(
+    displacement: wp.array(dtype=wp.vec3),
+    support_radius: float,
+    value: wp.array(dtype=float),
+    gradient: wp.array(dtype=wp.vec3),
+    hessian: wp.array(dtype=wp.mat33),
+):
+    """Evaluate the current kernel interface for a set of query displacements."""
+    tid = wp.tid()
+    disp = displacement[tid]
+    value[tid] = kernel_value(wp.dot(disp, disp), support_radius)
+    gradient[tid] = kernel_gradient(disp, support_radius)
+    hessian[tid] = kernel_hessian(disp, support_radius)
+
+
+def run_two_particle_ipbf_step(
+    device,
+    *,
+    iterations: int,
+    relaxation: float,
+    rest_density: float = 1.0,
+    support_radius: float = 0.3,
+    regularization: float = 1.0e-6,
+):
+    """Run one zero-gravity IPBF step for a symmetric two-particle setup."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(-0.05, 1.0, 0.0),
+            wp.vec3(0.05, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0],
+        radius=[0.05, 0.05],
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=rest_density,
+            smoothing_radius=support_radius,
+            hessian_regularization=regularization,
+            iterations=iterations,
+            relaxation=relaxation,
+            use_constraint_clamp=False,
+        ),
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+    return state_1
 
 
 def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device):
@@ -89,7 +169,7 @@ def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device)
 
     expected_y = np.array([0.0, 1.0 - 9.81 * dt * dt, 0.0], dtype=np.float32)
     expected_v = np.array([0.0, -9.81 * dt, 0.0], dtype=np.float32)
-    expected_density = poly6_density(2.0, config.smoothing_radius, 0.0)
+    expected_density = kernel_density_contribution(2.0, config.smoothing_radius, 0.0)
     expected_hessian = expected_ipbf_hessian(
         np.zeros(3, dtype=np.float32),
         mass=2.0,
@@ -233,9 +313,11 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
     hessian = state_1.ipbf.hessian.numpy()
 
     distance = 0.1
-    expected_density = poly6_density(1.0, support_radius, 0.0) + poly6_density(1.0, support_radius, distance)
+    expected_density = kernel_density_contribution(1.0, support_radius, 0.0) + kernel_density_contribution(
+        1.0, support_radius, distance
+    )
     expected_constraint = expected_density / rest_density - 1.0
-    expected_gradient_0 = poly6_gradient_contribution(
+    expected_gradient_0 = kernel_gradient_contribution(
         1.0,
         support_radius,
         np.array([-distance, 0.0, 0.0], dtype=np.float32),
@@ -275,53 +357,26 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
 
 
 def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
-    SolverIPBF.register_custom_attributes(builder)
-
-    builder.add_particles(
-        pos=[
-            wp.vec3(-0.05, 1.0, 0.0),
-            wp.vec3(0.05, 1.0, 0.0),
-        ],
-        vel=[
-            wp.vec3(0.0, 0.0, 0.0),
-            wp.vec3(0.0, 0.0, 0.0),
-        ],
-        mass=[1.0, 1.0],
-        radius=[0.05, 0.05],
-    )
-
-    model = builder.finalize(device=device)
-    model.set_gravity((0.0, 0.0, 0.0))
-
     rest_density = 1.0
     support_radius = 0.2
     relaxation = 0.5
     regularization = 1.0e-6
     dt = 0.05
-
-    solver = SolverIPBF(
-        model,
-        SolverIPBF.Config(
-            rest_density=rest_density,
-            smoothing_radius=support_radius,
-            hessian_regularization=regularization,
-            iterations=1,
-            relaxation=relaxation,
-            use_constraint_clamp=False,
-        ),
+    state_1 = run_two_particle_ipbf_step(
+        device,
+        iterations=1,
+        relaxation=relaxation,
+        rest_density=rest_density,
+        support_radius=support_radius,
+        regularization=regularization,
     )
 
-    state_0 = model.state()
-    state_1 = model.state()
-
-    state_0.clear_forces()
-    solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
-
     distance = 0.1
-    expected_density = poly6_density(1.0, support_radius, 0.0) + poly6_density(1.0, support_radius, distance)
+    expected_density = kernel_density_contribution(1.0, support_radius, 0.0) + kernel_density_contribution(
+        1.0, support_radius, distance
+    )
     expected_constraint = expected_density / rest_density - 1.0
-    expected_gradient_0 = poly6_gradient_contribution(
+    expected_gradient_0 = kernel_gradient_contribution(
         1.0,
         support_radius,
         np.array([-distance, 0.0, 0.0], dtype=np.float32),
@@ -360,6 +415,53 @@ def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
     np.testing.assert_allclose(state_1.particle_qd.numpy()[1], expected_qd_1, rtol=1e-5, atol=1e-5)
     test.assertLess(float(state_1.particle_q.numpy()[0, 0]), -0.05)
     test.assertGreater(float(state_1.particle_q.numpy()[1, 0]), 0.05)
+
+
+def test_ipbf_kernel_interface_matches_reference(test, device):
+    support_radius = 0.3
+    displacement = np.array([[0.05, -0.04, 0.02]], dtype=np.float32)
+
+    displacement_wp = wp.array(displacement, dtype=wp.vec3, device=device)
+    value_wp = wp.empty(1, dtype=float, device=device)
+    gradient_wp = wp.empty(1, dtype=wp.vec3, device=device)
+    hessian_wp = wp.empty(1, dtype=wp.mat33, device=device)
+
+    wp.launch(
+        evaluate_kernel_interface,
+        dim=1,
+        inputs=[displacement_wp, support_radius],
+        outputs=[value_wp, gradient_wp, hessian_wp],
+        device=device,
+    )
+
+    expected_value = kernel_density_contribution(1.0, support_radius, float(np.linalg.norm(displacement[0])))
+    expected_gradient = kernel_gradient_contribution(1.0, support_radius, displacement[0])
+    expected_hessian = kernel_hessian_reference(support_radius, displacement[0])
+
+    np.testing.assert_allclose(value_wp.numpy()[0], expected_value, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(gradient_wp.numpy()[0], expected_gradient, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(hessian_wp.numpy()[0], expected_hessian, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(hessian_wp.numpy()[0], hessian_wp.numpy()[0].T, rtol=1e-6, atol=1e-6)
+
+
+def test_ipbf_multiple_iterations_reduce_constraint_magnitude(test, device):
+    relaxation = 0.2
+    state_0 = run_two_particle_ipbf_step(device, iterations=0, relaxation=relaxation)
+    state_1 = run_two_particle_ipbf_step(device, iterations=1, relaxation=relaxation)
+    state_2 = run_two_particle_ipbf_step(device, iterations=2, relaxation=relaxation)
+
+    mean_abs_constraint_0 = float(np.mean(np.abs(state_0.ipbf.constraint.numpy())))
+    mean_abs_constraint_1 = float(np.mean(np.abs(state_1.ipbf.constraint.numpy())))
+    mean_abs_constraint_2 = float(np.mean(np.abs(state_2.ipbf.constraint.numpy())))
+
+    test.assertGreater(mean_abs_constraint_0, mean_abs_constraint_1)
+    test.assertGreater(mean_abs_constraint_1, mean_abs_constraint_2)
+    test.assertGreater(float(np.abs(state_1.ipbf.delta_q.numpy()).max()), 0.0)
+    test.assertGreater(float(np.abs(state_2.ipbf.delta_q.numpy()).max()), 0.0)
+    test.assertLess(float(state_1.particle_q.numpy()[0, 0]), -0.05)
+    test.assertLess(float(state_2.particle_q.numpy()[0, 0]), float(state_1.particle_q.numpy()[0, 0]))
+    test.assertGreater(float(state_1.particle_q.numpy()[1, 0]), 0.05)
+    test.assertGreater(float(state_2.particle_q.numpy()[1, 0]), float(state_1.particle_q.numpy()[1, 0]))
 
 
 def test_ipbf_reset_restores_initial_particle_state(test, device):
@@ -454,6 +556,22 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_single_iteration_applies_relaxed_jacobi_update",
     test_ipbf_single_iteration_applies_relaxed_jacobi_update,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_kernel_interface_matches_reference",
+    test_ipbf_kernel_interface_matches_reference,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_multiple_iterations_reduce_constraint_magnitude",
+    test_ipbf_multiple_iterations_reduce_constraint_magnitude,
     devices=devices,
     check_output=False,
 )
