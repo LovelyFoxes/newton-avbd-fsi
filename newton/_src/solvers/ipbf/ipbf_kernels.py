@@ -23,6 +23,23 @@ def poly6_kernel(dist2: float, support_radius: float) -> float:
     return 315.0 / (64.0 * wp.pi * h9) * x * x * x
 
 
+@wp.func
+def poly6_kernel_gradient(displacement: wp.vec3, support_radius: float) -> wp.vec3:
+    """Evaluate the spatial gradient of the 3D poly6 SPH kernel."""
+    if support_radius <= 0.0:
+        return wp.vec3(0.0)
+
+    dist2 = wp.dot(displacement, displacement)
+    h2 = support_radius * support_radius
+    if dist2 >= h2 or dist2 == 0.0:
+        return wp.vec3(0.0)
+
+    h3 = h2 * support_radius
+    h9 = h3 * h3 * h3
+    x = h2 - dist2
+    return displacement * (-945.0 / (32.0 * wp.pi * h9) * x * x)
+
+
 @wp.kernel
 def predict_inertial_positions(
     particle_q: wp.array(dtype=wp.vec3),
@@ -96,6 +113,31 @@ def initialize_density_and_neighbor_count(
 
 
 @wp.kernel
+def initialize_constraint_and_gradient(
+    density: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    rest_density: float,
+    use_constraint_clamp: int,
+    constraint: wp.array(dtype=float),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+):
+    """Initialize constraint values for states without a particle hash grid."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or rest_density <= 0.0:
+        constraint[tid] = 0.0
+        constraint_gradient[tid] = wp.vec3(0.0)
+        return
+
+    c = density[tid] / rest_density - 1.0
+    if use_constraint_clamp != 0 and c < 0.0:
+        c = 0.0
+
+    constraint[tid] = c
+    constraint_gradient[tid] = wp.vec3(0.0)
+
+
+@wp.kernel
 def compute_density_and_neighbor_count(
     grid: wp.uint64,
     particle_q: wp.array(dtype=wp.vec3),
@@ -142,6 +184,56 @@ def compute_density_and_neighbor_count(
 
     density[tid] = rho
     neighbor_count[tid] = count
+
+
+@wp.kernel
+def compute_constraint_and_gradient(
+    grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    density: wp.array(dtype=float),
+    rest_density: float,
+    support_radius: float,
+    use_constraint_clamp: int,
+    constraint: wp.array(dtype=float),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+):
+    """Compute density constraints and their local gradients from the hash grid."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or rest_density <= 0.0:
+        constraint[tid] = 0.0
+        constraint_gradient[tid] = wp.vec3(0.0)
+        return
+
+    c = density[tid] / rest_density - 1.0
+    if use_constraint_clamp != 0 and c < 0.0:
+        constraint[tid] = 0.0
+        constraint_gradient[tid] = wp.vec3(0.0)
+        return
+
+    xi = particle_q[tid]
+    world_i = particle_world[tid]
+    grad = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+
+        world_j = particle_world[index]
+        if world_i >= 0 and world_j >= 0 and world_i != world_j:
+            continue
+
+        displacement = xi - particle_q[index]
+        grad += particle_mass[index] * poly6_kernel_gradient(displacement, support_radius)
+
+    constraint[tid] = c
+    constraint_gradient[tid] = grad / rest_density
 
 
 @wp.kernel

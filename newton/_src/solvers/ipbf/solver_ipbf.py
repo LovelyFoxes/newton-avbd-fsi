@@ -17,8 +17,10 @@ from ...sim import (
 )
 from ..solver import SolverBase
 from .ipbf_kernels import (
+    compute_constraint_and_gradient,
     compute_density_and_neighbor_count,
     initialize_guess_positions,
+    initialize_constraint_and_gradient,
     initialize_density_and_neighbor_count,
     predict_inertial_positions,
     update_velocity_from_positions,
@@ -88,6 +90,8 @@ class SolverIPBF(SolverBase):
             - ``ipbf:x_new``: Updated relaxed Jacobi iterate
             - ``ipbf:density``: Current SPH density estimate :math:`\\rho_i` [kg/m^3]
             - ``ipbf:neighbor_count``: Number of active neighboring particles inside the support radius
+            - ``ipbf:constraint``: Density constraint value :math:`C_i = \\rho_i / \\rho_0 - 1`
+            - ``ipbf:constraint_gradient``: Local constraint gradient :math:`\\partial C_i / \\partial x_i`
             - ``ipbf:hessian``: Local 3x3 Hessian approximation :math:`H_i`
             - ``ipbf:delta_q``: Local position increment :math:`\\Delta x_i`
         """
@@ -160,6 +164,22 @@ class SolverIPBF(SolverBase):
                 assignment=Model.AttributeAssignment.STATE,
                 dtype=wp.int32,
                 default=0,
+                namespace="ipbf",
+            ),
+            ModelBuilder.CustomAttribute(
+                name="constraint",
+                frequency=Model.AttributeFrequency.PARTICLE,
+                assignment=Model.AttributeAssignment.STATE,
+                dtype=wp.float32,
+                default=0.0,
+                namespace="ipbf",
+            ),
+            ModelBuilder.CustomAttribute(
+                name="constraint_gradient",
+                frequency=Model.AttributeFrequency.PARTICLE,
+                assignment=Model.AttributeAssignment.STATE,
+                dtype=wp.vec3,
+                default=wp.vec3(0.0),
                 namespace="ipbf",
             ),
             ModelBuilder.CustomAttribute(
@@ -246,6 +266,8 @@ class SolverIPBF(SolverBase):
 
         state_out.ipbf.density.zero_()
         state_out.ipbf.neighbor_count.zero_()
+        state_out.ipbf.constraint.zero_()
+        state_out.ipbf.constraint_gradient.zero_()
         state_out.ipbf.delta_q.zero_()
 
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
@@ -268,10 +290,11 @@ class SolverIPBF(SolverBase):
             2. Initialize ``x_guess <- y``.
             3. Build/update the particle hash grid from ``x_guess``.
             4. Query neighbors and compute density estimates from the hash grid.
-            5. Run relaxed Jacobi iterations to compute Hessians and local
+            5. Compute density constraints and constraint gradients.
+            6. Run relaxed Jacobi iterations to compute Hessians and local
                updates ``delta_q``.
-            5. Commit ``x_new`` to ``state_out.particle_q``.
-            6. Reconstruct velocities from position changes and apply optional
+            7. Commit ``x_new`` to ``state_out.particle_q``.
+            8. Reconstruct velocities from position changes and apply optional
                artificial damping.
 
         The current implementation is intentionally minimal and only executes
@@ -281,8 +304,9 @@ class SolverIPBF(SolverBase):
         2. Initialize ``x_guess`` and ``x_new`` from ``y``.
         3. Build/update the particle hash grid from ``x_guess``.
         4. Compute neighbor counts and SPH density estimates.
-        5. Commit ``x_new`` to ``state_out.particle_q``.
-        6. Reconstruct ``state_out.particle_qd`` from position changes.
+        5. Compute density constraints and constraint gradients.
+        6. Commit ``x_new`` to ``state_out.particle_q``.
+        7. Reconstruct ``state_out.particle_qd`` from position changes.
 
         Hessian assembly, pressure iterations, and relaxed Jacobi updates will
         be added on top of this scaffold.
@@ -346,6 +370,24 @@ class SolverIPBF(SolverBase):
                 outputs=[state_out.ipbf.density, state_out.ipbf.neighbor_count],
                 device=model.device,
             )
+
+            wp.launch(
+                compute_constraint_and_gradient,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    state_out.ipbf.x_guess,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    state_out.ipbf.density,
+                    self.rest_density,
+                    self.smoothing_radius,
+                    int(self.use_constraint_clamp),
+                ],
+                outputs=[state_out.ipbf.constraint, state_out.ipbf.constraint_gradient],
+                device=model.device,
+            )
         else:
             wp.launch(
                 initialize_density_and_neighbor_count,
@@ -356,6 +398,19 @@ class SolverIPBF(SolverBase):
                     self.smoothing_radius,
                 ],
                 outputs=[state_out.ipbf.density, state_out.ipbf.neighbor_count],
+                device=model.device,
+            )
+
+            wp.launch(
+                initialize_constraint_and_gradient,
+                dim=model.particle_count,
+                inputs=[
+                    state_out.ipbf.density,
+                    model.particle_flags,
+                    self.rest_density,
+                    int(self.use_constraint_clamp),
+                ],
+                outputs=[state_out.ipbf.constraint, state_out.ipbf.constraint_gradient],
                 device=model.device,
             )
 
