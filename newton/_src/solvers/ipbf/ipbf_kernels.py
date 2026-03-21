@@ -414,6 +414,11 @@ def compute_hessian(
         if index != tid:
             neighbor_gradient = particle_mass[tid] * inv_rest_density * kernel_gradient(-displacement, support_radius)
             h += wp.outer(neighbor_gradient, neighbor_gradient)
+            if constraint[index] != 0.0:
+                neighbor_constraint_hessian = (
+                    particle_mass[tid] * inv_rest_density * kernel_hessian(-displacement, support_radius)
+                )
+                h += wp.abs(constraint[index]) * diagonal_from_column_norms(neighbor_constraint_hessian)
 
     constraint_hessian = constraint_hessian * inv_rest_density
     if constraint[tid] != 0.0:
