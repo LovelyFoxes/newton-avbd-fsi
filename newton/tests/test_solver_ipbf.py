@@ -91,6 +91,26 @@ def expected_ipbf_delta(force: np.ndarray, hessian: np.ndarray) -> np.ndarray:
     return np.linalg.solve(hessian, force).astype(np.float32)
 
 
+def expected_two_particle_force(
+    constraint_self: float,
+    gradient_self: np.ndarray,
+    constraint_neighbor: float,
+    support_radius: float,
+    displacement_neighbor_minus_self: np.ndarray,
+    rest_density: float,
+) -> np.ndarray:
+    """Reference two-particle IPBF force with neighbor constraint contributions."""
+    if rest_density <= 0.0:
+        return np.zeros(3, dtype=np.float32)
+
+    neighbor_term = (
+        constraint_neighbor
+        * kernel_gradient_contribution(1.0, support_radius, displacement_neighbor_minus_self)
+        / rest_density
+    )
+    return (-constraint_self * gradient_self + neighbor_term).astype(np.float32)
+
+
 @wp.kernel
 def evaluate_kernel_interface(
     displacement: wp.array(dtype=wp.vec3),
@@ -365,8 +385,22 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         ],
         rest_density,
     )
-    expected_force_0 = -expected_constraint * expected_gradient_0
-    expected_force_1 = -expected_constraint * expected_gradient_1
+    expected_force_0 = expected_two_particle_force(
+        expected_constraint,
+        expected_gradient_0,
+        expected_constraint,
+        support_radius,
+        np.array([distance, 0.0, 0.0], dtype=np.float32),
+        rest_density,
+    )
+    expected_force_1 = expected_two_particle_force(
+        expected_constraint,
+        expected_gradient_1,
+        expected_constraint,
+        support_radius,
+        np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        rest_density,
+    )
     expected_hessian_0 = expected_ipbf_hessian(
         expected_gradient_0,
         mass=1.0,
@@ -446,8 +480,22 @@ def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
         ],
         rest_density,
     )
-    expected_force_0 = -expected_constraint * expected_gradient_0
-    expected_force_1 = -expected_constraint * expected_gradient_1
+    expected_force_0 = expected_two_particle_force(
+        expected_constraint,
+        expected_gradient_0,
+        expected_constraint,
+        support_radius,
+        np.array([distance, 0.0, 0.0], dtype=np.float32),
+        rest_density,
+    )
+    expected_force_1 = expected_two_particle_force(
+        expected_constraint,
+        expected_gradient_1,
+        expected_constraint,
+        support_radius,
+        np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        rest_density,
+    )
     expected_hessian_0 = expected_ipbf_hessian(
         expected_gradient_0,
         mass=1.0,

@@ -272,6 +272,63 @@ def compute_constraint_and_gradient(
 
 @wp.kernel
 def compute_force(
+    grid: wp.uint64,
+    x_guess: wp.array(dtype=wp.vec3),
+    y: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    constraint: wp.array(dtype=float),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    support_radius: float,
+    compliance: float,
+    dt: float,
+    force: wp.array(dtype=wp.vec3),
+):
+    """Compute the local IPBF force term used by the per-particle Newton step.
+
+    The current implementation includes the self contribution from ``C_i`` and
+    the neighboring constraint contributions that depend on ``x_i``.
+    """
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or dt <= 0.0:
+        force[tid] = wp.vec3(0.0)
+        return
+
+    inertia_scale = compliance * particle_mass[tid] / (dt * dt)
+    inertial_force = -inertia_scale * (x_guess[tid] - y[tid])
+    pressure_force = -constraint[tid] * constraint_gradient[tid]
+
+    if rest_density > 0.0:
+        xi = x_guess[tid]
+        world_i = particle_world[tid]
+        inv_rest_density = 1.0 / rest_density
+
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        index = int(0)
+
+        while wp.hash_grid_query_next(query, index):
+            if index == tid or (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+                continue
+
+            world_j = particle_world[index]
+            if world_i >= 0 and world_j >= 0 and world_i != world_j:
+                continue
+
+            cj = constraint[index]
+            if cj == 0.0:
+                continue
+
+            displacement = x_guess[index] - xi
+            pressure_force += cj * particle_mass[tid] * inv_rest_density * kernel_gradient(displacement, support_radius)
+
+    force[tid] = inertial_force + pressure_force
+
+
+@wp.kernel
+def compute_force_without_grid(
     x_guess: wp.array(dtype=wp.vec3),
     y: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
@@ -282,7 +339,7 @@ def compute_force(
     dt: float,
     force: wp.array(dtype=wp.vec3),
 ):
-    """Compute the local IPBF force term used by the per-particle Newton step."""
+    """Compute the local IPBF force term for cases without a hash grid."""
     tid = wp.tid()
 
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or dt <= 0.0:

@@ -21,6 +21,7 @@ from .ipbf_kernels import (
     compute_constraint_and_gradient,
     compute_density_and_neighbor_count,
     compute_force,
+    compute_force_without_grid,
     compute_hessian,
     compute_hessian_without_grid,
     initialize_guess_positions,
@@ -371,24 +372,28 @@ class SolverIPBF(SolverBase):
                 device=model.device,
             )
 
-        wp.launch(
-            compute_force,
-            dim=model.particle_count,
-            inputs=[
-                particle_q,
-                state.ipbf.y,
-                model.particle_mass,
-                model.particle_flags,
-                state.ipbf.constraint,
-                state.ipbf.constraint_gradient,
-                self.compliance,
-                dt,
-            ],
-            outputs=[state.ipbf.force],
-            device=model.device,
-        )
-
         if model.particle_count > 1 and model.particle_grid is not None:
+            wp.launch(
+                compute_force,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    particle_q,
+                    state.ipbf.y,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    state.ipbf.constraint,
+                    state.ipbf.constraint_gradient,
+                    self.rest_density,
+                    self.smoothing_radius,
+                    self.compliance,
+                    dt,
+                ],
+                outputs=[state.ipbf.force],
+                device=model.device,
+            )
+
             wp.launch(
                 compute_hessian,
                 dim=model.particle_count,
@@ -410,6 +415,23 @@ class SolverIPBF(SolverBase):
                 device=model.device,
             )
         else:
+            wp.launch(
+                compute_force_without_grid,
+                dim=model.particle_count,
+                inputs=[
+                    particle_q,
+                    state.ipbf.y,
+                    model.particle_mass,
+                    model.particle_flags,
+                    state.ipbf.constraint,
+                    state.ipbf.constraint_gradient,
+                    self.compliance,
+                    dt,
+                ],
+                outputs=[state.ipbf.force],
+                device=model.device,
+            )
+
             wp.launch(
                 compute_hessian_without_grid,
                 dim=model.particle_count,
