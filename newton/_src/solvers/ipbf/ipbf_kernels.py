@@ -389,13 +389,14 @@ def compute_hessian(
     identity = wp.identity(n=3, dtype=float)
     h = (inertia_scale + regularization) * identity + wp.outer(grad, grad)
 
-    if rest_density <= 0.0 or constraint[tid] == 0.0:
+    if rest_density <= 0.0:
         hessian[tid] = h
         return
 
     xi = particle_q[tid]
     world_i = particle_world[tid]
     constraint_hessian = wp.mat33(0.0)
+    inv_rest_density = 1.0 / rest_density
 
     query = wp.hash_grid_query(grid, xi, support_radius)
     index = int(0)
@@ -410,9 +411,13 @@ def compute_hessian(
 
         displacement = xi - particle_q[index]
         constraint_hessian += particle_mass[index] * kernel_hessian(displacement, support_radius)
+        if index != tid:
+            neighbor_gradient = particle_mass[tid] * inv_rest_density * kernel_gradient(-displacement, support_radius)
+            h += wp.outer(neighbor_gradient, neighbor_gradient)
 
-    constraint_hessian = constraint_hessian / rest_density
-    h += wp.abs(constraint[tid]) * diagonal_from_column_norms(constraint_hessian)
+    constraint_hessian = constraint_hessian * inv_rest_density
+    if constraint[tid] != 0.0:
+        h += wp.abs(constraint[tid]) * diagonal_from_column_norms(constraint_hessian)
     hessian[tid] = h
 
 
