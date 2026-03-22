@@ -420,7 +420,7 @@ def run_ipbf_box_container_rollout(device, *, num_frames: int):
     """Run the public IPBF box-container example with a null viewer."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
-        example = ExampleIPBFBoxContainer(viewer)
+        example = ExampleIPBFBoxContainer(viewer, args=argparse.Namespace(test=True))
         example.graph = None
 
         speed_history = []
@@ -453,7 +453,7 @@ def run_ipbf_boundary_particle_box_container_rollout(
     """Run the boundary-particle IPBF box-container example with a null viewer."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
-        example = ExampleIPBFBoxContainerBoundaryParticles(viewer)
+        example = ExampleIPBFBoxContainerBoundaryParticles(viewer, args=argparse.Namespace(test=True))
         example.graph = None
         example.use_shape_contacts = use_shape_contacts
         if viscosity_coefficient is not None:
@@ -1233,6 +1233,7 @@ def test_ipbf_boundary_particle_example_args_override_runtime_controls(test, dev
             use_shape_contacts=False,
             viscosity_coefficient=0.015,
             xsph_coefficient=0.035,
+            test=True,
         )
         example = ExampleIPBFBoxContainerBoundaryParticles(viewer, args=args)
 

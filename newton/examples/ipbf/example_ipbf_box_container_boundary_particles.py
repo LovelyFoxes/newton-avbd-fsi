@@ -87,6 +87,7 @@ class Example:
         NORMAL = "normal"
         DENSE = "dense"
         X_DENSE = "x-dense"
+        LARGE = "large"
 
     def __init__(self, viewer, args=None):
         self.fps = 60
@@ -108,15 +109,17 @@ class Example:
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
         self.boundary_spacing = 0.05
-        self.initial_particle_velocity = wp.vec3(0.3, 0.0, 0.1125)
         # A small global damping still helps the current prototype settle,
         # even when boundary particles provide near-wall density support.
         self.velocity_damping = 0.99
         self.use_shape_contacts = bool(getattr(args, "use_shape_contacts", True))
-        self.dense_level = str(getattr(args, "dense_level", self.DenseLevel.NORMAL))
+        default_dense_level = self.DenseLevel.NORMAL if bool(getattr(args, "test", False)) else self.DenseLevel.LARGE
+        self.dense_level = str(getattr(args, "dense_level", default_dense_level))
         self.initial_viscosity_coefficient = float(getattr(args, "viscosity_coefficient", 0.005))
         self.initial_xsph_coefficient = float(getattr(args, "xsph_coefficient", 0.02))
         particle_block = self._get_particle_block_config(self.dense_level)
+        self.initial_particle_velocity = particle_block["velocity"]
+        self.boundary_spacing = particle_block["boundary_spacing"]
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -146,9 +149,9 @@ class Example:
             self.model,
             SolverIPBF.Config(
                 rest_density=1000.0,
-                smoothing_radius=0.12,
+                smoothing_radius=particle_block["smoothing_radius"],
                 boundary_mode=SolverIPBF.Config.BoundaryMode.BOUNDARY_PARTICLES,
-                iterations=5,
+                iterations=particle_block["iterations"],
                 relaxation=0.5,
                 viscosity_coefficient=self.initial_viscosity_coefficient,
                 xsph_coefficient=self.initial_xsph_coefficient,
@@ -261,6 +264,10 @@ class Example:
                 "cell_z": 0.075,
                 "mass": 0.5,
                 "radius_mean": 0.03,
+                "smoothing_radius": 0.12,
+                "iterations": 5,
+                "velocity": wp.vec3(0.3, 0.0, 0.1125),
+                "boundary_spacing": 0.05,
             },
             self.DenseLevel.DENSE: {
                 "pos": wp.vec3(-0.225, 0.12, -0.225),
@@ -272,6 +279,10 @@ class Example:
                 "cell_z": 0.075,
                 "mass": 0.5,
                 "radius_mean": 0.03,
+                "smoothing_radius": 0.12,
+                "iterations": 5,
+                "velocity": wp.vec3(0.3, 0.0, 0.1125),
+                "boundary_spacing": 0.05,
             },
             self.DenseLevel.X_DENSE: {
                 "pos": wp.vec3(-0.2625, 0.12, -0.2625),
@@ -283,6 +294,25 @@ class Example:
                 "cell_z": 0.075,
                 "mass": 0.5,
                 "radius_mean": 0.03,
+                "smoothing_radius": 0.12,
+                "iterations": 5,
+                "velocity": wp.vec3(0.3, 0.0, 0.1125),
+                "boundary_spacing": 0.05,
+            },
+            self.DenseLevel.LARGE: {
+                "pos": wp.vec3(-0.434, 0.035, -0.434),
+                "dim_x": 32,
+                "dim_y": 30,
+                "dim_z": 32,
+                "cell_x": 0.028,
+                "cell_y": 0.028,
+                "cell_z": 0.028,
+                "mass": 0.022,
+                "radius_mean": 0.012,
+                "smoothing_radius": 0.048,
+                "iterations": 6,
+                "velocity": wp.vec3(0.15, 0.0, 0.06),
+                "boundary_spacing": 0.03,
             },
         }
         if dense_level not in presets:
@@ -406,8 +436,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dense-level",
         type=str,
-        choices=[Example.DenseLevel.NORMAL, Example.DenseLevel.DENSE, Example.DenseLevel.X_DENSE],
-        default=Example.DenseLevel.NORMAL,
+        choices=[Example.DenseLevel.NORMAL, Example.DenseLevel.DENSE, Example.DenseLevel.X_DENSE, Example.DenseLevel.LARGE],
+        default=Example.DenseLevel.LARGE,
         help="Particle-density preset used to build the initial fluid block.",
     )
     parser.add_argument(

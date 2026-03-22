@@ -73,6 +73,38 @@ def build_box_wireframe(
 
 
 class Example:
+    def _get_particle_block_config(self) -> dict[str, float | int | wp.vec3]:
+        if bool(getattr(self.args, "test", False)):
+            return {
+                "pos": wp.vec3(-0.24, 0.12, -0.24),
+                "dim_x": 7,
+                "dim_y": 8,
+                "dim_z": 7,
+                "cell_x": 0.075,
+                "cell_y": 0.075,
+                "cell_z": 0.075,
+                "mass": 0.5,
+                "radius_mean": 0.03,
+                "smoothing_radius": 0.12,
+                "iterations": 4,
+                "velocity": wp.vec3(0.9, 0.0, 0.35),
+            }
+
+        return {
+            "pos": wp.vec3(-0.434, 0.035, -0.434),
+            "dim_x": 32,
+            "dim_y": 30,
+            "dim_z": 32,
+            "cell_x": 0.028,
+            "cell_y": 0.028,
+            "cell_z": 0.028,
+            "mass": 0.022,
+            "radius_mean": 0.012,
+            "smoothing_radius": 0.048,
+            "iterations": 5,
+            "velocity": wp.vec3(0.35, 0.0, 0.14),
+        }
+
     def __init__(self, viewer, args=None):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -91,7 +123,8 @@ class Example:
         self.wall_half_height = 0.45
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
-        self.initial_particle_velocity = wp.vec3(0.9, 0.0, 0.35)
+        particle_block = self._get_particle_block_config()
+        self.initial_particle_velocity = particle_block["velocity"]
         # The current IPBF boundary handling uses post-update positional projection
         # without dedicated wall friction, so a small global velocity damping keeps
         # the demo bounded and lets the particle block settle inside the box.
@@ -104,18 +137,18 @@ class Example:
         self._add_container(builder)
 
         builder.add_particle_grid(
-            pos=wp.vec3(-0.24, 0.12, -0.24),
+            pos=particle_block["pos"],
             rot=wp.quat_identity(),
             vel=self.initial_particle_velocity,
-            dim_x=7,
-            dim_y=8,
-            dim_z=7,
-            cell_x=0.075,
-            cell_y=0.075,
-            cell_z=0.075,
-            mass=0.5,
+            dim_x=particle_block["dim_x"],
+            dim_y=particle_block["dim_y"],
+            dim_z=particle_block["dim_z"],
+            cell_x=particle_block["cell_x"],
+            cell_y=particle_block["cell_y"],
+            cell_z=particle_block["cell_z"],
+            mass=particle_block["mass"],
             jitter=0.0,
-            radius_mean=0.03,
+            radius_mean=particle_block["radius_mean"],
         )
 
         self.model = builder.finalize()
@@ -125,8 +158,8 @@ class Example:
             self.model,
             SolverIPBF.Config(
                 rest_density=1000.0,
-                smoothing_radius=0.12,
-                iterations=4,
+                smoothing_radius=particle_block["smoothing_radius"],
+                iterations=particle_block["iterations"],
                 relaxation=0.5,
             ),
         )

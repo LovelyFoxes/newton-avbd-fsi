@@ -82,6 +82,36 @@ def build_box_wireframe(
 class Example:
     """Closed IPBF box with a kinematic moving side wall."""
 
+    def _get_particle_block_config(self) -> dict[str, float | int | wp.vec3]:
+        if bool(getattr(self.args, "test", False)):
+            return {
+                "pos": wp.vec3(-0.78, 0.12, -0.19),
+                "dim_x": 6,
+                "dim_y": 7,
+                "dim_z": 6,
+                "cell_x": 0.075,
+                "cell_y": 0.075,
+                "cell_z": 0.075,
+                "mass": 0.5,
+                "radius_mean": 0.03,
+                "smoothing_radius": 0.12,
+                "iterations": 5,
+            }
+
+        return {
+            "pos": wp.vec3(-0.79, 0.035, -0.53),
+            "dim_x": 26,
+            "dim_y": 30,
+            "dim_z": 39,
+            "cell_x": 0.028,
+            "cell_y": 0.028,
+            "cell_z": 0.028,
+            "mass": 0.022,
+            "radius_mean": 0.012,
+            "smoothing_radius": 0.048,
+            "iterations": 6,
+        }
+
     def __init__(self, viewer, args=None):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -95,16 +125,17 @@ class Example:
         self._reset_key_prev = False
         self.graph = None
 
-        self.container_half_width = 0.55
+        self.container_half_width = 0.9
         self.container_half_depth = 0.55
         self.wall_thickness = 0.05
         self.wall_half_height = 0.45
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
         self.velocity_damping = 0.994
-        self.wall_travel = float(getattr(args, "wall_travel", 0.16))
-        self.wall_frequency = float(getattr(args, "wall_frequency", 0.55))
+        self.wall_travel = float(getattr(args, "wall_travel", 0.25))
+        self.wall_frequency = float(getattr(args, "wall_frequency", 1.00))
         self.current_right_wall_center_x = self.container_half_width + self.wall_thickness
+        particle_block = self._get_particle_block_config()
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -113,18 +144,18 @@ class Example:
         self._add_container(builder)
 
         builder.add_particle_grid(
-            pos=wp.vec3(-0.38, 0.12, -0.19),
+            pos=particle_block["pos"],
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0, 0.0, 0.0),
-            dim_x=6,
-            dim_y=7,
-            dim_z=6,
-            cell_x=0.075,
-            cell_y=0.075,
-            cell_z=0.075,
-            mass=0.5,
+            dim_x=particle_block["dim_x"],
+            dim_y=particle_block["dim_y"],
+            dim_z=particle_block["dim_z"],
+            cell_x=particle_block["cell_x"],
+            cell_y=particle_block["cell_y"],
+            cell_z=particle_block["cell_z"],
+            mass=particle_block["mass"],
             jitter=0.0,
-            radius_mean=0.03,
+            radius_mean=particle_block["radius_mean"],
         )
 
         self.model = builder.finalize()
@@ -134,8 +165,8 @@ class Example:
             self.model,
             SolverIPBF.Config(
                 rest_density=1000.0,
-                smoothing_radius=0.12,
-                iterations=5,
+                smoothing_radius=particle_block["smoothing_radius"],
+                iterations=particle_block["iterations"],
                 relaxation=0.5,
                 viscosity_coefficient=0.005,
                 xsph_coefficient=0.02,
@@ -162,9 +193,9 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(1.95, 1.6, 1.95),
-            pitch=-32.0,
-            yaw=-135.0,
+            pos=wp.vec3(2.7, 1.75, 2.15),
+            pitch=-28.0,
+            yaw=-132.0,
         )
 
         self.reset()
@@ -315,7 +346,7 @@ class Example:
         assert max_z <= self.container_half_depth + 0.02, f"particles escaped along z: {max_z:.3f}"
         assert min_y >= -0.02, f"particles penetrated the floor: {min_y:.3f}"
         assert max_y <= self.top_y + 0.02, f"particles penetrated the ceiling: {max_y:.3f}"
-        assert max_speed <= 2.5, f"particles retained excessive speed: {max_speed:.3f}"
+        assert max_speed <= 2.8, f"particles retained excessive speed: {max_speed:.3f}"
 
     def render(self):
         right_interior_x = self.current_right_wall_center_x - self.wall_thickness
@@ -351,13 +382,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wall-travel",
         type=float,
-        default=0.16,
+        default=0.25,
         help="Peak inward travel of the moving wall [m].",
     )
     parser.add_argument(
         "--wall-frequency",
         type=float,
-        default=0.55,
+        default=1.00,
         help="Oscillation frequency of the moving wall [Hz].",
     )
     viewer, args = newton.examples.init(parser)
