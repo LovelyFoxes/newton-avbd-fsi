@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 
 import numpy as np
 import warp as wp
@@ -58,6 +59,8 @@ class SolverIPBF(SolverBase):
         Attributes:
             rest_density: Fluid rest density [kg/m^3].
             smoothing_radius: SPH kernel support radius [m].
+            kernel_family: SPH kernel family used for density, gradient, and
+                Hessian evaluation.
             compliance: Normalized compliance parameter ``alpha = 1 / k``.
             hessian_regularization: Small diagonal regularization added to the
                 local Hessian to keep it invertible.
@@ -70,8 +73,15 @@ class SolverIPBF(SolverBase):
             damping_beta: Distance threshold factor used by the damping model.
         """
 
+        class KernelFamily(IntEnum):
+            """Selectable SPH kernel families for IPBF."""
+
+            CUBIC_SPLINE = 0
+            POLY6 = 1
+
         rest_density: float = 1000.0
         smoothing_radius: float = 0.1
+        kernel_family: KernelFamily = KernelFamily.CUBIC_SPLINE
         compliance: float = 0.0
         hessian_regularization: float = 1.0e-6
         iterations: int = 3
@@ -231,6 +241,7 @@ class SolverIPBF(SolverBase):
         self.config = config if config is not None else self.Config()
         self.rest_density = float(self.config.rest_density)
         self.smoothing_radius = float(self.config.smoothing_radius)
+        self.kernel_family = int(self.Config.KernelFamily(self.config.kernel_family))
         self.compliance = float(self.config.compliance)
         self.hessian_regularization = float(self.config.hessian_regularization)
         self.iterations = int(self.config.iterations)
@@ -324,6 +335,7 @@ class SolverIPBF(SolverBase):
                     model.particle_flags,
                     model.particle_world,
                     self.smoothing_radius,
+                    self.kernel_family,
                 ],
                 outputs=[state.ipbf.density, state.ipbf.neighbor_count],
                 device=model.device,
@@ -341,6 +353,7 @@ class SolverIPBF(SolverBase):
                     state.ipbf.density,
                     self.rest_density,
                     self.smoothing_radius,
+                    self.kernel_family,
                     int(self.use_constraint_clamp),
                 ],
                 outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
@@ -354,6 +367,7 @@ class SolverIPBF(SolverBase):
                     model.particle_mass,
                     model.particle_flags,
                     self.smoothing_radius,
+                    self.kernel_family,
                 ],
                 outputs=[state.ipbf.density, state.ipbf.neighbor_count],
                 device=model.device,
@@ -387,6 +401,7 @@ class SolverIPBF(SolverBase):
                     state.ipbf.constraint_gradient,
                     self.rest_density,
                     self.smoothing_radius,
+                    self.kernel_family,
                     self.compliance,
                     dt,
                 ],
@@ -407,6 +422,7 @@ class SolverIPBF(SolverBase):
                     state.ipbf.constraint_gradient,
                     self.rest_density,
                     self.smoothing_radius,
+                    self.kernel_family,
                     self.compliance,
                     dt,
                     self.hessian_regularization,
@@ -442,6 +458,7 @@ class SolverIPBF(SolverBase):
                     state.ipbf.constraint_gradient,
                     self.rest_density,
                     self.smoothing_radius,
+                    self.kernel_family,
                     self.compliance,
                     dt,
                     self.hessian_regularization,

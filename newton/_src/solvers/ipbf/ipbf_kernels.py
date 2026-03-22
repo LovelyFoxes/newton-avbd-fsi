@@ -6,13 +6,34 @@ import warp as wp
 
 from ...geometry import ParticleFlags
 
+KERNEL_FAMILY_CUBIC_SPLINE = 0
+KERNEL_FAMILY_POLY6 = 1
+
 
 @wp.func
-def kernel_value(dist2: float, support_radius: float) -> float:
-    """Evaluate the current scalar SPH kernel value.
+def kernel_value_cubic_spline(dist2: float, support_radius: float) -> float:
+    """Evaluate the 3D cubic spline kernel value."""
+    if support_radius <= 0.0:
+        return 0.0
 
-    The current implementation uses the 3D poly6 kernel
-    """
+    r = wp.sqrt(dist2)
+    if r >= support_radius:
+        return 0.0
+
+    inv_support_radius = 1.0 / support_radius
+    q = 2.0 * r * inv_support_radius
+    normalization = 8.0 * inv_support_radius * inv_support_radius * inv_support_radius / wp.pi
+
+    if q < 1.0:
+        return normalization * (1.0 - 1.5 * q * q + 0.75 * q * q * q)
+
+    two_minus_q = 2.0 - q
+    return normalization * 0.25 * two_minus_q * two_minus_q * two_minus_q
+
+
+@wp.func
+def kernel_value_poly6(dist2: float, support_radius: float) -> float:
+    """Evaluate the 3D poly6 kernel value."""
     if support_radius <= 0.0:
         return 0.0
 
@@ -27,8 +48,37 @@ def kernel_value(dist2: float, support_radius: float) -> float:
 
 
 @wp.func
-def kernel_gradient(displacement: wp.vec3, support_radius: float) -> wp.vec3:
-    """Evaluate the spatial gradient of the current SPH kernel."""
+def kernel_gradient_cubic_spline(displacement: wp.vec3, support_radius: float) -> wp.vec3:
+    """Evaluate the spatial gradient of the 3D cubic spline kernel."""
+    if support_radius <= 0.0:
+        return wp.vec3(0.0)
+
+    dist2 = wp.dot(displacement, displacement)
+    if dist2 == 0.0:
+        return wp.vec3(0.0)
+
+    r = wp.sqrt(dist2)
+    if r >= support_radius:
+        return wp.vec3(0.0)
+
+    inv_support_radius = 1.0 / support_radius
+    q = 2.0 * r * inv_support_radius
+    normalization = 8.0 * inv_support_radius * inv_support_radius * inv_support_radius / wp.pi
+    q_scale = 2.0 * inv_support_radius
+
+    dW_dr = float(0.0)
+    if q < 1.0:
+        dW_dr = normalization * q_scale * (-3.0 * q + 2.25 * q * q)
+    else:
+        two_minus_q = 2.0 - q
+        dW_dr = normalization * q_scale * (-0.75 * two_minus_q * two_minus_q)
+
+    return displacement * (dW_dr / r)
+
+
+@wp.func
+def kernel_gradient_poly6(displacement: wp.vec3, support_radius: float) -> wp.vec3:
+    """Evaluate the spatial gradient of the 3D poly6 kernel."""
     if support_radius <= 0.0:
         return wp.vec3(0.0)
 
@@ -44,8 +94,46 @@ def kernel_gradient(displacement: wp.vec3, support_radius: float) -> wp.vec3:
 
 
 @wp.func
-def kernel_hessian(displacement: wp.vec3, support_radius: float) -> wp.mat33:
-    """Evaluate the spatial Hessian of the current scalar SPH kernel."""
+def kernel_hessian_cubic_spline(displacement: wp.vec3, support_radius: float) -> wp.mat33:
+    """Evaluate the spatial Hessian of the 3D cubic spline kernel."""
+    if support_radius <= 0.0:
+        return wp.mat33(0.0)
+
+    dist2 = wp.dot(displacement, displacement)
+    r = wp.sqrt(dist2)
+    if r >= support_radius:
+        return wp.mat33(0.0)
+
+    inv_support_radius = 1.0 / support_radius
+    q = 2.0 * r * inv_support_radius
+    normalization = 8.0 * inv_support_radius * inv_support_radius * inv_support_radius / wp.pi
+    q_scale = 2.0 * inv_support_radius
+    q_scale2 = q_scale * q_scale
+    identity = wp.identity(n=3, dtype=float)
+
+    if dist2 == 0.0:
+        return normalization * q_scale2 * (-3.0) * identity
+
+    dW_dr = float(0.0)
+    d2W_dr2 = float(0.0)
+    if q < 1.0:
+        dW_dr = normalization * q_scale * (-3.0 * q + 2.25 * q * q)
+        d2W_dr2 = normalization * q_scale2 * (-3.0 + 4.5 * q)
+    else:
+        two_minus_q = 2.0 - q
+        dW_dr = normalization * q_scale * (-0.75 * two_minus_q * two_minus_q)
+        d2W_dr2 = normalization * q_scale2 * (1.5 * two_minus_q)
+
+    inv_r = 1.0 / r
+    inv_r2 = inv_r * inv_r
+    outer_disp = wp.outer(displacement, displacement)
+
+    return dW_dr * inv_r * identity + (d2W_dr2 - dW_dr * inv_r) * inv_r2 * outer_disp
+
+
+@wp.func
+def kernel_hessian_poly6(displacement: wp.vec3, support_radius: float) -> wp.mat33:
+    """Evaluate the spatial Hessian of the 3D poly6 kernel."""
     if support_radius <= 0.0:
         return wp.mat33(0.0)
 
@@ -63,6 +151,33 @@ def kernel_hessian(displacement: wp.vec3, support_radius: float) -> wp.mat33:
         -945.0 / (32.0 * wp.pi * h9) * x * x * identity
         + 945.0 / (8.0 * wp.pi * h9) * x * wp.outer(displacement, displacement)
     )
+
+
+@wp.func
+def kernel_value(dist2: float, support_radius: float, kernel_family: int) -> float:
+    """Evaluate the selected scalar SPH kernel value."""
+    if kernel_family == KERNEL_FAMILY_POLY6:
+        return kernel_value_poly6(dist2, support_radius)
+
+    return kernel_value_cubic_spline(dist2, support_radius)
+
+
+@wp.func
+def kernel_gradient(displacement: wp.vec3, support_radius: float, kernel_family: int) -> wp.vec3:
+    """Evaluate the spatial gradient of the selected SPH kernel."""
+    if kernel_family == KERNEL_FAMILY_POLY6:
+        return kernel_gradient_poly6(displacement, support_radius)
+
+    return kernel_gradient_cubic_spline(displacement, support_radius)
+
+
+@wp.func
+def kernel_hessian(displacement: wp.vec3, support_radius: float, kernel_family: int) -> wp.mat33:
+    """Evaluate the spatial Hessian of the selected scalar SPH kernel."""
+    if kernel_family == KERNEL_FAMILY_POLY6:
+        return kernel_hessian_poly6(displacement, support_radius)
+
+    return kernel_hessian_cubic_spline(displacement, support_radius)
 
 
 @wp.func
@@ -127,6 +242,7 @@ def initialize_density_and_neighbor_count(
     particle_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     support_radius: float,
+    kernel_family: int,
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
 ):
@@ -142,7 +258,7 @@ def initialize_density_and_neighbor_count(
         neighbor_count[tid] = 0
         return
 
-    density[tid] = particle_mass[tid] * kernel_value(0.0, support_radius)
+    density[tid] = particle_mass[tid] * kernel_value(0.0, support_radius, kernel_family)
     neighbor_count[tid] = 0
 
 
@@ -179,6 +295,7 @@ def compute_density_and_neighbor_count(
     particle_flags: wp.array(dtype=wp.int32),
     particle_world: wp.array(dtype=wp.int32),
     support_radius: float,
+    kernel_family: int,
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
 ):
@@ -208,7 +325,7 @@ def compute_density_and_neighbor_count(
 
         dist = xi - particle_q[index]
         dist2 = wp.dot(dist, dist)
-        kernel = kernel_value(dist2, support_radius)
+        kernel = kernel_value(dist2, support_radius, kernel_family)
         if kernel <= 0.0:
             continue
 
@@ -230,6 +347,7 @@ def compute_constraint_and_gradient(
     density: wp.array(dtype=float),
     rest_density: float,
     support_radius: float,
+    kernel_family: int,
     use_constraint_clamp: int,
     constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
@@ -264,7 +382,7 @@ def compute_constraint_and_gradient(
             continue
 
         displacement = xi - particle_q[index]
-        grad += particle_mass[index] * kernel_gradient(displacement, support_radius)
+        grad += particle_mass[index] * kernel_gradient(displacement, support_radius, kernel_family)
 
     constraint[tid] = c
     constraint_gradient[tid] = grad / rest_density
@@ -282,6 +400,7 @@ def compute_force(
     constraint_gradient: wp.array(dtype=wp.vec3),
     rest_density: float,
     support_radius: float,
+    kernel_family: int,
     compliance: float,
     dt: float,
     force: wp.array(dtype=wp.vec3),
@@ -322,7 +441,9 @@ def compute_force(
                 continue
 
             displacement = x_guess[index] - xi
-            pressure_force += cj * particle_mass[tid] * inv_rest_density * kernel_gradient(displacement, support_radius)
+            pressure_force += (
+                cj * particle_mass[tid] * inv_rest_density * kernel_gradient(displacement, support_radius, kernel_family)
+            )
 
     force[tid] = inertial_force + pressure_force
 
@@ -364,6 +485,7 @@ def compute_hessian(
     constraint_gradient: wp.array(dtype=wp.vec3),
     rest_density: float,
     support_radius: float,
+    kernel_family: int,
     compliance: float,
     dt: float,
     regularization: float,
@@ -410,13 +532,17 @@ def compute_hessian(
             continue
 
         displacement = xi - particle_q[index]
-        constraint_hessian += particle_mass[index] * kernel_hessian(displacement, support_radius)
+        constraint_hessian += particle_mass[index] * kernel_hessian(displacement, support_radius, kernel_family)
         if index != tid:
-            neighbor_gradient = particle_mass[tid] * inv_rest_density * kernel_gradient(-displacement, support_radius)
+            neighbor_gradient = (
+                particle_mass[tid] * inv_rest_density * kernel_gradient(-displacement, support_radius, kernel_family)
+            )
             h += wp.outer(neighbor_gradient, neighbor_gradient)
             if constraint[index] != 0.0:
                 neighbor_constraint_hessian = (
-                    particle_mass[tid] * inv_rest_density * kernel_hessian(-displacement, support_radius)
+                    particle_mass[tid]
+                    * inv_rest_density
+                    * kernel_hessian(-displacement, support_radius, kernel_family)
                 )
                 h += wp.abs(constraint[index]) * diagonal_from_column_norms(neighbor_constraint_hessian)
 
@@ -434,6 +560,7 @@ def compute_hessian_without_grid(
     constraint_gradient: wp.array(dtype=wp.vec3),
     rest_density: float,
     support_radius: float,
+    kernel_family: int,
     compliance: float,
     dt: float,
     regularization: float,
@@ -455,7 +582,7 @@ def compute_hessian_without_grid(
     h = (inertia_scale + regularization) * identity + wp.outer(grad, grad)
 
     if rest_density > 0.0 and constraint[tid] != 0.0:
-        constraint_hessian = particle_mass[tid] * kernel_hessian(wp.vec3(0.0), support_radius) / rest_density
+        constraint_hessian = particle_mass[tid] * kernel_hessian(wp.vec3(0.0), support_radius, kernel_family) / rest_density
         h += wp.abs(constraint[tid]) * diagonal_from_column_norms(constraint_hessian)
 
     hessian[tid] = h

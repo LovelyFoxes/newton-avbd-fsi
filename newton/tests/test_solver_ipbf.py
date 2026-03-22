@@ -8,41 +8,104 @@ from newton._src.solvers.ipbf.ipbf_kernels import kernel_gradient, kernel_hessia
 from newton.solvers import SolverIPBF
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
+KernelFamily = SolverIPBF.Config.KernelFamily
 
-def kernel_density_contribution(mass: float, support_radius: float, distance: float) -> float:
+
+def kernel_density_contribution(
+    mass: float,
+    support_radius: float,
+    distance: float,
+    kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
+) -> float:
     """Reference scalar kernel density contribution used by the IPBF kernels."""
     if support_radius <= 0.0 or distance >= support_radius:
         return 0.0
 
-    support_radius2 = support_radius * support_radius
-    x = support_radius2 - distance * distance
-    return mass * 315.0 / (64.0 * np.pi * support_radius**9) * x**3
+    if kernel_family == KernelFamily.POLY6:
+        support_radius2 = support_radius * support_radius
+        x = support_radius2 - distance * distance
+        value = 315.0 / (64.0 * np.pi * support_radius**9) * x**3
+    else:
+        q = 2.0 * distance / support_radius
+        normalization = 8.0 / (np.pi * support_radius**3)
+        if q < 1.0:
+            value = normalization * (1.0 - 1.5 * q**2 + 0.75 * q**3)
+        else:
+            value = normalization * 0.25 * (2.0 - q) ** 3
+
+    return float(mass * value)
 
 
-def kernel_gradient_contribution(mass: float, support_radius: float, displacement: np.ndarray) -> np.ndarray:
+def kernel_gradient_contribution(
+    mass: float,
+    support_radius: float,
+    displacement: np.ndarray,
+    kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
+) -> np.ndarray:
     """Reference spatial kernel gradient contribution used by the IPBF kernels."""
     distance2 = float(np.dot(displacement, displacement))
     if support_radius <= 0.0 or distance2 >= support_radius * support_radius or distance2 == 0.0:
         return np.zeros(3, dtype=np.float32)
 
-    x = support_radius * support_radius - distance2
-    scale = -945.0 / (32.0 * np.pi * support_radius**9) * x * x
-    return (mass * scale * displacement).astype(np.float32)
+    if kernel_family == KernelFamily.POLY6:
+        x = support_radius * support_radius - distance2
+        scale = -945.0 / (32.0 * np.pi * support_radius**9) * x * x
+        return (mass * scale * displacement).astype(np.float32)
+
+    distance = float(np.sqrt(distance2))
+    q = 2.0 * distance / support_radius
+    normalization = 8.0 / (np.pi * support_radius**3)
+    q_scale = 2.0 / support_radius
+
+    if q < 1.0:
+        dW_dr = normalization * q_scale * (-3.0 * q + 2.25 * q**2)
+    else:
+        dW_dr = normalization * q_scale * (-0.75 * (2.0 - q) ** 2)
+
+    return (mass * (dW_dr / distance) * displacement).astype(np.float32)
 
 
-def kernel_hessian_reference(support_radius: float, displacement: np.ndarray) -> np.ndarray:
+def kernel_hessian_reference(
+    support_radius: float,
+    displacement: np.ndarray,
+    kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
+) -> np.ndarray:
     """Reference spatial kernel Hessian used by the IPBF kernels."""
     distance2 = float(np.dot(displacement, displacement))
     if support_radius <= 0.0 or distance2 >= support_radius * support_radius:
         return np.zeros((3, 3), dtype=np.float32)
 
-    x = support_radius * support_radius - distance2
+    if kernel_family == KernelFamily.POLY6:
+        x = support_radius * support_radius - distance2
+        identity = np.eye(3, dtype=np.float32)
+        outer = np.outer(displacement, displacement)
+        return (
+            -945.0 / (32.0 * np.pi * support_radius**9) * x * x * identity
+            + 945.0 / (8.0 * np.pi * support_radius**9) * x * outer
+        ).astype(np.float32)
+
+    normalization = 8.0 / (np.pi * support_radius**3)
+    q_scale = 2.0 / support_radius
+    q_scale2 = q_scale * q_scale
     identity = np.eye(3, dtype=np.float32)
+
+    if distance2 == 0.0:
+        return (normalization * q_scale2 * (-3.0) * identity).astype(np.float32)
+
+    distance = float(np.sqrt(distance2))
+    q = 2.0 * distance / support_radius
+
+    if q < 1.0:
+        dW_dr = normalization * q_scale * (-3.0 * q + 2.25 * q**2)
+        d2W_dr2 = normalization * q_scale2 * (-3.0 + 4.5 * q)
+    else:
+        dW_dr = normalization * q_scale * (-0.75 * (2.0 - q) ** 2)
+        d2W_dr2 = normalization * q_scale2 * (1.5 * (2.0 - q))
+
+    inv_r = 1.0 / distance
+    inv_r2 = inv_r * inv_r
     outer = np.outer(displacement, displacement)
-    return (
-        -945.0 / (32.0 * np.pi * support_radius**9) * x * x * identity
-        + 945.0 / (8.0 * np.pi * support_radius**9) * x * outer
-    ).astype(np.float32)
+    return (dW_dr * inv_r * identity + (d2W_dr2 - dW_dr * inv_r) * inv_r2 * outer).astype(np.float32)
 
 
 def expected_constraint_hessian(
@@ -50,6 +113,7 @@ def expected_constraint_hessian(
     support_radius: float,
     displacements: list[np.ndarray],
     rest_density: float,
+    kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
 ) -> np.ndarray:
     """Reference constraint Hessian built from kernel Hessian contributions."""
     if rest_density <= 0.0:
@@ -57,7 +121,7 @@ def expected_constraint_hessian(
 
     hessian = np.zeros((3, 3), dtype=np.float32)
     for mass, displacement in zip(masses, displacements, strict=True):
-        hessian += mass * kernel_hessian_reference(support_radius, displacement)
+        hessian += mass * kernel_hessian_reference(support_radius, displacement, kernel_family)
 
     return (hessian / rest_density).astype(np.float32)
 
@@ -67,14 +131,15 @@ def expected_neighbor_constraint_hessian(
     support_radius: float,
     displacement_neighbor_minus_self: np.ndarray,
     rest_density: float,
+    kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
 ) -> np.ndarray:
     """Reference neighbor constraint Hessian with respect to the current particle."""
     if rest_density <= 0.0:
         return np.zeros((3, 3), dtype=np.float32)
 
-    return (mass_self * kernel_hessian_reference(support_radius, displacement_neighbor_minus_self) / rest_density).astype(
-        np.float32
-    )
+    return (
+        mass_self * kernel_hessian_reference(support_radius, displacement_neighbor_minus_self, kernel_family) / rest_density
+    ).astype(np.float32)
 
 
 def expected_ipbf_hessian(
@@ -129,6 +194,7 @@ def expected_two_particle_force(
     support_radius: float,
     displacement_neighbor_minus_self: np.ndarray,
     rest_density: float,
+    kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
 ) -> np.ndarray:
     """Reference two-particle IPBF force with neighbor constraint contributions."""
     if rest_density <= 0.0:
@@ -136,7 +202,7 @@ def expected_two_particle_force(
 
     neighbor_term = (
         constraint_neighbor
-        * kernel_gradient_contribution(1.0, support_radius, displacement_neighbor_minus_self)
+        * kernel_gradient_contribution(1.0, support_radius, displacement_neighbor_minus_self, kernel_family)
         / rest_density
     )
     return (-constraint_self * gradient_self + neighbor_term).astype(np.float32)
@@ -146,6 +212,7 @@ def expected_two_particle_force(
 def evaluate_kernel_interface(
     displacement: wp.array(dtype=wp.vec3),
     support_radius: float,
+    kernel_family: int,
     value: wp.array(dtype=float),
     gradient: wp.array(dtype=wp.vec3),
     hessian: wp.array(dtype=wp.mat33),
@@ -153,9 +220,9 @@ def evaluate_kernel_interface(
     """Evaluate the current kernel interface for a set of query displacements."""
     tid = wp.tid()
     disp = displacement[tid]
-    value[tid] = kernel_value(wp.dot(disp, disp), support_radius)
-    gradient[tid] = kernel_gradient(disp, support_radius)
-    hessian[tid] = kernel_hessian(disp, support_radius)
+    value[tid] = kernel_value(wp.dot(disp, disp), support_radius, kernel_family)
+    gradient[tid] = kernel_gradient(disp, support_radius, kernel_family)
+    hessian[tid] = kernel_hessian(disp, support_radius, kernel_family)
 
 
 def run_two_particle_ipbf_step(
@@ -166,6 +233,7 @@ def run_two_particle_ipbf_step(
     rest_density: float = 1.0,
     support_radius: float = 0.3,
     regularization: float = 1.0e-6,
+    kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
 ):
     """Run one zero-gravity IPBF step for a symmetric two-particle setup."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -192,6 +260,7 @@ def run_two_particle_ipbf_step(
         SolverIPBF.Config(
             rest_density=rest_density,
             smoothing_radius=support_radius,
+            kernel_family=kernel_family,
             hessian_regularization=regularization,
             iterations=iterations,
             relaxation=relaxation,
@@ -629,22 +698,28 @@ def test_ipbf_kernel_interface_matches_reference(test, device):
     gradient_wp = wp.empty(1, dtype=wp.vec3, device=device)
     hessian_wp = wp.empty(1, dtype=wp.mat33, device=device)
 
-    wp.launch(
-        evaluate_kernel_interface,
-        dim=1,
-        inputs=[displacement_wp, support_radius],
-        outputs=[value_wp, gradient_wp, hessian_wp],
-        device=device,
-    )
+    for kernel_family in (KernelFamily.CUBIC_SPLINE, KernelFamily.POLY6):
+        wp.launch(
+            evaluate_kernel_interface,
+            dim=1,
+            inputs=[displacement_wp, support_radius, int(kernel_family)],
+            outputs=[value_wp, gradient_wp, hessian_wp],
+            device=device,
+        )
 
-    expected_value = kernel_density_contribution(1.0, support_radius, float(np.linalg.norm(displacement[0])))
-    expected_gradient = kernel_gradient_contribution(1.0, support_radius, displacement[0])
-    expected_hessian = kernel_hessian_reference(support_radius, displacement[0])
+        expected_value = kernel_density_contribution(
+            1.0,
+            support_radius,
+            float(np.linalg.norm(displacement[0])),
+            kernel_family,
+        )
+        expected_gradient = kernel_gradient_contribution(1.0, support_radius, displacement[0], kernel_family)
+        expected_hessian = kernel_hessian_reference(support_radius, displacement[0], kernel_family)
 
-    np.testing.assert_allclose(value_wp.numpy()[0], expected_value, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(gradient_wp.numpy()[0], expected_gradient, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(hessian_wp.numpy()[0], expected_hessian, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(hessian_wp.numpy()[0], hessian_wp.numpy()[0].T, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(value_wp.numpy()[0], expected_value, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(gradient_wp.numpy()[0], expected_gradient, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(hessian_wp.numpy()[0], expected_hessian, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(hessian_wp.numpy()[0], hessian_wp.numpy()[0].T, rtol=1e-6, atol=1e-6)
 
 
 def test_ipbf_multiple_iterations_reduce_constraint_magnitude(test, device):
@@ -665,6 +740,23 @@ def test_ipbf_multiple_iterations_reduce_constraint_magnitude(test, device):
     test.assertLess(float(state_2.particle_q.numpy()[0, 0]), float(state_1.particle_q.numpy()[0, 0]))
     test.assertGreater(float(state_1.particle_q.numpy()[1, 0]), 0.05)
     test.assertGreater(float(state_2.particle_q.numpy()[1, 0]), float(state_1.particle_q.numpy()[1, 0]))
+
+
+def test_ipbf_poly6_step_runs_and_updates_state(test, device):
+    state_1 = run_two_particle_ipbf_step(
+        device,
+        iterations=1,
+        relaxation=0.5,
+        kernel_family=KernelFamily.POLY6,
+    )
+
+    np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.array([1, 1], dtype=np.int32))
+    test.assertTrue(np.isfinite(state_1.ipbf.density.numpy()).all())
+    test.assertTrue(np.isfinite(state_1.ipbf.constraint.numpy()).all())
+    test.assertTrue(np.isfinite(state_1.ipbf.force.numpy()).all())
+    test.assertTrue(np.isfinite(state_1.ipbf.hessian.numpy()).all())
+    test.assertTrue(np.isfinite(state_1.ipbf.delta_q.numpy()).all())
+    test.assertGreater(float(np.abs(state_1.ipbf.delta_q.numpy()).max()), 0.0)
 
 
 def test_ipbf_reset_restores_initial_particle_state(test, device):
@@ -775,6 +867,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_multiple_iterations_reduce_constraint_magnitude",
     test_ipbf_multiple_iterations_reduce_constraint_magnitude,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_poly6_step_runs_and_updates_state",
+    test_ipbf_poly6_step_runs_and_updates_state,
     devices=devices,
     check_output=False,
 )
