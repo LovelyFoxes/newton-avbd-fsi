@@ -38,6 +38,13 @@ def scale_velocities(
 class Example:
     """Experimental IPBF box container using boundary particles."""
 
+    class DenseLevel:
+        """Named particle-density presets for the box container example."""
+
+        NORMAL = "normal"
+        DENSE = "dense"
+        X_DENSE = "x-dense"
+
     def __init__(self, viewer, args=None):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -61,8 +68,10 @@ class Example:
         # even when boundary particles provide near-wall density support.
         self.velocity_damping = 0.99
         self.use_shape_contacts = bool(getattr(args, "use_shape_contacts", True))
+        self.dense_level = str(getattr(args, "dense_level", self.DenseLevel.NORMAL))
         self.initial_viscosity_coefficient = float(getattr(args, "viscosity_coefficient", 0.005))
         self.initial_xsph_coefficient = float(getattr(args, "xsph_coefficient", 0.02))
+        particle_block = self._get_particle_block_config(self.dense_level)
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -71,18 +80,18 @@ class Example:
         self._add_container(builder)
 
         builder.add_particle_grid(
-            pos=wp.vec3(-0.2, 0.12, -0.2),
+            pos=particle_block["pos"],
             rot=wp.quat_identity(),
             vel=self.initial_particle_velocity,
-            dim_x=6,
-            dim_y=7,
-            dim_z=6,
-            cell_x=0.075,
-            cell_y=0.075,
-            cell_z=0.075,
-            mass=0.5,
+            dim_x=particle_block["dim_x"],
+            dim_y=particle_block["dim_y"],
+            dim_z=particle_block["dim_z"],
+            cell_x=particle_block["cell_x"],
+            cell_y=particle_block["cell_y"],
+            cell_z=particle_block["cell_z"],
+            mass=particle_block["mass"],
             jitter=0.0,
-            radius_mean=0.03,
+            radius_mean=particle_block["radius_mean"],
         )
 
         self.model = builder.finalize()
@@ -170,9 +179,51 @@ class Example:
             hz=wall_t,
         )
 
+    def _get_particle_block_config(self, dense_level: str) -> dict[str, object]:
+        """Return the particle-block preset for the requested density level."""
+        presets = {
+            self.DenseLevel.NORMAL: {
+                "pos": wp.vec3(-0.2, 0.12, -0.2),
+                "dim_x": 6,
+                "dim_y": 7,
+                "dim_z": 6,
+                "cell_x": 0.075,
+                "cell_y": 0.075,
+                "cell_z": 0.075,
+                "mass": 0.5,
+                "radius_mean": 0.03,
+            },
+            self.DenseLevel.DENSE: {
+                "pos": wp.vec3(-0.225, 0.12, -0.225),
+                "dim_x": 7,
+                "dim_y": 8,
+                "dim_z": 7,
+                "cell_x": 0.075,
+                "cell_y": 0.075,
+                "cell_z": 0.075,
+                "mass": 0.5,
+                "radius_mean": 0.03,
+            },
+            self.DenseLevel.X_DENSE: {
+                "pos": wp.vec3(-0.2625, 0.12, -0.2625),
+                "dim_x": 8,
+                "dim_y": 9,
+                "dim_z": 8,
+                "cell_x": 0.075,
+                "cell_y": 0.075,
+                "cell_z": 0.075,
+                "mass": 0.5,
+                "radius_mean": 0.03,
+            },
+        }
+        if dense_level not in presets:
+            raise ValueError(f"Unknown dense level: {dense_level}")
+        return presets[dense_level]
+
     def gui(self, ui):
         if ui.button("Reset"):
             self.reset()
+        ui.text(f"Dense Level: {self.dense_level}")
         changed, value = ui.checkbox("Use Shape Contacts", self.use_shape_contacts)
         if changed:
             self.set_use_shape_contacts(value)
@@ -270,6 +321,13 @@ class Example:
 
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--dense-level",
+        type=str,
+        choices=[Example.DenseLevel.NORMAL, Example.DenseLevel.DENSE, Example.DenseLevel.X_DENSE],
+        default=Example.DenseLevel.NORMAL,
+        help="Particle-density preset used to build the initial fluid block.",
+    )
     parser.add_argument(
         "--use-shape-contacts",
         action=argparse.BooleanOptionalAction,

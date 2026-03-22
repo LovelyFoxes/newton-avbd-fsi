@@ -1228,9 +1228,16 @@ def test_ipbf_boundary_particle_example_args_override_runtime_controls(test, dev
 
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
-        args = argparse.Namespace(use_shape_contacts=False, viscosity_coefficient=0.015, xsph_coefficient=0.035)
+        args = argparse.Namespace(
+            dense_level=ExampleIPBFBoxContainerBoundaryParticles.DenseLevel.DENSE,
+            use_shape_contacts=False,
+            viscosity_coefficient=0.015,
+            xsph_coefficient=0.035,
+        )
         example = ExampleIPBFBoxContainerBoundaryParticles(viewer, args=args)
 
+        test.assertEqual(example.dense_level, ExampleIPBFBoxContainerBoundaryParticles.DenseLevel.DENSE)
+        test.assertEqual(example.model.particle_count, 7 * 8 * 7)
         test.assertFalse(example.use_shape_contacts)
         test.assertAlmostEqual(example.solver.viscosity_coefficient, 0.015, places=7)
         test.assertAlmostEqual(example.solver.xsph_coefficient, 0.035, places=7)
