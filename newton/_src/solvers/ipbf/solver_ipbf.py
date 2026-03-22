@@ -18,6 +18,7 @@ from ...sim import (
 )
 from ..solver import SolverBase
 from .ipbf_kernels import (
+    accumulate_particle_shape_boundary_velocity_projection,
     apply_artificial_damping,
     apply_relaxed_jacobi_update,
     compute_constraint_and_gradient,
@@ -26,10 +27,13 @@ from .ipbf_kernels import (
     compute_force_without_grid,
     compute_hessian,
     compute_hessian_without_grid,
+    finalize_particle_shape_boundary_velocity_projection,
+    initialize_particle_shape_boundary_velocity_projection,
     initialize_guess_positions,
     initialize_constraint_and_gradient,
     initialize_density_and_neighbor_count,
     predict_inertial_positions,
+    project_particle_shape_contacts,
     solve_local_system,
     update_velocity_from_positions,
 )
@@ -72,6 +76,8 @@ class SolverIPBF(SolverBase):
             damping_compliance: Compliance used for the alternative position
                 solve in artificial damping.
             damping_beta: Distance threshold factor used by the damping model.
+            boundary_velocity_damping: Tangential damping multiplier applied to
+                particle velocities at final particle-shape contacts.
         """
 
         class KernelFamily(IntEnum):
@@ -90,6 +96,7 @@ class SolverIPBF(SolverBase):
         use_constraint_clamp: bool = True
         damping_compliance: float = 1.0 / 1000.0
         damping_beta: float = 60.0
+        boundary_velocity_damping: float = 1.0
 
     @override
     @classmethod
@@ -259,6 +266,7 @@ class SolverIPBF(SolverBase):
         self.use_constraint_clamp = bool(self.config.use_constraint_clamp)
         self.damping_compliance = float(self.config.damping_compliance)
         self.damping_beta = float(self.config.damping_beta)
+        self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
 
         if not hasattr(model, "ipbf"):
             raise ValueError(
@@ -271,6 +279,10 @@ class SolverIPBF(SolverBase):
         model.ipbf.compliance.fill_(self.compliance)
 
         self._initial_state = model.state()
+        with wp.ScopedDevice(model.device):
+            self._empty_body_q = wp.empty(0, dtype=wp.transform)
+            self._boundary_projected_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._boundary_projected_contact_count = wp.zeros(model.particle_count, dtype=int)
 
         if model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
@@ -315,6 +327,99 @@ class SolverIPBF(SolverBase):
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
             with wp.ScopedDevice(self.model.device):
                 self.model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
+
+    def _has_shape_boundary_contacts(self, contacts: Contacts | None) -> bool:
+        """Return whether shape boundary projection can be applied."""
+        return contacts is not None and self.model.shape_count > 0 and contacts.soft_contact_max > 0
+
+    def _apply_shape_boundary_contacts(
+        self,
+        state: State,
+        particle_q: wp.array(dtype=wp.vec3),
+        contacts: Contacts | None,
+    ) -> None:
+        """Project the given particle positions out of shape contacts."""
+        if not self._has_shape_boundary_contacts(contacts):
+            return
+
+        model = self.model
+        state.particle_q.assign(particle_q)
+        model.collide(state, contacts)
+
+        wp.launch(
+            project_particle_shape_contacts,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                state.particle_q,
+                model.particle_radius,
+                model.particle_flags,
+                state.body_q if state.body_q is not None else self._empty_body_q,
+                model.shape_body,
+                contacts.soft_contact_count,
+                contacts.soft_contact_particle,
+                contacts.soft_contact_shape,
+                contacts.soft_contact_body_pos,
+                contacts.soft_contact_normal,
+                contacts.soft_contact_max,
+                1.0,
+            ],
+            device=model.device,
+        )
+
+        particle_q.assign(state.particle_q)
+
+    def _apply_shape_boundary_velocity_projection(self, state: State, contacts: Contacts | None) -> None:
+        """Project final particle velocities against active particle-shape contacts."""
+        if not self._has_shape_boundary_contacts(contacts):
+            return
+
+        model = self.model
+        model.collide(state, contacts)
+
+        wp.launch(
+            initialize_particle_shape_boundary_velocity_projection,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+            ],
+            outputs=[
+                self._boundary_projected_particle_qd,
+                self._boundary_projected_contact_count,
+            ],
+            device=model.device,
+        )
+
+        wp.launch(
+            accumulate_particle_shape_boundary_velocity_projection,
+            dim=contacts.soft_contact_max,
+            inputs=[
+                state.particle_qd,
+                model.particle_flags,
+                contacts.soft_contact_count,
+                contacts.soft_contact_particle,
+                contacts.soft_contact_body_vel,
+                contacts.soft_contact_normal,
+                contacts.soft_contact_max,
+                self.boundary_velocity_damping,
+            ],
+            outputs=[
+                self._boundary_projected_particle_qd,
+                self._boundary_projected_contact_count,
+            ],
+            device=model.device,
+        )
+
+        wp.launch(
+            finalize_particle_shape_boundary_velocity_projection,
+            dim=model.particle_count,
+            inputs=[
+                state.particle_qd,
+                model.particle_flags,
+                self._boundary_projected_particle_qd,
+                self._boundary_projected_contact_count,
+            ],
+            device=model.device,
+        )
 
     def _compute_iteration_fields(
         self,
@@ -509,13 +614,16 @@ class SolverIPBF(SolverBase):
         6. Repeat for ``iterations`` rounds.
         7. During the final iteration, optionally compute a single alternative
            soft-compliance update for artificial damping.
-        8. Recompute the diagnostic fields on the final positions.
-        9. Commit the converged positions and reconstruct velocities, applying
+        8. If particle-shape contacts are provided, project iterates back out
+           of penetrating static or kinematic boundaries after each update.
+        9. Recompute the diagnostic fields on the final positions.
+        10. Commit the converged positions and reconstruct velocities, applying
            the artificial damping correction when enabled.
 
         The current force and Hessian use a stable approximation that includes
         neighborhood Gauss-Newton terms and diagonalized second-order
-        stabilization.
+        stabilization. Particle-shape contacts are handled by a minimal
+        normal-direction positional projection using Newton soft contacts.
         """
         if state_in.particle_q is None or state_in.particle_qd is None:
             raise ValueError("SolverIPBF requires particle positions and velocities.")
@@ -532,6 +640,9 @@ class SolverIPBF(SolverBase):
 
         state_out.particle_q.assign(state_in.particle_q)
         state_out.particle_qd.assign(state_in.particle_qd)
+        if model.body_count and state_in.body_q is not None and state_out.body_q is not None:
+            state_out.body_q.assign(state_in.body_q)
+            state_out.body_qd.assign(state_in.body_qd)
 
         wp.launch(
             predict_inertial_positions,
@@ -560,6 +671,9 @@ class SolverIPBF(SolverBase):
         state_out.ipbf.x_star.assign(state_out.ipbf.y)
 
         if self.iterations <= 0:
+            self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_guess, contacts)
+            state_out.ipbf.x_new.assign(state_out.ipbf.x_guess)
+            state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
             self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
             state_out.ipbf.delta_q.zero_()
         else:
@@ -600,6 +714,7 @@ class SolverIPBF(SolverBase):
                         outputs=[state_out.ipbf.x_star],
                         device=model.device,
                     )
+                    self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_star, contacts)
 
                     self._compute_iteration_fields(
                         state_out,
@@ -635,6 +750,7 @@ class SolverIPBF(SolverBase):
                     outputs=[state_out.ipbf.x_new],
                     device=model.device,
                 )
+                self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_new, contacts)
 
                 state_out.ipbf.x_guess.assign(state_out.ipbf.x_new)
 
@@ -671,3 +787,5 @@ class SolverIPBF(SolverBase):
                 outputs=[state_out.particle_qd],
                 device=model.device,
             )
+
+        self._apply_shape_boundary_velocity_projection(state_out, contacts)

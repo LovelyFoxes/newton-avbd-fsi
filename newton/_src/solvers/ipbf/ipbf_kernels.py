@@ -629,6 +629,127 @@ def apply_relaxed_jacobi_update(
 
 
 @wp.kernel
+def project_particle_shape_contacts(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    body_q: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=int),
+    contact_count: wp.array(dtype=int),
+    contact_particle: wp.array(dtype=int),
+    contact_shape: wp.array(dtype=int),
+    contact_body_pos: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    contact_max: int,
+    relaxation: float,
+):
+    """Project particles out of penetrating particle-shape soft contacts."""
+    tid = wp.tid()
+
+    count = min(contact_max, contact_count[0])
+    if tid >= count:
+        return
+
+    particle_index = contact_particle[tid]
+    shape_index = contact_shape[tid]
+    if particle_index < 0 or shape_index < 0:
+        return
+
+    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    body_index = shape_body[shape_index]
+    X_wb = wp.transform_identity()
+    if body_index >= 0:
+        X_wb = body_q[body_index]
+
+    x = particle_q[particle_index]
+    bx = wp.transform_point(X_wb, contact_body_pos[tid])
+    n = contact_normal[tid]
+    c = wp.dot(n, x - bx) - particle_radius[particle_index]
+    if c >= 0.0:
+        return
+
+    wp.atomic_add(particle_q, particle_index, -relaxation * c * n)
+
+
+@wp.kernel
+def initialize_particle_shape_boundary_velocity_projection(
+    particle_flags: wp.array(dtype=wp.int32),
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+):
+    """Initialize boundary-velocity projection accumulators."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        projected_particle_qd[tid] = wp.vec3(0.0)
+        projected_contact_count[tid] = 0
+        return
+
+    projected_particle_qd[tid] = wp.vec3(0.0)
+    projected_contact_count[tid] = 0
+
+
+@wp.kernel
+def accumulate_particle_shape_boundary_velocity_projection(
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    contact_count: wp.array(dtype=int),
+    contact_particle: wp.array(dtype=int),
+    contact_body_vel: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    contact_max: int,
+    tangential_damping: float,
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+):
+    """Accumulate per-contact projected particle velocities against shape boundaries."""
+    tid = wp.tid()
+
+    count = min(contact_max, contact_count[0])
+    if tid >= count:
+        return
+
+    particle_index = contact_particle[tid]
+    if particle_index < 0:
+        return
+
+    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    n = contact_normal[tid]
+    body_v = contact_body_vel[tid]
+    rel_v = particle_qd[particle_index] - body_v
+    rel_v_n = wp.dot(rel_v, n)
+    rel_v_t = rel_v - rel_v_n * n
+    rel_v_projected = wp.max(rel_v_n, 0.0) * n + tangential_damping * rel_v_t
+    projected_v = body_v + rel_v_projected
+
+    wp.atomic_add(projected_particle_qd, particle_index, projected_v)
+    wp.atomic_add(projected_contact_count, particle_index, 1)
+
+
+@wp.kernel
+def finalize_particle_shape_boundary_velocity_projection(
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+):
+    """Average accumulated boundary-projected velocities back into the particle state."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        particle_qd[tid] = wp.vec3(0.0)
+        return
+
+    count = projected_contact_count[tid]
+    if count > 0:
+        particle_qd[tid] = projected_particle_qd[tid] / float(count)
+
+
+@wp.kernel
 def update_velocity_from_positions(
     x_new: wp.array(dtype=wp.vec3),
     x_old: wp.array(dtype=wp.vec3),

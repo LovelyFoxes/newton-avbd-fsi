@@ -4,6 +4,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton.examples.ipbf.example_ipbf_box_container import Example as ExampleIPBFBoxContainer
 from newton._src.solvers.ipbf.ipbf_kernels import kernel_gradient, kernel_hessian, kernel_value
 from newton.solvers import SolverIPBF
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -277,6 +278,116 @@ def run_two_particle_ipbf_step(
     state_0.clear_forces()
     solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
     return state_1
+
+
+def run_single_particle_ground_step(device, *, use_contacts: bool):
+    """Run one gravity step for a particle above a ground plane."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particle(
+        pos=wp.vec3(0.0, 0.06, 0.0),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        mass=1.0,
+        radius=0.05,
+    )
+    builder.add_ground_plane()
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, -9.81, 0.0))
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            smoothing_radius=0.2,
+            iterations=0,
+        ),
+    )
+
+    contacts = None
+    if use_contacts:
+        collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
+        contacts = model.contacts(collision_pipeline=collision_pipeline)
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=contacts, dt=0.1)
+    return state_1, contacts
+
+
+def run_single_particle_ground_rollout(
+    device,
+    *,
+    steps: int,
+    boundary_velocity_damping: float = 1.0,
+    initial_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    gravity: tuple[float, float, float] = (0.0, -9.81, 0.0),
+    dt: float = 0.1,
+):
+    """Run several gravity steps for a particle above a ground plane."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particle(
+        pos=wp.vec3(0.0, 0.06, 0.0),
+        vel=wp.vec3(*initial_velocity),
+        mass=1.0,
+        radius=0.05,
+    )
+    builder.add_ground_plane()
+
+    model = builder.finalize(device=device)
+    model.set_gravity(gravity)
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            smoothing_radius=0.2,
+            iterations=0,
+            boundary_velocity_damping=boundary_velocity_damping,
+        ),
+    )
+
+    collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
+    contacts = model.contacts(collision_pipeline=collision_pipeline)
+    state_0 = model.state()
+    state_1 = model.state()
+
+    positions = []
+    velocities = []
+    for _ in range(steps):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control=None, contacts=contacts, dt=dt)
+        state_0, state_1 = state_1, state_0
+        positions.append(state_0.particle_q.numpy()[0].copy())
+        velocities.append(state_0.particle_qd.numpy()[0].copy())
+
+    return state_0, contacts, np.asarray(positions, dtype=np.float32), np.asarray(velocities, dtype=np.float32)
+
+
+def run_ipbf_box_container_rollout(device, *, num_frames: int):
+    """Run the public IPBF box-container example with a null viewer."""
+    with wp.ScopedDevice(device):
+        viewer = newton.viewer.ViewerNull()
+        example = ExampleIPBFBoxContainer(viewer)
+        example.graph = None
+
+        speed_history = []
+        max_abs_x = 0.0
+        max_abs_z = 0.0
+        min_y = np.inf
+
+        for _ in range(num_frames):
+            example.step()
+            particle_q = example.state_0.particle_q.numpy()
+            particle_qd = example.state_0.particle_qd.numpy()
+            particle_radius = example.model.particle_radius.numpy()
+
+            max_abs_x = max(max_abs_x, float(np.max(np.abs(particle_q[:, 0]) + particle_radius)))
+            max_abs_z = max(max_abs_z, float(np.max(np.abs(particle_q[:, 2]) + particle_radius)))
+            min_y = min(min_y, float(np.min(particle_q[:, 1] - particle_radius)))
+            speed_history.append(float(np.linalg.norm(particle_qd, axis=1).max()))
+
+    return np.asarray(speed_history, dtype=np.float32), max_abs_x, max_abs_z, float(min_y)
 
 
 def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device):
@@ -838,6 +949,50 @@ def test_ipbf_artificial_damping_reduces_velocity_magnitude(test, device):
     test.assertTrue(np.all(np.linalg.norm(damped.ipbf.x_star.numpy() - damped.particle_q.numpy(), axis=1) > 0.0))
 
 
+def test_ipbf_static_shape_boundary_projects_particles_out_of_ground(test, device):
+    without_contacts, _ = run_single_particle_ground_step(device, use_contacts=False)
+    with_contacts, contacts = run_single_particle_ground_step(device, use_contacts=True)
+
+    test.assertLess(float(without_contacts.particle_q.numpy()[0, 1]), 0.05)
+    test.assertGreaterEqual(float(with_contacts.particle_q.numpy()[0, 1]), 0.05 - 1.0e-5)
+    test.assertAlmostEqual(float(with_contacts.particle_q.numpy()[0, 0]), 0.0, places=6)
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+
+
+def test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity(test, device):
+    final_state, contacts, positions, velocities = run_single_particle_ground_rollout(device, steps=6)
+
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+    test.assertGreaterEqual(float(np.min(positions[:, 1])), 0.05 - 1.0e-5)
+    test.assertGreaterEqual(float(velocities[-1, 1]), -1.0e-5)
+    test.assertLessEqual(abs(float(final_state.particle_qd.numpy()[0, 1])), 1.0e-4)
+
+
+def test_ipbf_box_container_rollout_keeps_particles_inside_bounds(test, device):
+    _, max_abs_x, max_abs_z, min_y = run_ipbf_box_container_rollout(device, num_frames=200)
+
+    test.assertLessEqual(max_abs_x, 0.57)
+    test.assertLessEqual(max_abs_z, 0.57)
+    test.assertGreaterEqual(min_y, -0.02)
+
+
+def test_ipbf_ground_contact_tangential_damping_reduces_speed(test, device):
+    _, contacts, _, velocities = run_single_particle_ground_rollout(
+        device,
+        steps=10,
+        boundary_velocity_damping=0.9,
+        initial_velocity=(1.0, 0.0, 0.0),
+        gravity=(0.0, -9.81, 0.0),
+        dt=0.05,
+    )
+
+    speed_history = np.linalg.norm(velocities[:, [0, 2]], axis=1)
+
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+    test.assertLess(float(speed_history[-1]), float(speed_history[0]))
+    test.assertLess(float(speed_history[-1]), 0.5)
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -921,6 +1076,38 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_reset_restores_initial_particle_state",
     test_ipbf_reset_restores_initial_particle_state,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_static_shape_boundary_projects_particles_out_of_ground",
+    test_ipbf_static_shape_boundary_projects_particles_out_of_ground,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity",
+    test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_box_container_rollout_keeps_particles_inside_bounds",
+    test_ipbf_box_container_rollout_keeps_particles_inside_bounds,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_ground_contact_tangential_damping_reduces_speed",
+    test_ipbf_ground_contact_tangential_damping_reduces_speed,
     devices=devices,
     check_output=False,
 )
