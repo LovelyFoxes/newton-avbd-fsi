@@ -190,6 +190,43 @@ def diagonal_from_column_norms(matrix: wp.mat33) -> wp.mat33:
 
 
 @wp.kernel
+def compute_boundary_particle_volumes(
+    boundary_grid: wp.uint64,
+    boundary_q: wp.array(dtype=wp.vec3),
+    boundary_world: wp.array(dtype=wp.int32),
+    support_radius: float,
+    kernel_family: int,
+    boundary_volume: wp.array(dtype=float),
+):
+    """Estimate Akinci-style boundary particle volumes from local kernel sums."""
+    tid = wp.tid()
+
+    xi = boundary_q[tid]
+    world_i = boundary_world[tid]
+    kernel_sum = float(0.0)
+
+    query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        world_j = boundary_world[index]
+        if world_i >= 0 and world_j >= 0 and world_i != world_j:
+            continue
+
+        displacement = xi - boundary_q[index]
+        weight = kernel_value(wp.dot(displacement, displacement), support_radius, kernel_family)
+        if weight <= 0.0:
+            continue
+
+        kernel_sum += weight
+
+    if kernel_sum > 0.0:
+        boundary_volume[tid] = 1.0 / kernel_sum
+    else:
+        boundary_volume[tid] = 0.0
+
+
+@wp.kernel
 def predict_inertial_positions(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
@@ -248,6 +285,7 @@ def initialize_density_and_neighbor_count(
     boundary_volume: wp.array(dtype=float),
     boundary_world: wp.array(dtype=wp.int32),
     boundary_particle_count: int,
+    rest_density: float,
     support_radius: float,
     kernel_family: int,
     density: wp.array(dtype=float),
@@ -269,7 +307,7 @@ def initialize_density_and_neighbor_count(
     world_i = particle_world[tid]
     rho = particle_mass[tid] * kernel_value(0.0, support_radius, kernel_family)
 
-    if boundary_particle_count > 0:
+    if boundary_particle_count > 0 and rest_density > 0.0:
         query = wp.hash_grid_query(boundary_grid, xi, support_radius)
         index = int(0)
 
@@ -284,7 +322,7 @@ def initialize_density_and_neighbor_count(
             if kernel <= 0.0:
                 continue
 
-            rho += boundary_volume[index] * kernel
+            rho += rest_density * boundary_volume[index] * kernel
 
     density[tid] = rho
     neighbor_count[tid] = 0
@@ -333,7 +371,7 @@ def initialize_constraint_and_gradient(
                 continue
 
             displacement = xi - boundary_q[index]
-            grad += boundary_volume[index] * kernel_gradient(displacement, support_radius, kernel_family)
+            grad += rest_density * boundary_volume[index] * kernel_gradient(displacement, support_radius, kernel_family)
 
     constraint[tid] = c
     constraint_gradient[tid] = grad / rest_density
@@ -351,6 +389,7 @@ def compute_density_and_neighbor_count(
     boundary_volume: wp.array(dtype=float),
     boundary_world: wp.array(dtype=wp.int32),
     boundary_particle_count: int,
+    rest_density: float,
     support_radius: float,
     kernel_family: int,
     density: wp.array(dtype=float),
@@ -390,7 +429,7 @@ def compute_density_and_neighbor_count(
         if index != tid:
             count += 1
 
-    if boundary_particle_count > 0:
+    if boundary_particle_count > 0 and rest_density > 0.0:
         boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
         boundary_index = int(0)
 
@@ -405,7 +444,7 @@ def compute_density_and_neighbor_count(
             if kernel <= 0.0:
                 continue
 
-            rho += boundary_volume[boundary_index] * kernel
+            rho += rest_density * boundary_volume[boundary_index] * kernel
 
     density[tid] = rho
     neighbor_count[tid] = count
@@ -473,7 +512,11 @@ def compute_constraint_and_gradient(
                 continue
 
             displacement = xi - boundary_q[boundary_index]
-            grad += boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
+            grad += (
+                rest_density
+                * boundary_volume[boundary_index]
+                * kernel_gradient(displacement, support_radius, kernel_family)
+            )
 
     constraint[tid] = c
     constraint_gradient[tid] = grad / rest_density
@@ -652,7 +695,7 @@ def compute_hessian(
                 continue
 
             displacement = xi - boundary_q[boundary_index]
-            constraint_hessian += boundary_volume[boundary_index] * kernel_hessian(
+            constraint_hessian += rest_density * boundary_volume[boundary_index] * kernel_hessian(
                 displacement, support_radius, kernel_family
             )
 
@@ -713,7 +756,7 @@ def compute_hessian_without_grid(
                     continue
 
                 displacement = xi - boundary_q[boundary_index]
-                constraint_hessian += boundary_volume[boundary_index] * kernel_hessian(
+                constraint_hessian += rest_density * boundary_volume[boundary_index] * kernel_hessian(
                     displacement, support_radius, kernel_family
                 )
 

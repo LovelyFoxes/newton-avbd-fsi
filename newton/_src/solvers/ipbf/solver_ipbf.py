@@ -21,6 +21,7 @@ from .ipbf_kernels import (
     accumulate_particle_shape_boundary_velocity_projection,
     apply_artificial_damping,
     apply_relaxed_jacobi_update,
+    compute_boundary_particle_volumes,
     compute_constraint_and_gradient,
     compute_density_and_neighbor_count,
     compute_force,
@@ -381,9 +382,7 @@ class SolverIPBF(SolverBase):
             return
 
         if volumes is None:
-            if spacing is None or spacing <= 0.0:
-                raise ValueError("setup_boundary_particles() requires either explicit volumes or a positive spacing.")
-            volumes_np = np.full(count, float(spacing) ** 3, dtype=np.float32)
+            volumes_np = None
         else:
             volumes_np = np.asarray(volumes, dtype=np.float32).reshape((-1,))
             if volumes_np.shape[0] != count:
@@ -398,11 +397,27 @@ class SolverIPBF(SolverBase):
 
         with wp.ScopedDevice(self.model.device):
             self._boundary_particle_q = wp.array(positions_np, dtype=wp.vec3, device=self.model.device)
-            self._boundary_particle_volume = wp.array(volumes_np, dtype=float, device=self.model.device)
             self._boundary_particle_world = wp.array(world_np, dtype=int, device=self.model.device)
             self._boundary_particle_grid = wp.HashGrid(128, 128, 128)
             self._boundary_particle_grid.reserve(count)
             self._boundary_particle_grid.build(self._boundary_particle_q, radius=self.smoothing_radius)
+            if volumes_np is None:
+                self._boundary_particle_volume = wp.zeros(count, dtype=float, device=self.model.device)
+                wp.launch(
+                    compute_boundary_particle_volumes,
+                    dim=count,
+                    inputs=[
+                        self._boundary_particle_grid.id,
+                        self._boundary_particle_q,
+                        self._boundary_particle_world,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                    ],
+                    outputs=[self._boundary_particle_volume],
+                    device=self.model.device,
+                )
+            else:
+                self._boundary_particle_volume = wp.array(volumes_np, dtype=float, device=self.model.device)
 
         self._boundary_particle_count = count
 
@@ -466,8 +481,8 @@ class SolverIPBF(SolverBase):
 
         self.setup_boundary_particles(
             positions,
-            volumes=np.full(positions.shape[0], spacing**3, dtype=np.float32),
             world_indices=np.full(positions.shape[0], world_index, dtype=np.int32),
+            spacing=spacing,
         )
 
     def _has_shape_boundary_contacts(self, contacts: Contacts | None) -> bool:
@@ -613,6 +628,7 @@ class SolverIPBF(SolverBase):
                     self._boundary_particle_volume,
                     self._boundary_particle_world,
                     self._boundary_particle_count,
+                    self.rest_density,
                     self.smoothing_radius,
                     self.kernel_family,
                 ],
@@ -657,6 +673,7 @@ class SolverIPBF(SolverBase):
                     self._boundary_particle_volume,
                     self._boundary_particle_world,
                     self._boundary_particle_count,
+                    self.rest_density,
                     self.smoothing_radius,
                     self.kernel_family,
                 ],

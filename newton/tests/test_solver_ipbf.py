@@ -5,6 +5,9 @@ import warp as wp
 
 import newton
 from newton.examples.ipbf.example_ipbf_box_container import Example as ExampleIPBFBoxContainer
+from newton.examples.ipbf.example_ipbf_box_container_boundary_particles import (
+    Example as ExampleIPBFBoxContainerBoundaryParticles,
+)
 from newton._src.solvers.ipbf.ipbf_kernels import kernel_gradient, kernel_hessian, kernel_value
 from newton.solvers import SolverIPBF
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -315,7 +318,7 @@ def run_single_particle_ground_step(device, *, use_contacts: bool):
     return state_1, contacts
 
 
-def run_single_particle_boundary_particle_step(device):
+def run_single_particle_boundary_particle_step(device, *, rest_density: float = 1.0, return_solver: bool = False):
     """Run one zero-gravity step with solver-owned boundary particles."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
@@ -332,7 +335,7 @@ def run_single_particle_boundary_particle_step(device):
     solver = SolverIPBF(
         model,
         SolverIPBF.Config(
-            rest_density=1.0,
+            rest_density=rest_density,
             smoothing_radius=0.2,
             boundary_mode=SolverIPBF.Config.BoundaryMode.BOUNDARY_PARTICLES,
             iterations=0,
@@ -349,6 +352,8 @@ def run_single_particle_boundary_particle_step(device):
     state_1 = model.state()
     state_0.clear_forces()
     solver.step(state_0, state_1, control=None, contacts=None, dt=0.01)
+    if return_solver:
+        return solver, state_1
     return state_1
 
 
@@ -406,6 +411,32 @@ def run_ipbf_box_container_rollout(device, *, num_frames: int):
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = ExampleIPBFBoxContainer(viewer)
+        example.graph = None
+
+        speed_history = []
+        max_abs_x = 0.0
+        max_abs_z = 0.0
+        min_y = np.inf
+
+        for _ in range(num_frames):
+            example.step()
+            particle_q = example.state_0.particle_q.numpy()
+            particle_qd = example.state_0.particle_qd.numpy()
+            particle_radius = example.model.particle_radius.numpy()
+
+            max_abs_x = max(max_abs_x, float(np.max(np.abs(particle_q[:, 0]) + particle_radius)))
+            max_abs_z = max(max_abs_z, float(np.max(np.abs(particle_q[:, 2]) + particle_radius)))
+            min_y = min(min_y, float(np.min(particle_q[:, 1] - particle_radius)))
+            speed_history.append(float(np.linalg.norm(particle_qd, axis=1).max()))
+
+    return np.asarray(speed_history, dtype=np.float32), max_abs_x, max_abs_z, float(min_y)
+
+
+def run_ipbf_boundary_particle_box_container_rollout(device, *, num_frames: int):
+    """Run the boundary-particle IPBF box-container example with a null viewer."""
+    with wp.ScopedDevice(device):
+        viewer = newton.viewer.ViewerNull()
+        example = ExampleIPBFBoxContainerBoundaryParticles(viewer)
         example.graph = None
 
         speed_history = []
@@ -1008,6 +1039,27 @@ def test_ipbf_boundary_particles_contribute_near_wall_density_and_gradient(test,
     test.assertAlmostEqual(float(state_1.particle_q.numpy()[0, 1]), 0.06, places=6)
 
 
+def test_ipbf_boundary_particle_volumes_are_positive(test, device):
+    solver, _ = run_single_particle_boundary_particle_step(device, return_solver=True)
+
+    volumes = solver._boundary_particle_volume.numpy()
+
+    test.assertGreater(solver._boundary_particle_count, 0)
+    test.assertTrue(np.isfinite(volumes).all())
+    test.assertTrue(np.all(volumes > 0.0))
+
+
+def test_ipbf_boundary_particles_contribute_at_physical_rest_density(test, device):
+    state_1 = run_single_particle_boundary_particle_step(device, rest_density=1000.0)
+
+    density = float(state_1.ipbf.density.numpy()[0])
+    gradient = state_1.ipbf.constraint_gradient.numpy()[0]
+    self_density = kernel_density_contribution(1.0, 0.2, 0.0)
+
+    test.assertGreater(density, float(self_density) + 50.0)
+    test.assertLess(float(gradient[1]), -1.0e-3)
+
+
 def test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity(test, device):
     final_state, contacts, positions, velocities = run_single_particle_ground_rollout(device, steps=6)
 
@@ -1022,6 +1074,17 @@ def test_ipbf_box_container_rollout_keeps_particles_inside_bounds(test, device):
         return
 
     _, max_abs_x, max_abs_z, min_y = run_ipbf_box_container_rollout(device, num_frames=120)
+
+    test.assertLessEqual(max_abs_x, 0.57)
+    test.assertLessEqual(max_abs_z, 0.57)
+    test.assertGreaterEqual(min_y, -0.02)
+
+
+def test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds(test, device):
+    if wp.get_device(device).is_cpu:
+        return
+
+    _, max_abs_x, max_abs_z, min_y = run_ipbf_boundary_particle_box_container_rollout(device, num_frames=120)
 
     test.assertLessEqual(max_abs_x, 0.57)
     test.assertLessEqual(max_abs_z, 0.57)
@@ -1150,6 +1213,22 @@ add_function_test(
 
 add_function_test(
     TestSolverIPBF,
+    "test_ipbf_boundary_particle_volumes_are_positive",
+    test_ipbf_boundary_particle_volumes_are_positive,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_particles_contribute_at_physical_rest_density",
+    test_ipbf_boundary_particles_contribute_at_physical_rest_density,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
     "test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity",
     test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity,
     devices=devices,
@@ -1160,6 +1239,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_box_container_rollout_keeps_particles_inside_bounds",
     test_ipbf_box_container_rollout_keeps_particles_inside_bounds,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds",
+    test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds,
     devices=devices,
     check_output=False,
 )
