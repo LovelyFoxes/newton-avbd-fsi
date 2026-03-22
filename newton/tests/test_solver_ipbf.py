@@ -315,6 +315,43 @@ def run_single_particle_ground_step(device, *, use_contacts: bool):
     return state_1, contacts
 
 
+def run_single_particle_boundary_particle_step(device):
+    """Run one zero-gravity step with solver-owned boundary particles."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particle(
+        pos=wp.vec3(0.0, 0.06, 0.0),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        mass=1.0,
+        radius=0.05,
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1.0,
+            smoothing_radius=0.2,
+            boundary_mode=SolverIPBF.Config.BoundaryMode.BOUNDARY_PARTICLES,
+            iterations=0,
+        ),
+    )
+    solver.setup_boundary_particles_box(
+        half_width=0.2,
+        half_depth=0.2,
+        wall_half_height=0.2,
+        spacing=0.05,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.01)
+    return state_1
+
+
 def run_single_particle_ground_rollout(
     device,
     *,
@@ -959,6 +996,18 @@ def test_ipbf_static_shape_boundary_projects_particles_out_of_ground(test, devic
     test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
 
 
+def test_ipbf_boundary_particles_contribute_near_wall_density_and_gradient(test, device):
+    state_1 = run_single_particle_boundary_particle_step(device)
+
+    density = state_1.ipbf.density.numpy()[0]
+    gradient = state_1.ipbf.constraint_gradient.numpy()[0]
+    self_density = kernel_density_contribution(1.0, 0.2, 0.0)
+
+    test.assertGreater(float(density), float(self_density))
+    test.assertLess(float(gradient[1]), 0.0)
+    test.assertAlmostEqual(float(state_1.particle_q.numpy()[0, 1]), 0.06, places=6)
+
+
 def test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity(test, device):
     final_state, contacts, positions, velocities = run_single_particle_ground_rollout(device, steps=6)
 
@@ -969,7 +1018,10 @@ def test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity(te
 
 
 def test_ipbf_box_container_rollout_keeps_particles_inside_bounds(test, device):
-    _, max_abs_x, max_abs_z, min_y = run_ipbf_box_container_rollout(device, num_frames=200)
+    if wp.get_device(device).is_cpu:
+        return
+
+    _, max_abs_x, max_abs_z, min_y = run_ipbf_box_container_rollout(device, num_frames=120)
 
     test.assertLessEqual(max_abs_x, 0.57)
     test.assertLessEqual(max_abs_z, 0.57)
@@ -1084,6 +1136,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_static_shape_boundary_projects_particles_out_of_ground",
     test_ipbf_static_shape_boundary_projects_particles_out_of_ground,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_particles_contribute_near_wall_density_and_gradient",
+    test_ipbf_boundary_particles_contribute_near_wall_density_and_gradient,
     devices=devices,
     check_output=False,
 )

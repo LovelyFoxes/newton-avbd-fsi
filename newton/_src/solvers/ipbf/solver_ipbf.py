@@ -66,6 +66,7 @@ class SolverIPBF(SolverBase):
             smoothing_radius: SPH kernel support radius [m].
             kernel_family: SPH kernel family used for density, gradient, and
                 Hessian evaluation.
+            boundary_mode: Boundary handling mode used by the solver.
             compliance: Normalized compliance parameter ``alpha = 1 / k``.
             hessian_regularization: Small diagonal regularization added to the
                 local Hessian to keep it invertible.
@@ -86,9 +87,16 @@ class SolverIPBF(SolverBase):
             CUBIC_SPLINE = 0
             POLY6 = 1
 
+        class BoundaryMode(IntEnum):
+            """Selectable boundary handling modes for IPBF."""
+
+            SHAPE_PROJECTION = 0
+            BOUNDARY_PARTICLES = 1
+
         rest_density: float = 1000.0
         smoothing_radius: float = 0.1
         kernel_family: KernelFamily = KernelFamily.CUBIC_SPLINE
+        boundary_mode: BoundaryMode = BoundaryMode.SHAPE_PROJECTION
         compliance: float = 0.0
         hessian_regularization: float = 1.0e-6
         iterations: int = 3
@@ -259,6 +267,7 @@ class SolverIPBF(SolverBase):
         self.rest_density = float(self.config.rest_density)
         self.smoothing_radius = float(self.config.smoothing_radius)
         self.kernel_family = int(self.Config.KernelFamily(self.config.kernel_family))
+        self.boundary_mode = int(self.Config.BoundaryMode(self.config.boundary_mode))
         self.compliance = float(self.config.compliance)
         self.hessian_regularization = float(self.config.hessian_regularization)
         self.iterations = int(self.config.iterations)
@@ -281,12 +290,21 @@ class SolverIPBF(SolverBase):
         self._initial_state = model.state()
         with wp.ScopedDevice(model.device):
             self._empty_body_q = wp.empty(0, dtype=wp.transform)
+            self._empty_vec3 = wp.empty(0, dtype=wp.vec3)
+            self._empty_float = wp.empty(0, dtype=float)
+            self._empty_int = wp.empty(0, dtype=int)
             self._boundary_projected_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projected_contact_count = wp.zeros(model.particle_count, dtype=int)
 
         if model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
                 model.particle_grid.reserve(model.particle_count)
+
+        self._boundary_particle_q = self._empty_vec3
+        self._boundary_particle_volume = self._empty_float
+        self._boundary_particle_world = self._empty_int
+        self._boundary_particle_grid: wp.HashGrid | None = None
+        self._boundary_particle_count = 0
 
     def reset(self, state_out: State) -> None:
         """Reset a state to the solver's initial particle configuration.
@@ -328,9 +346,137 @@ class SolverIPBF(SolverBase):
             with wp.ScopedDevice(self.model.device):
                 self.model.particle_grid.build(state_out.ipbf.x_guess, radius=self.smoothing_radius)
 
+    def clear_boundary_particles(self) -> None:
+        """Clear all solver-owned static boundary particles."""
+        self._boundary_particle_q = self._empty_vec3
+        self._boundary_particle_volume = self._empty_float
+        self._boundary_particle_world = self._empty_int
+        self._boundary_particle_grid = None
+        self._boundary_particle_count = 0
+
+    def setup_boundary_particles(
+        self,
+        positions: np.ndarray | list[tuple[float, float, float]] | list[list[float]],
+        *,
+        volumes: np.ndarray | list[float] | None = None,
+        world_indices: np.ndarray | list[int] | None = None,
+        spacing: float | None = None,
+    ) -> None:
+        """Initialize static boundary particles owned by the solver.
+
+        Args:
+            positions: Boundary particle positions [m], shape [count, 3].
+            volumes: Effective boundary particle volumes [m^3], shape [count].
+                If omitted, ``spacing`` must be provided and a uniform
+                ``spacing**3`` volume is used.
+            world_indices: World index of each boundary particle. If omitted,
+                all particles are assigned to world 0.
+            spacing: Sampling spacing [m] used when ``volumes`` are omitted.
+        """
+        positions_np = np.asarray(positions, dtype=np.float32).reshape((-1, 3))
+        count = int(positions_np.shape[0])
+
+        if count == 0:
+            self.clear_boundary_particles()
+            return
+
+        if volumes is None:
+            if spacing is None or spacing <= 0.0:
+                raise ValueError("setup_boundary_particles() requires either explicit volumes or a positive spacing.")
+            volumes_np = np.full(count, float(spacing) ** 3, dtype=np.float32)
+        else:
+            volumes_np = np.asarray(volumes, dtype=np.float32).reshape((-1,))
+            if volumes_np.shape[0] != count:
+                raise ValueError("Boundary particle volume count must match the number of boundary particle positions.")
+
+        if world_indices is None:
+            world_np = np.zeros(count, dtype=np.int32)
+        else:
+            world_np = np.asarray(world_indices, dtype=np.int32).reshape((-1,))
+            if world_np.shape[0] != count:
+                raise ValueError("Boundary particle world-index count must match the number of boundary particle positions.")
+
+        with wp.ScopedDevice(self.model.device):
+            self._boundary_particle_q = wp.array(positions_np, dtype=wp.vec3, device=self.model.device)
+            self._boundary_particle_volume = wp.array(volumes_np, dtype=float, device=self.model.device)
+            self._boundary_particle_world = wp.array(world_np, dtype=int, device=self.model.device)
+            self._boundary_particle_grid = wp.HashGrid(128, 128, 128)
+            self._boundary_particle_grid.reserve(count)
+            self._boundary_particle_grid.build(self._boundary_particle_q, radius=self.smoothing_radius)
+
+        self._boundary_particle_count = count
+
+    def setup_boundary_particles_box(
+        self,
+        *,
+        half_width: float,
+        half_depth: float,
+        wall_half_height: float,
+        spacing: float,
+        floor_y: float = 0.0,
+        world_index: int = 0,
+    ) -> None:
+        """Sample a static open-top box boundary into boundary particles.
+
+        Args:
+            half_width: Interior half-width of the box [m].
+            half_depth: Interior half-depth of the box [m].
+            wall_half_height: Interior half-height of the side walls [m].
+            spacing: Boundary-particle sampling spacing [m].
+            floor_y: Height of the box floor [m].
+            world_index: World index assigned to all boundary particles.
+        """
+        if spacing <= 0.0:
+            raise ValueError("setup_boundary_particles_box() requires a positive spacing.")
+
+        top_y = floor_y + 2.0 * wall_half_height
+
+        def sample_axis(min_value: float, max_value: float) -> np.ndarray:
+            length = max_value - min_value
+            count = max(2, int(np.floor(length / spacing + 0.5)) + 1)
+            return np.linspace(min_value, max_value, count, dtype=np.float32)
+
+        xs = sample_axis(-half_width, half_width)
+        ys = sample_axis(floor_y, top_y)
+        zs = sample_axis(-half_depth, half_depth)
+
+        def append_plane(
+            points: list[np.ndarray], fixed_axis: int, fixed_value: float, axis_a: np.ndarray, axis_b: np.ndarray
+        ) -> None:
+            grid_a, grid_b = np.meshgrid(axis_a, axis_b, indexing="ij")
+            plane = np.zeros((grid_a.size, 3), dtype=np.float32)
+            free_axes = [0, 1, 2]
+            free_axes.remove(fixed_axis)
+            plane[:, fixed_axis] = fixed_value
+            plane[:, free_axes[0]] = grid_a.reshape(-1)
+            plane[:, free_axes[1]] = grid_b.reshape(-1)
+            points.append(plane)
+
+        planes: list[np.ndarray] = []
+        append_plane(planes, 1, floor_y, xs, zs)
+        append_plane(planes, 0, half_width, ys, zs)
+        append_plane(planes, 0, -half_width, ys, zs)
+        append_plane(planes, 2, half_depth, xs, ys)
+        append_plane(planes, 2, -half_depth, xs, ys)
+
+        positions = np.concatenate(planes, axis=0)
+        quantized = np.round(positions / spacing).astype(np.int64)
+        _, unique_indices = np.unique(quantized, axis=0, return_index=True)
+        positions = positions[np.sort(unique_indices)]
+
+        self.setup_boundary_particles(
+            positions,
+            volumes=np.full(positions.shape[0], spacing**3, dtype=np.float32),
+            world_indices=np.full(positions.shape[0], world_index, dtype=np.int32),
+        )
+
     def _has_shape_boundary_contacts(self, contacts: Contacts | None) -> bool:
         """Return whether shape boundary projection can be applied."""
         return contacts is not None and self.model.shape_count > 0 and contacts.soft_contact_max > 0
+
+    def _has_boundary_particles(self) -> bool:
+        """Return whether the solver currently owns static boundary particles."""
+        return self.boundary_mode == int(self.Config.BoundaryMode.BOUNDARY_PARTICLES) and self._boundary_particle_count > 0
 
     def _apply_shape_boundary_contacts(
         self,
@@ -446,6 +592,8 @@ class SolverIPBF(SolverBase):
         """
         model = self.model
         compliance_value = self.compliance if compliance is None else float(compliance)
+        has_boundary_particles = self._has_boundary_particles()
+        boundary_grid_id = self._boundary_particle_grid.id if has_boundary_particles and self._boundary_particle_grid else 0
 
         if recompute_density_constraint and model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
@@ -460,6 +608,11 @@ class SolverIPBF(SolverBase):
                     model.particle_mass,
                     model.particle_flags,
                     model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
                     self.smoothing_radius,
                     self.kernel_family,
                 ],
@@ -476,6 +629,11 @@ class SolverIPBF(SolverBase):
                     model.particle_mass,
                     model.particle_flags,
                     model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
                     state.ipbf.density,
                     self.rest_density,
                     self.smoothing_radius,
@@ -490,8 +648,15 @@ class SolverIPBF(SolverBase):
                 initialize_density_and_neighbor_count,
                 dim=model.particle_count,
                 inputs=[
+                    particle_q,
                     model.particle_mass,
                     model.particle_flags,
+                    model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
                     self.smoothing_radius,
                     self.kernel_family,
                 ],
@@ -503,9 +668,18 @@ class SolverIPBF(SolverBase):
                 initialize_constraint_and_gradient,
                 dim=model.particle_count,
                 inputs=[
+                    particle_q,
                     state.ipbf.density,
                     model.particle_flags,
+                    model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
                     self.rest_density,
+                    self.smoothing_radius,
+                    self.kernel_family,
                     int(self.use_constraint_clamp),
                 ],
                 outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
@@ -544,6 +718,11 @@ class SolverIPBF(SolverBase):
                     model.particle_mass,
                     model.particle_flags,
                     model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
                     state.ipbf.constraint,
                     state.ipbf.constraint_gradient,
                     self.rest_density,
@@ -580,6 +759,13 @@ class SolverIPBF(SolverBase):
                 inputs=[
                     model.particle_mass,
                     model.particle_flags,
+                    particle_q,
+                    model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
                     state.ipbf.constraint,
                     state.ipbf.constraint_gradient,
                     self.rest_density,
