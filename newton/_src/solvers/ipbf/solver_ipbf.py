@@ -18,6 +18,7 @@ from ...sim import (
 )
 from ..solver import SolverBase
 from .ipbf_kernels import (
+    apply_artificial_damping,
     apply_relaxed_jacobi_update,
     compute_constraint_and_gradient,
     compute_density_and_neighbor_count,
@@ -107,6 +108,7 @@ class SolverIPBF(SolverBase):
             - ``ipbf:y``: Inertial target position :math:`y = x^t + h v^t + h^2 a^*`
             - ``ipbf:x_guess``: Current relaxed Jacobi iterate
             - ``ipbf:x_new``: Updated relaxed Jacobi iterate
+            - ``ipbf:x_star``: Alternative final-iteration position used by artificial damping
             - ``ipbf:density``: Current SPH density estimate :math:`\\rho_i` [kg/m^3]
             - ``ipbf:neighbor_count``: Number of active neighboring particles inside the support radius
             - ``ipbf:constraint``: Density constraint value :math:`C_i = \\rho_i / \\rho_0 - 1`
@@ -164,6 +166,14 @@ class SolverIPBF(SolverBase):
             ),
             ModelBuilder.CustomAttribute(
                 name="x_new",
+                frequency=Model.AttributeFrequency.PARTICLE,
+                assignment=Model.AttributeAssignment.STATE,
+                dtype=wp.vec3,
+                default=wp.vec3(0.0),
+                namespace="ipbf",
+            ),
+            ModelBuilder.CustomAttribute(
+                name="x_star",
                 frequency=Model.AttributeFrequency.PARTICLE,
                 assignment=Model.AttributeAssignment.STATE,
                 dtype=wp.vec3,
@@ -293,6 +303,7 @@ class SolverIPBF(SolverBase):
             outputs=[state_out.ipbf.x_guess, state_out.ipbf.x_new],
             device=self.model.device,
         )
+        state_out.ipbf.x_star.assign(state_out.particle_q)
 
         state_out.ipbf.density.zero_()
         state_out.ipbf.neighbor_count.zero_()
@@ -310,6 +321,9 @@ class SolverIPBF(SolverBase):
         state: State,
         particle_q: wp.array(dtype=wp.vec3),
         dt: float,
+        *,
+        recompute_density_constraint: bool = True,
+        compliance: float | None = None,
     ) -> None:
         """Assemble IPBF local solve quantities for the given particle positions.
 
@@ -318,10 +332,17 @@ class SolverIPBF(SolverBase):
             particle_q: Current particle positions [m] used to build the local
                 IPBF system.
             dt: Timestep size [s].
+            recompute_density_constraint: Whether to recompute density and
+                constraint terms on ``particle_q`` before assembling the local
+                linear system.
+            compliance: Compliance override used when assembling force and
+                Hessian terms. If ``None``, uses the solver's default
+                compliance.
         """
         model = self.model
+        compliance_value = self.compliance if compliance is None else float(compliance)
 
-        if model.particle_count > 1 and model.particle_grid is not None:
+        if recompute_density_constraint and model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
                 model.particle_grid.build(particle_q, radius=self.smoothing_radius)
 
@@ -359,7 +380,7 @@ class SolverIPBF(SolverBase):
                 outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
                 device=model.device,
             )
-        else:
+        elif recompute_density_constraint:
             wp.launch(
                 initialize_density_and_neighbor_count,
                 dim=model.particle_count,
@@ -402,7 +423,7 @@ class SolverIPBF(SolverBase):
                     self.rest_density,
                     self.smoothing_radius,
                     self.kernel_family,
-                    self.compliance,
+                    compliance_value,
                     dt,
                 ],
                 outputs=[state.ipbf.force],
@@ -423,7 +444,7 @@ class SolverIPBF(SolverBase):
                     self.rest_density,
                     self.smoothing_radius,
                     self.kernel_family,
-                    self.compliance,
+                    compliance_value,
                     dt,
                     self.hessian_regularization,
                 ],
@@ -441,7 +462,7 @@ class SolverIPBF(SolverBase):
                     model.particle_flags,
                     state.ipbf.constraint,
                     state.ipbf.constraint_gradient,
-                    self.compliance,
+                    compliance_value,
                     dt,
                 ],
                 outputs=[state.ipbf.force],
@@ -459,7 +480,7 @@ class SolverIPBF(SolverBase):
                     self.rest_density,
                     self.smoothing_radius,
                     self.kernel_family,
-                    self.compliance,
+                    compliance_value,
                     dt,
                     self.hessian_regularization,
                 ],
@@ -486,12 +507,15 @@ class SolverIPBF(SolverBase):
         4. Solve the local 3x3 system for ``delta_q``.
         5. Apply a relaxed Jacobi position update to form ``x_new``.
         6. Repeat for ``iterations`` rounds.
-        7. Recompute the diagnostic fields on the final positions.
-        8. Commit the converged positions and reconstruct velocities.
+        7. During the final iteration, optionally compute a single alternative
+           soft-compliance update for artificial damping.
+        8. Recompute the diagnostic fields on the final positions.
+        9. Commit the converged positions and reconstruct velocities, applying
+           the artificial damping correction when enabled.
 
-        The current force and Hessian use a first-pass stable approximation.
-        The full paper-specific Hessian refinement and artificial damping are
-        still to be added.
+        The current force and Hessian use a stable approximation that includes
+        neighborhood Gauss-Newton terms and diagonalized second-order
+        stabilization.
         """
         if state_in.particle_q is None or state_in.particle_qd is None:
             raise ValueError("SolverIPBF requires particle positions and velocities.")
@@ -533,13 +557,59 @@ class SolverIPBF(SolverBase):
             outputs=[state_out.ipbf.x_guess, state_out.ipbf.x_new],
             device=model.device,
         )
+        state_out.ipbf.x_star.assign(state_out.ipbf.y)
 
         if self.iterations <= 0:
             self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
             state_out.ipbf.delta_q.zero_()
         else:
-            for _ in range(self.iterations):
+            for iteration in range(self.iterations):
+                is_last_iteration = iteration == self.iterations - 1
                 self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
+
+                if is_last_iteration and self.damping_beta > 0.0 and self.smoothing_radius > 0.0:
+                    self._compute_iteration_fields(
+                        state_out,
+                        state_out.ipbf.x_guess,
+                        dt,
+                        recompute_density_constraint=False,
+                        compliance=self.damping_compliance,
+                    )
+
+                    wp.launch(
+                        solve_local_system,
+                        dim=model.particle_count,
+                        inputs=[
+                            model.particle_flags,
+                            state_out.ipbf.force,
+                            state_out.ipbf.hessian,
+                        ],
+                        outputs=[state_out.ipbf.delta_q],
+                        device=model.device,
+                    )
+
+                    wp.launch(
+                        apply_relaxed_jacobi_update,
+                        dim=model.particle_count,
+                        inputs=[
+                            model.particle_flags,
+                            state_out.ipbf.x_guess,
+                            state_out.ipbf.delta_q,
+                            self.relaxation,
+                        ],
+                        outputs=[state_out.ipbf.x_star],
+                        device=model.device,
+                    )
+
+                    self._compute_iteration_fields(
+                        state_out,
+                        state_out.ipbf.x_guess,
+                        dt,
+                        recompute_density_constraint=False,
+                        compliance=self.compliance,
+                    )
+                elif is_last_iteration:
+                    state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
 
                 wp.launch(
                     solve_local_system,
@@ -571,15 +641,33 @@ class SolverIPBF(SolverBase):
             self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
 
         state_out.particle_q.assign(state_out.ipbf.x_guess)
-        wp.launch(
-            update_velocity_from_positions,
-            dim=model.particle_count,
-            inputs=[
-                state_out.ipbf.x_guess,
-                state_in.particle_q,
-                model.particle_flags,
-                dt,
-            ],
-            outputs=[state_out.particle_qd],
-            device=model.device,
-        )
+        if self.iterations > 0 and self.damping_beta > 0.0 and self.smoothing_radius > 0.0:
+            wp.launch(
+                apply_artificial_damping,
+                dim=model.particle_count,
+                inputs=[
+                    state_out.ipbf.x_guess,
+                    state_out.ipbf.x_star,
+                    state_in.particle_q,
+                    model.particle_flags,
+                    dt,
+                    self.smoothing_radius,
+                    self.damping_beta,
+                ],
+                outputs=[state_out.particle_qd],
+                device=model.device,
+            )
+        else:
+            state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
+            wp.launch(
+                update_velocity_from_positions,
+                dim=model.particle_count,
+                inputs=[
+                    state_out.ipbf.x_guess,
+                    state_in.particle_q,
+                    model.particle_flags,
+                    dt,
+                ],
+                outputs=[state_out.particle_qd],
+                device=model.device,
+            )

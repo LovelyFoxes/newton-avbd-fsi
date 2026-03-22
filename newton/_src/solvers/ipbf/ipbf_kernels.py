@@ -644,3 +644,57 @@ def update_velocity_from_positions(
         return
 
     particle_qd[tid] = (x_new[tid] - x_old[tid]) / dt
+
+
+@wp.kernel
+def apply_artificial_damping(
+    x_new: wp.array(dtype=wp.vec3),
+    x_star: wp.array(dtype=wp.vec3),
+    x_old: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    dt: float,
+    support_radius: float,
+    damping_beta: float,
+    particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply the IPBF artificial damping velocity correction."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or dt <= 0.0:
+        particle_qd[tid] = wp.vec3(0.0)
+        return
+
+    v = (x_new[tid] - x_old[tid]) / dt
+    if damping_beta <= 0.0 or support_radius <= 0.0:
+        particle_qd[tid] = v
+        return
+
+    threshold = damping_beta * support_radius
+    if threshold <= 0.0:
+        particle_qd[tid] = v
+        return
+
+    dx = x_new[tid] - x_star[tid]
+    dx_norm = wp.length(dx)
+    if dx_norm >= threshold:
+        particle_qd[tid] = v
+        return
+
+    v2 = wp.dot(v, v)
+    if v2 <= 0.0:
+        particle_qd[tid] = v
+        return
+
+    v_star = (x_star[tid] - x_old[tid]) / dt
+    v_star2 = wp.dot(v_star, v_star)
+    if v_star2 >= v2:
+        particle_qd[tid] = v
+        return
+
+    d = 1.0 - dx_norm / threshold
+    scale2 = 1.0 - d * (v2 - v_star2) / v2
+    if scale2 <= 0.0:
+        particle_qd[tid] = wp.vec3(0.0)
+        return
+
+    particle_qd[tid] = wp.sqrt(scale2) * v

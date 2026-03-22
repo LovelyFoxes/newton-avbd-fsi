@@ -234,6 +234,8 @@ def run_two_particle_ipbf_step(
     support_radius: float = 0.3,
     regularization: float = 1.0e-6,
     kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
+    damping_compliance: float = 1.0 / 1000.0,
+    damping_beta: float = 0.0,
 ):
     """Run one zero-gravity IPBF step for a symmetric two-particle setup."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -265,6 +267,8 @@ def run_two_particle_ipbf_step(
             iterations=iterations,
             relaxation=relaxation,
             use_constraint_clamp=False,
+            damping_compliance=damping_compliance,
+            damping_beta=damping_beta,
         ),
     )
 
@@ -800,12 +804,38 @@ def test_ipbf_reset_restores_initial_particle_state(test, device):
     np.testing.assert_allclose(state_1.ipbf.y.numpy(), q_initial, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.x_guess.numpy(), q_initial, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.x_new.numpy(), q_initial, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(state_1.ipbf.x_star.numpy(), q_initial, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.density.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.zeros(2, dtype=np.int32))
     np.testing.assert_allclose(state_1.ipbf.constraint.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.constraint_gradient.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.force.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.delta_q.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+
+
+def test_ipbf_artificial_damping_reduces_velocity_magnitude(test, device):
+    undamped = run_two_particle_ipbf_step(
+        device,
+        iterations=1,
+        relaxation=0.5,
+        damping_beta=0.0,
+    )
+    damped = run_two_particle_ipbf_step(
+        device,
+        iterations=1,
+        relaxation=0.5,
+        damping_compliance=1.0 / 1000.0,
+        damping_beta=60.0,
+    )
+
+    np.testing.assert_allclose(damped.particle_q.numpy(), undamped.particle_q.numpy(), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(damped.ipbf.delta_q.numpy(), undamped.ipbf.delta_q.numpy(), rtol=1e-6, atol=1e-6)
+
+    damped_speed = np.linalg.norm(damped.particle_qd.numpy(), axis=1)
+    undamped_speed = np.linalg.norm(undamped.particle_qd.numpy(), axis=1)
+    test.assertTrue(np.all(damped_speed <= undamped_speed + 1.0e-7))
+    test.assertGreater(float(np.max(undamped_speed - damped_speed)), 0.0)
+    test.assertTrue(np.all(np.linalg.norm(damped.ipbf.x_star.numpy() - damped.particle_q.numpy(), axis=1) > 0.0))
 
 
 devices = get_test_devices(mode="basic")
@@ -875,6 +905,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_poly6_step_runs_and_updates_state",
     test_ipbf_poly6_step_runs_and_updates_state,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_artificial_damping_reduces_velocity_magnitude",
+    test_ipbf_artificial_damping_reduces_velocity_magnitude,
     devices=devices,
     check_output=False,
 )
