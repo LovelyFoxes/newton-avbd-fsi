@@ -444,8 +444,9 @@ class SolverIPBF(SolverBase):
         spacing: float,
         floor_y: float = 0.0,
         world_index: int = 0,
+        include_top: bool = False,
     ) -> None:
-        """Sample a static open-top box boundary into boundary particles.
+        """Sample a static box boundary into boundary particles.
 
         Args:
             half_width: Interior half-width of the box [m].
@@ -454,6 +455,7 @@ class SolverIPBF(SolverBase):
             spacing: Boundary-particle sampling spacing [m].
             floor_y: Height of the box floor [m].
             world_index: World index assigned to all boundary particles.
+            include_top: Whether to include a sampled top lid for a closed box.
         """
         if spacing <= 0.0:
             raise ValueError("setup_boundary_particles_box() requires a positive spacing.")
@@ -487,6 +489,8 @@ class SolverIPBF(SolverBase):
         append_plane(planes, 0, -half_width, ys, zs)
         append_plane(planes, 2, half_depth, xs, ys)
         append_plane(planes, 2, -half_depth, xs, ys)
+        if include_top:
+            append_plane(planes, 1, top_y, xs, zs)
 
         positions = np.concatenate(planes, axis=0)
         quantized = np.round(positions / spacing).astype(np.int64)

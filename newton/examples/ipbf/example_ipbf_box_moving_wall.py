@@ -1,15 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
 ###########################################################################
-# Example IPBF Box Container
+# Example IPBF Box Moving Wall
 #
-# Minimal static-container example for the current IPBF solver.
-# A particle block is dropped into an open box made from static collision
-# shapes, while the solver projects particles back out of soft contacts.
+# Closed-box IPBF example with a kinematic right wall that periodically
+# moves inward and outward to stir the particle block. The walls are not
+# rendered as solid geometry; instead the example draws a wireframe box and
+# a blue particle cloud so the fluid motion stays easy to inspect.
 #
-# Command: python -m newton.examples ipbf_box_container
+# Command: python -m newton.examples ipbf_box_moving_wall
 #
 ###########################################################################
 
 from __future__ import annotations
+
+import argparse
+import math
 
 import numpy as np
 import warp as wp
@@ -73,6 +80,8 @@ def build_box_wireframe(
 
 
 class Example:
+    """Closed IPBF box with a kinematic moving side wall."""
+
     def __init__(self, viewer, args=None):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
@@ -84,6 +93,7 @@ class Example:
         self.viewer._paused = True
         self.args = args
         self._reset_key_prev = False
+        self.graph = None
 
         self.container_half_width = 0.55
         self.container_half_depth = 0.55
@@ -91,11 +101,10 @@ class Example:
         self.wall_half_height = 0.45
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
-        self.initial_particle_velocity = wp.vec3(0.9, 0.0, 0.35)
-        # The current IPBF boundary handling uses post-update positional projection
-        # without dedicated wall friction, so a small global velocity damping keeps
-        # the demo bounded and lets the particle block settle inside the box.
-        self.velocity_damping = 0.989
+        self.velocity_damping = 0.994
+        self.wall_travel = float(getattr(args, "wall_travel", 0.16))
+        self.wall_frequency = float(getattr(args, "wall_frequency", 0.55))
+        self.current_right_wall_center_x = self.container_half_width + self.wall_thickness
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -104,12 +113,12 @@ class Example:
         self._add_container(builder)
 
         builder.add_particle_grid(
-            pos=wp.vec3(-0.24, 0.12, -0.24),
+            pos=wp.vec3(-0.38, 0.12, -0.19),
             rot=wp.quat_identity(),
-            vel=self.initial_particle_velocity,
-            dim_x=7,
-            dim_y=8,
-            dim_z=7,
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=6,
+            dim_y=7,
+            dim_z=6,
             cell_x=0.075,
             cell_y=0.075,
             cell_z=0.075,
@@ -126,8 +135,10 @@ class Example:
             SolverIPBF.Config(
                 rest_density=1000.0,
                 smoothing_radius=0.12,
-                iterations=4,
+                iterations=5,
                 relaxation=0.5,
+                viscosity_coefficient=0.005,
+                xsph_coefficient=0.02,
             ),
         )
 
@@ -147,26 +158,16 @@ class Example:
             dtype=wp.vec3,
             device=self.model.device,
         )
-        self.box_wire_starts, self.box_wire_ends = build_box_wireframe(
-            min_x=-self.container_half_width,
-            max_x=self.container_half_width,
-            min_y=self.floor_y,
-            max_y=self.top_y,
-            min_z=-self.container_half_depth,
-            max_z=self.container_half_depth,
-            device=self.model.device,
-        )
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(1.85, 1.55, 1.85),
+            pos=wp.vec3(1.95, 1.6, 1.95),
             pitch=-32.0,
             yaw=-135.0,
         )
 
         self.reset()
-        self.capture()
 
     def _add_container(self, builder: newton.ModelBuilder) -> None:
         wall_t = self.wall_thickness
@@ -179,13 +180,6 @@ class Example:
             xform=wp.transform((0.0, -wall_t, 0.0), wp.quat_identity()),
             hx=hx + wall_t,
             hy=wall_t,
-            hz=hz + wall_t,
-        )
-        builder.add_shape_box(
-            body=-1,
-            xform=wp.transform((hx + wall_t, hy, 0.0), wp.quat_identity()),
-            hx=wall_t,
-            hy=hy + wall_t,
             hz=hz + wall_t,
         )
         builder.add_shape_box(
@@ -217,29 +211,73 @@ class Example:
             hz=hz + wall_t,
         )
 
+        self.moving_wall_body = builder.add_body(
+            xform=wp.transform((hx + wall_t, hy, 0.0), wp.quat_identity()),
+            is_kinematic=True,
+            label="moving_wall",
+        )
+        builder.add_shape_box(
+            body=self.moving_wall_body,
+            hx=wall_t,
+            hy=hy + wall_t,
+            hz=hz + wall_t,
+        )
+
+    def _moving_wall_state(self, time_s: float) -> tuple[float, float]:
+        omega = 2.0 * math.pi * self.wall_frequency
+        center_x = self.container_half_width + self.wall_thickness - 0.5 * self.wall_travel * (1.0 - math.cos(omega * time_s))
+        velocity_x = -0.5 * self.wall_travel * omega * math.sin(omega * time_s)
+        return center_x, velocity_x
+
+    def _set_moving_wall_state(self, state: newton.State, time_s: float) -> None:
+        center_x, velocity_x = self._moving_wall_state(time_s)
+        self.current_right_wall_center_x = center_x
+
+        body_q_np = state.body_q.numpy()
+        body_q_np[self.moving_wall_body][0] = center_x
+        body_q_np[self.moving_wall_body][1] = self.wall_half_height
+        body_q_np[self.moving_wall_body][2] = 0.0
+        body_q_np[self.moving_wall_body][3] = 0.0
+        body_q_np[self.moving_wall_body][4] = 0.0
+        body_q_np[self.moving_wall_body][5] = 0.0
+        body_q_np[self.moving_wall_body][6] = 1.0
+        state.body_q = wp.array(body_q_np, dtype=wp.transform, device=self.model.device)
+
+        body_qd_np = state.body_qd.numpy()
+        body_qd_np[self.moving_wall_body][0] = velocity_x
+        body_qd_np[self.moving_wall_body][1] = 0.0
+        body_qd_np[self.moving_wall_body][2] = 0.0
+        body_qd_np[self.moving_wall_body][3] = 0.0
+        body_qd_np[self.moving_wall_body][4] = 0.0
+        body_qd_np[self.moving_wall_body][5] = 0.0
+        state.body_qd = wp.array(body_qd_np, dtype=wp.spatial_vector, device=self.model.device)
+
     def gui(self, ui):
         if ui.button("Reset"):
             self.reset()
+        ui.text(f"Wall travel: {self.wall_travel:.3f} m")
+        ui.text(f"Wall frequency: {self.wall_frequency:.2f} Hz")
 
     def reset(self):
         self.sim_time = 0.0
         self.solver.reset(self.state_0)
         self.solver.reset(self.state_1)
+        self._set_moving_wall_state(self.state_0, 0.0)
+        self._set_moving_wall_state(self.state_1, 0.0)
         self.contacts.clear()
         self.viewer._paused = True
 
     def capture(self):
-        if wp.get_device().is_cuda:
-            with wp.ScopedCapture() as capture:
-                self.simulate()
-            self.graph = capture.graph
-        else:
-            self.graph = None
+        # Disable CUDA graph capture because the kinematic wall state is updated
+        # from Python every substep.
+        self.graph = None
 
     def simulate(self):
-        for _ in range(self.sim_substeps):
+        for substep in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
+            current_time = self.sim_time + substep * self.sim_dt
+            self._set_moving_wall_state(self.state_0, current_time)
             wp.launch(
                 scale_velocities,
                 dim=self.model.particle_count,
@@ -256,10 +294,7 @@ class Example:
                 self.reset()
             self._reset_key_prev = reset_down
 
-        if self.graph:
-            wp.capture_launch(self.graph)
-        else:
-            self.simulate()
+        self.simulate()
         self.sim_time += self.frame_dt
 
     def test_final(self):
@@ -267,24 +302,37 @@ class Example:
         particle_radius = self.model.particle_radius.numpy()
         particle_speed = np.linalg.norm(self.state_0.particle_qd.numpy(), axis=1)
 
-        max_x = np.max(np.abs(particle_q[:, 0]) + particle_radius)
+        min_x = np.min(particle_q[:, 0] - particle_radius)
+        max_x = np.max(particle_q[:, 0] + particle_radius)
         max_z = np.max(np.abs(particle_q[:, 2]) + particle_radius)
         min_y = np.min(particle_q[:, 1] - particle_radius)
         max_y = np.max(particle_q[:, 1] + particle_radius)
         max_speed = np.max(particle_speed)
+        right_interior_x = self.current_right_wall_center_x - self.wall_thickness
 
-        assert max_x <= self.container_half_width + 0.02, f"particles escaped along x: {max_x:.3f}"
+        assert min_x >= -self.container_half_width - 0.02, f"particles escaped through the left wall: {min_x:.3f}"
+        assert max_x <= right_interior_x + 0.02, f"particles escaped through the moving wall: {max_x:.3f}"
         assert max_z <= self.container_half_depth + 0.02, f"particles escaped along z: {max_z:.3f}"
         assert min_y >= -0.02, f"particles penetrated the floor: {min_y:.3f}"
         assert max_y <= self.top_y + 0.02, f"particles penetrated the ceiling: {max_y:.3f}"
-        assert max_speed <= 2.0, f"particles retained excessive speed: {max_speed:.3f}"
+        assert max_speed <= 2.5, f"particles retained excessive speed: {max_speed:.3f}"
 
     def render(self):
+        right_interior_x = self.current_right_wall_center_x - self.wall_thickness
+        wire_starts, wire_ends = build_box_wireframe(
+            min_x=-self.container_half_width,
+            max_x=right_interior_x,
+            min_y=self.floor_y,
+            max_y=self.top_y,
+            min_z=-self.container_half_depth,
+            max_z=self.container_half_depth,
+            device=self.model.device,
+        )
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_lines(
             "/ipbf/container_wireframe",
-            self.box_wire_starts,
-            self.box_wire_ends,
+            wire_starts,
+            wire_ends,
             colors=(0.88, 0.9, 0.95),
             width=0.01,
         )
@@ -299,6 +347,19 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--wall-travel",
+        type=float,
+        default=0.16,
+        help="Peak inward travel of the moving wall [m].",
+    )
+    parser.add_argument(
+        "--wall-frequency",
+        type=float,
+        default=0.55,
+        help="Oscillation frequency of the moving wall [Hz].",
+    )
+    viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)

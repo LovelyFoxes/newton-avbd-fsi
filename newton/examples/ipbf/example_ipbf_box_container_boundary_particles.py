@@ -35,8 +35,51 @@ def scale_velocities(
     particle_qd[tid] = scale * particle_qd[tid]
 
 
+def build_box_wireframe(
+    *,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+    min_z: float,
+    max_z: float,
+    device,
+) -> tuple[wp.array(dtype=wp.vec3), wp.array(dtype=wp.vec3)]:
+    """Build a box wireframe for viewer line rendering."""
+    corners = np.array(
+        [
+            [min_x, min_y, min_z],
+            [max_x, min_y, min_z],
+            [max_x, min_y, max_z],
+            [min_x, min_y, max_z],
+            [min_x, max_y, min_z],
+            [max_x, max_y, min_z],
+            [max_x, max_y, max_z],
+            [min_x, max_y, max_z],
+        ],
+        dtype=np.float32,
+    )
+    edges = (
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    )
+    starts = wp.array(corners[[i for i, _ in edges]], dtype=wp.vec3, device=device)
+    ends = wp.array(corners[[j for _, j in edges]], dtype=wp.vec3, device=device)
+    return starts, ends
+
+
 class Example:
-    """Experimental IPBF box container using boundary particles."""
+    """Experimental closed-box IPBF container using boundary particles."""
 
     class DenseLevel:
         """Named particle-density presets for the box container example."""
@@ -62,6 +105,8 @@ class Example:
         self.container_half_depth = 0.55
         self.wall_thickness = 0.05
         self.wall_half_height = 0.45
+        self.floor_y = 0.0
+        self.top_y = 2.0 * self.wall_half_height
         self.boundary_spacing = 0.05
         self.initial_particle_velocity = wp.vec3(0.3, 0.0, 0.1125)
         # A small global damping still helps the current prototype settle,
@@ -114,6 +159,7 @@ class Example:
             half_depth=self.container_half_depth,
             wall_half_height=self.wall_half_height,
             spacing=self.boundary_spacing,
+            include_top=True,
         )
 
         self.collision_pipeline = newton.examples.create_collision_pipeline(
@@ -126,11 +172,27 @@ class Example:
         self.state_1 = self.model.state()
         self.contacts = self.model.contacts(collision_pipeline=self.collision_pipeline)
 
+        self.particle_colors = wp.full(
+            self.model.particle_count,
+            value=wp.vec3(0.15, 0.55, 1.0),
+            dtype=wp.vec3,
+            device=self.model.device,
+        )
+        self.box_wire_starts, self.box_wire_ends = build_box_wireframe(
+            min_x=-self.container_half_width,
+            max_x=self.container_half_width,
+            min_y=self.floor_y,
+            max_y=self.top_y,
+            min_z=-self.container_half_depth,
+            max_z=self.container_half_depth,
+            device=self.model.device,
+        )
+
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(1.6, 1.85, 1.6),
-            pitch=-40.0,
+            pos=wp.vec3(1.85, 1.55, 1.85),
+            pitch=-32.0,
             yaw=-135.0,
         )
 
@@ -177,6 +239,13 @@ class Example:
             hx=hx,
             hy=hy + wall_t,
             hz=wall_t,
+        )
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform((0.0, 2.0 * hy + wall_t, 0.0), wp.quat_identity()),
+            hx=hx + wall_t,
+            hy=wall_t,
+            hz=hz + wall_t,
         )
 
     def _get_particle_block_config(self, dense_level: str) -> dict[str, object]:
@@ -304,18 +373,31 @@ class Example:
         max_x = np.max(np.abs(particle_q[:, 0]) + particle_radius)
         max_z = np.max(np.abs(particle_q[:, 2]) + particle_radius)
         min_y = np.min(particle_q[:, 1] - particle_radius)
+        max_y = np.max(particle_q[:, 1] + particle_radius)
         max_speed = np.max(particle_speed)
 
         assert max_x <= self.container_half_width + 0.02, f"particles escaped along x: {max_x:.3f}"
         assert max_z <= self.container_half_depth + 0.02, f"particles escaped along z: {max_z:.3f}"
         assert min_y >= -0.02, f"particles penetrated the floor: {min_y:.3f}"
+        assert max_y <= self.top_y + 0.02, f"particles penetrated the ceiling: {max_y:.3f}"
         assert max_speed <= 2.0, f"particles retained excessive speed: {max_speed:.3f}"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
-        self.viewer.log_state(self.state_0)
-        if self.use_shape_contacts:
-            self.viewer.log_contacts(self.contacts, self.state_0)
+        self.viewer.log_lines(
+            "/ipbf/container_wireframe",
+            self.box_wire_starts,
+            self.box_wire_ends,
+            colors=(0.88, 0.9, 0.95),
+            width=0.01,
+        )
+        self.viewer.log_points(
+            "/ipbf/particles",
+            points=self.state_0.particle_q,
+            radii=self.model.particle_radius,
+            colors=self.particle_colors,
+            hidden=not self.viewer.show_particles,
+        )
         self.viewer.end_frame()
 
 
