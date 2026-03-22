@@ -21,6 +21,8 @@ from .ipbf_kernels import (
     accumulate_particle_shape_boundary_velocity_projection,
     apply_artificial_damping,
     apply_relaxed_jacobi_update,
+    apply_xsph_velocity_smoothing,
+    apply_xsph_velocity_smoothing_without_grid,
     compute_boundary_particle_volumes,
     compute_constraint_and_gradient,
     compute_density_and_neighbor_count,
@@ -78,6 +80,8 @@ class SolverIPBF(SolverBase):
             damping_compliance: Compliance used for the alternative position
                 solve in artificial damping.
             damping_beta: Distance threshold factor used by the damping model.
+            xsph_coefficient: XSPH velocity smoothing coefficient applied after
+                the position solve.
             boundary_velocity_damping: Tangential damping multiplier applied to
                 particle velocities at final particle-shape contacts.
         """
@@ -105,6 +109,7 @@ class SolverIPBF(SolverBase):
         use_constraint_clamp: bool = True
         damping_compliance: float = 1.0 / 1000.0
         damping_beta: float = 60.0
+        xsph_coefficient: float = 0.0
         boundary_velocity_damping: float = 1.0
 
     @override
@@ -276,6 +281,7 @@ class SolverIPBF(SolverBase):
         self.use_constraint_clamp = bool(self.config.use_constraint_clamp)
         self.damping_compliance = float(self.config.damping_compliance)
         self.damping_beta = float(self.config.damping_beta)
+        self.xsph_coefficient = float(self.config.xsph_coefficient)
         self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
 
         if not hasattr(model, "ipbf"):
@@ -296,6 +302,7 @@ class SolverIPBF(SolverBase):
             self._empty_int = wp.empty(0, dtype=int)
             self._boundary_projected_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projected_contact_count = wp.zeros(model.particle_count, dtype=int)
+            self._xsph_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
 
         if model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
@@ -581,6 +588,66 @@ class SolverIPBF(SolverBase):
             ],
             device=model.device,
         )
+
+    def _apply_xsph_velocity_smoothing(self, state: State) -> None:
+        """Apply an optional XSPH-style velocity smoothing pass."""
+        if self.xsph_coefficient <= 0.0 or self.model.particle_count == 0:
+            return
+
+        model = self.model
+        has_boundary_particles = self._has_boundary_particles()
+        boundary_grid_id = self._boundary_particle_grid.id if has_boundary_particles and self._boundary_particle_grid else 0
+
+        if model.particle_count > 1 and model.particle_grid is not None:
+            wp.launch(
+                apply_xsph_velocity_smoothing,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    state.particle_q,
+                    state.particle_qd,
+                    state.ipbf.density,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
+                    self.rest_density,
+                    self.smoothing_radius,
+                    self.kernel_family,
+                    self.xsph_coefficient,
+                ],
+                outputs=[self._xsph_particle_qd],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                apply_xsph_velocity_smoothing_without_grid,
+                dim=model.particle_count,
+                inputs=[
+                    state.particle_q,
+                    state.particle_qd,
+                    state.ipbf.density,
+                    model.particle_flags,
+                    model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
+                    self.rest_density,
+                    self.smoothing_radius,
+                    self.kernel_family,
+                    self.xsph_coefficient,
+                ],
+                outputs=[self._xsph_particle_qd],
+                device=model.device,
+            )
+
+        state.particle_qd.assign(self._xsph_particle_qd)
 
     def _compute_iteration_fields(
         self,
@@ -992,3 +1059,4 @@ class SolverIPBF(SolverBase):
             )
 
         self._apply_shape_boundary_velocity_projection(state_out, contacts)
+        self._apply_xsph_velocity_smoothing(state_out)

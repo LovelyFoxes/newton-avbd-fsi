@@ -928,6 +928,129 @@ def finalize_particle_shape_boundary_velocity_projection(
 
 
 @wp.kernel
+def apply_xsph_velocity_smoothing(
+    grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    density: wp.array(dtype=float),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_grid: wp.uint64,
+    boundary_q: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_world: wp.array(dtype=wp.int32),
+    boundary_particle_count: int,
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    xsph_coefficient: float,
+    smoothed_particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply an XSPH-style velocity smoothing step using particle neighbors."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or xsph_coefficient <= 0.0:
+        smoothed_particle_qd[tid] = particle_qd[tid]
+        return
+
+    xi = particle_q[tid]
+    vi = particle_qd[tid]
+    world_i = particle_world[tid]
+    correction = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if index == tid or (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+
+        world_j = particle_world[index]
+        if world_i >= 0 and world_j >= 0 and world_i != world_j:
+            continue
+
+        rho_j = density[index]
+        if rho_j <= 0.0:
+            continue
+
+        displacement = xi - particle_q[index]
+        weight = kernel_value(wp.dot(displacement, displacement), support_radius, kernel_family)
+        if weight <= 0.0:
+            continue
+
+        correction += (particle_mass[index] / rho_j) * (particle_qd[index] - vi) * weight
+
+    if boundary_particle_count > 0 and rest_density > 0.0:
+        boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+        boundary_index = int(0)
+
+        while wp.hash_grid_query_next(boundary_query, boundary_index):
+            world_b = boundary_world[boundary_index]
+            if world_i >= 0 and world_b >= 0 and world_i != world_b:
+                continue
+
+            displacement = xi - boundary_q[boundary_index]
+            weight = kernel_value(wp.dot(displacement, displacement), support_radius, kernel_family)
+            if weight <= 0.0:
+                continue
+
+            # Static boundary particles correspond to zero wall velocity.
+            correction += boundary_volume[boundary_index] * (wp.vec3(0.0) - vi) * weight
+
+    smoothed_particle_qd[tid] = vi + xsph_coefficient * correction
+
+
+@wp.kernel
+def apply_xsph_velocity_smoothing_without_grid(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    density: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_grid: wp.uint64,
+    boundary_q: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_world: wp.array(dtype=wp.int32),
+    boundary_particle_count: int,
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    xsph_coefficient: float,
+    smoothed_particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply XSPH-style smoothing for cases without a particle hash grid."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or xsph_coefficient <= 0.0:
+        smoothed_particle_qd[tid] = particle_qd[tid]
+        return
+
+    xi = particle_q[tid]
+    vi = particle_qd[tid]
+    world_i = particle_world[tid]
+    correction = wp.vec3(0.0)
+
+    if boundary_particle_count > 0 and rest_density > 0.0:
+        boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+        boundary_index = int(0)
+
+        while wp.hash_grid_query_next(boundary_query, boundary_index):
+            world_b = boundary_world[boundary_index]
+            if world_i >= 0 and world_b >= 0 and world_i != world_b:
+                continue
+
+            displacement = xi - boundary_q[boundary_index]
+            weight = kernel_value(wp.dot(displacement, displacement), support_radius, kernel_family)
+            if weight <= 0.0:
+                continue
+
+            correction += boundary_volume[boundary_index] * (wp.vec3(0.0) - vi) * weight
+
+    smoothed_particle_qd[tid] = vi + xsph_coefficient * correction
+
+
+@wp.kernel
 def update_velocity_from_positions(
     x_new: wp.array(dtype=wp.vec3),
     x_old: wp.array(dtype=wp.vec3),

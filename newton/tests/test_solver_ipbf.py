@@ -432,12 +432,21 @@ def run_ipbf_box_container_rollout(device, *, num_frames: int):
     return np.asarray(speed_history, dtype=np.float32), max_abs_x, max_abs_z, float(min_y)
 
 
-def run_ipbf_boundary_particle_box_container_rollout(device, *, num_frames: int):
+def run_ipbf_boundary_particle_box_container_rollout(
+    device,
+    *,
+    num_frames: int,
+    use_shape_contacts: bool = True,
+    xsph_coefficient: float | None = None,
+):
     """Run the boundary-particle IPBF box-container example with a null viewer."""
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
         example = ExampleIPBFBoxContainerBoundaryParticles(viewer)
         example.graph = None
+        example.use_shape_contacts = use_shape_contacts
+        if xsph_coefficient is not None:
+            example.solver.xsph_coefficient = xsph_coefficient
 
         speed_history = []
         max_abs_x = 0.0
@@ -1091,6 +1100,58 @@ def test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bou
     test.assertGreaterEqual(min_y, -0.02)
 
 
+def test_ipbf_boundary_particle_box_container_shape_contacts_improve_containment(test, device):
+    if wp.get_device(device).is_cpu:
+        return
+
+    speed_with_contacts, max_abs_x_with_contacts, max_abs_z_with_contacts, min_y_with_contacts = run_ipbf_boundary_particle_box_container_rollout(
+        device,
+        num_frames=300,
+        use_shape_contacts=True,
+    )
+    speed_without_contacts, max_abs_x_without_contacts, max_abs_z_without_contacts, min_y_without_contacts = run_ipbf_boundary_particle_box_container_rollout(
+        device,
+        num_frames=300,
+        use_shape_contacts=False,
+    )
+
+    test.assertLessEqual(max_abs_x_with_contacts, 0.57)
+    test.assertLessEqual(max_abs_z_with_contacts, 0.57)
+    test.assertGreaterEqual(min_y_with_contacts, -0.02)
+    test.assertLessEqual(max_abs_x_without_contacts, 0.57)
+    test.assertLessEqual(max_abs_z_without_contacts, 0.57)
+    test.assertGreaterEqual(min_y_without_contacts, -0.02)
+    test.assertLess(float(np.mean(speed_with_contacts[-30:])), float(np.mean(speed_without_contacts[-30:])))
+
+
+def test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field(test, device):
+    if wp.get_device(device).is_cpu:
+        return
+
+    speed_history_without_xsph, max_abs_x_without_xsph, max_abs_z_without_xsph, min_y_without_xsph = (
+        run_ipbf_boundary_particle_box_container_rollout(
+        device,
+        num_frames=300,
+        use_shape_contacts=True,
+        xsph_coefficient=0.0,
+    ))
+    speed_history_with_xsph, max_abs_x_with_xsph, max_abs_z_with_xsph, min_y_with_xsph = (
+        run_ipbf_boundary_particle_box_container_rollout(
+        device,
+        num_frames=300,
+        use_shape_contacts=True,
+        xsph_coefficient=0.02,
+    ))
+
+    test.assertLessEqual(max_abs_x_without_xsph, 0.57)
+    test.assertLessEqual(max_abs_z_without_xsph, 0.57)
+    test.assertGreaterEqual(min_y_without_xsph, -0.02)
+    test.assertLessEqual(max_abs_x_with_xsph, 0.57)
+    test.assertLessEqual(max_abs_z_with_xsph, 0.57)
+    test.assertGreaterEqual(min_y_with_xsph, -0.02)
+    test.assertGreater(float(np.mean(np.abs(speed_history_with_xsph - speed_history_without_xsph))), 1.0e-3)
+
+
 def test_ipbf_ground_contact_tangential_damping_reduces_speed(test, device):
     _, contacts, _, velocities = run_single_particle_ground_rollout(
         device,
@@ -1247,6 +1308,22 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds",
     test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_particle_box_container_shape_contacts_improve_containment",
+    test_ipbf_boundary_particle_box_container_shape_contacts_improve_containment,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field",
+    test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field,
     devices=devices,
     check_output=False,
 )

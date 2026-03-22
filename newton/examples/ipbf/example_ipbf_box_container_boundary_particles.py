@@ -6,8 +6,8 @@
 #
 # Experimental open-top box example that enables the IPBF boundary-particle
 # mode. Static box walls are sampled into boundary particles, while the
-# existing shape-contact projection remains active as a fallback anti-
-# tunneling mechanism.
+# existing shape-contact projection can optionally remain active as a fallback
+# anti-tunneling mechanism.
 #
 # Command: python -m newton.examples ipbf_box_container_boundary_particles
 #
@@ -57,6 +57,7 @@ class Example:
         # A small global damping still helps the current prototype settle,
         # even when boundary particles provide near-wall density support.
         self.velocity_damping = 0.99
+        self.use_shape_contacts = True
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -90,6 +91,7 @@ class Example:
                 boundary_mode=SolverIPBF.Config.BoundaryMode.BOUNDARY_PARTICLES,
                 iterations=5,
                 relaxation=0.5,
+                xsph_coefficient=0.02,
             ),
         )
         self.solver.setup_boundary_particles_box(
@@ -191,7 +193,8 @@ class Example:
                 inputs=[self.state_0.particle_qd, self.velocity_damping],
                 device=self.model.device,
             )
-            self.solver.step(self.state_0, self.state_1, control=None, contacts=self.contacts, dt=self.sim_dt)
+            contacts = self.contacts if self.use_shape_contacts else None
+            self.solver.step(self.state_0, self.state_1, control=None, contacts=contacts, dt=self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
@@ -225,7 +228,8 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
-        self.viewer.log_contacts(self.contacts, self.state_0)
+        if self.use_shape_contacts:
+            self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
 
