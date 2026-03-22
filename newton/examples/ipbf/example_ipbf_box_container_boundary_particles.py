@@ -61,6 +61,7 @@ class Example:
         # even when boundary particles provide near-wall density support.
         self.velocity_damping = 0.99
         self.use_shape_contacts = bool(getattr(args, "use_shape_contacts", True))
+        self.initial_viscosity_coefficient = float(getattr(args, "viscosity_coefficient", 0.005))
         self.initial_xsph_coefficient = float(getattr(args, "xsph_coefficient", 0.02))
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -95,6 +96,7 @@ class Example:
                 boundary_mode=SolverIPBF.Config.BoundaryMode.BOUNDARY_PARTICLES,
                 iterations=5,
                 relaxation=0.5,
+                viscosity_coefficient=self.initial_viscosity_coefficient,
                 xsph_coefficient=self.initial_xsph_coefficient,
             ),
         )
@@ -174,6 +176,9 @@ class Example:
         changed, value = ui.checkbox("Use Shape Contacts", self.use_shape_contacts)
         if changed:
             self.set_use_shape_contacts(value)
+        changed, value = ui.slider_float("Viscosity Coefficient", self.solver.viscosity_coefficient, 0.0, 0.1)
+        if changed:
+            self.set_viscosity_coefficient(value)
         changed, value = ui.slider_float("XSPH Coefficient", self.solver.xsph_coefficient, 0.0, 0.1)
         if changed:
             self.set_xsph_coefficient(value)
@@ -184,6 +189,10 @@ class Example:
 
     def set_use_shape_contacts(self, enabled: bool) -> None:
         self.use_shape_contacts = bool(enabled)
+        self._mark_capture_dirty()
+
+    def set_viscosity_coefficient(self, coefficient: float) -> None:
+        self.solver.viscosity_coefficient = float(coefficient)
         self._mark_capture_dirty()
 
     def set_xsph_coefficient(self, coefficient: float) -> None:
@@ -266,6 +275,12 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Enable static shape contacts as a fallback anti-tunneling mechanism.",
+    )
+    parser.add_argument(
+        "--viscosity-coefficient",
+        type=float,
+        default=0.005,
+        help="SPH viscosity diffusion coefficient.",
     )
     parser.add_argument(
         "--xsph-coefficient",

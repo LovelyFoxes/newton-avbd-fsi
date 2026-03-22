@@ -21,6 +21,8 @@ from .ipbf_kernels import (
     accumulate_particle_shape_boundary_velocity_projection,
     apply_artificial_damping,
     apply_relaxed_jacobi_update,
+    apply_viscosity_velocity_diffusion,
+    apply_viscosity_velocity_diffusion_without_grid,
     apply_xsph_velocity_smoothing,
     apply_xsph_velocity_smoothing_without_grid,
     compute_boundary_particle_volumes,
@@ -80,6 +82,8 @@ class SolverIPBF(SolverBase):
             damping_compliance: Compliance used for the alternative position
                 solve in artificial damping.
             damping_beta: Distance threshold factor used by the damping model.
+            viscosity_coefficient: Kinematic viscosity coefficient [m^2/s]
+                applied as a post-solve SPH velocity diffusion step.
             xsph_coefficient: XSPH velocity smoothing coefficient applied after
                 the position solve.
             boundary_velocity_damping: Tangential damping multiplier applied to
@@ -109,6 +113,7 @@ class SolverIPBF(SolverBase):
         use_constraint_clamp: bool = True
         damping_compliance: float = 1.0 / 1000.0
         damping_beta: float = 60.0
+        viscosity_coefficient: float = 0.0
         xsph_coefficient: float = 0.0
         boundary_velocity_damping: float = 1.0
 
@@ -281,6 +286,7 @@ class SolverIPBF(SolverBase):
         self.use_constraint_clamp = bool(self.config.use_constraint_clamp)
         self.damping_compliance = float(self.config.damping_compliance)
         self.damping_beta = float(self.config.damping_beta)
+        self.viscosity_coefficient = float(self.config.viscosity_coefficient)
         self.xsph_coefficient = float(self.config.xsph_coefficient)
         self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
 
@@ -302,6 +308,7 @@ class SolverIPBF(SolverBase):
             self._empty_int = wp.empty(0, dtype=int)
             self._boundary_projected_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projected_contact_count = wp.zeros(model.particle_count, dtype=int)
+            self._viscosity_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._xsph_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
 
         if model.particle_count > 1 and model.particle_grid is not None:
@@ -648,6 +655,65 @@ class SolverIPBF(SolverBase):
             )
 
         state.particle_qd.assign(self._xsph_particle_qd)
+
+    def _apply_viscosity_velocity_diffusion(self, state: State, dt: float) -> None:
+        """Apply an optional SPH viscosity diffusion pass to the final velocities."""
+        if self.viscosity_coefficient <= 0.0 or self.model.particle_count == 0 or dt <= 0.0:
+            return
+
+        model = self.model
+        has_boundary_particles = self._has_boundary_particles()
+        boundary_grid_id = self._boundary_particle_grid.id if has_boundary_particles and self._boundary_particle_grid else 0
+
+        if model.particle_count > 1 and model.particle_grid is not None:
+            wp.launch(
+                apply_viscosity_velocity_diffusion,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_grid.id,
+                    state.particle_q,
+                    state.particle_qd,
+                    state.ipbf.density,
+                    model.particle_mass,
+                    model.particle_flags,
+                    model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
+                    self.smoothing_radius,
+                    self.kernel_family,
+                    self.viscosity_coefficient,
+                    dt,
+                ],
+                outputs=[self._viscosity_particle_qd],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                apply_viscosity_velocity_diffusion_without_grid,
+                dim=model.particle_count,
+                inputs=[
+                    state.particle_q,
+                    state.particle_qd,
+                    model.particle_flags,
+                    model.particle_world,
+                    boundary_grid_id,
+                    self._boundary_particle_q,
+                    self._boundary_particle_volume,
+                    self._boundary_particle_world,
+                    self._boundary_particle_count,
+                    self.smoothing_radius,
+                    self.kernel_family,
+                    self.viscosity_coefficient,
+                    dt,
+                ],
+                outputs=[self._viscosity_particle_qd],
+                device=model.device,
+            )
+
+        state.particle_qd.assign(self._viscosity_particle_qd)
 
     def _compute_iteration_fields(
         self,
@@ -1059,4 +1125,5 @@ class SolverIPBF(SolverBase):
             )
 
         self._apply_shape_boundary_velocity_projection(state_out, contacts)
+        self._apply_viscosity_velocity_diffusion(state_out, dt)
         self._apply_xsph_velocity_smoothing(state_out)

@@ -241,6 +241,13 @@ def run_two_particle_ipbf_step(
     kernel_family: int | KernelFamily = KernelFamily.CUBIC_SPLINE,
     damping_compliance: float = 1.0 / 1000.0,
     damping_beta: float = 0.0,
+    initial_velocities: tuple[tuple[float, float, float], tuple[float, float, float]] = (
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+    ),
+    gravity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    xsph_coefficient: float = 0.0,
+    viscosity_coefficient: float = 0.0,
 ):
     """Run one zero-gravity IPBF step for a symmetric two-particle setup."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -252,15 +259,15 @@ def run_two_particle_ipbf_step(
             wp.vec3(0.05, 1.0, 0.0),
         ],
         vel=[
-            wp.vec3(0.0, 0.0, 0.0),
-            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(*initial_velocities[0]),
+            wp.vec3(*initial_velocities[1]),
         ],
         mass=[1.0, 1.0],
         radius=[0.05, 0.05],
     )
 
     model = builder.finalize(device=device)
-    model.set_gravity((0.0, 0.0, 0.0))
+    model.set_gravity(gravity)
 
     solver = SolverIPBF(
         model,
@@ -274,6 +281,8 @@ def run_two_particle_ipbf_step(
             use_constraint_clamp=False,
             damping_compliance=damping_compliance,
             damping_beta=damping_beta,
+            xsph_coefficient=xsph_coefficient,
+            viscosity_coefficient=viscosity_coefficient,
         ),
     )
 
@@ -438,6 +447,7 @@ def run_ipbf_boundary_particle_box_container_rollout(
     *,
     num_frames: int,
     use_shape_contacts: bool = True,
+    viscosity_coefficient: float | None = None,
     xsph_coefficient: float | None = None,
 ):
     """Run the boundary-particle IPBF box-container example with a null viewer."""
@@ -446,6 +456,8 @@ def run_ipbf_boundary_particle_box_container_rollout(
         example = ExampleIPBFBoxContainerBoundaryParticles(viewer)
         example.graph = None
         example.use_shape_contacts = use_shape_contacts
+        if viscosity_coefficient is not None:
+            example.solver.viscosity_coefficient = viscosity_coefficient
         if xsph_coefficient is not None:
             example.solver.xsph_coefficient = xsph_coefficient
 
@@ -1153,16 +1165,74 @@ def test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field(test, 
     test.assertGreater(float(np.mean(np.abs(speed_history_with_xsph - speed_history_without_xsph))), 1.0e-3)
 
 
+def test_ipbf_viscosity_reduces_two_particle_relative_speed(test, device):
+    without_viscosity = run_two_particle_ipbf_step(
+        device,
+        iterations=0,
+        relaxation=0.5,
+        initial_velocities=((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        viscosity_coefficient=0.0,
+    )
+    with_viscosity = run_two_particle_ipbf_step(
+        device,
+        iterations=0,
+        relaxation=0.5,
+        initial_velocities=((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        viscosity_coefficient=0.02,
+    )
+
+    velocity_difference_without = without_viscosity.particle_qd.numpy()[1] - without_viscosity.particle_qd.numpy()[0]
+    velocity_difference_with = with_viscosity.particle_qd.numpy()[1] - with_viscosity.particle_qd.numpy()[0]
+
+    test.assertLess(
+        float(np.linalg.norm(velocity_difference_with)),
+        float(np.linalg.norm(velocity_difference_without)),
+    )
+
+
+def test_ipbf_boundary_particle_box_container_viscosity_changes_velocity_field(test, device):
+    if wp.get_device(device).is_cpu:
+        return
+
+    speed_history_without_viscosity, max_abs_x_without_viscosity, max_abs_z_without_viscosity, min_y_without_viscosity = (
+        run_ipbf_boundary_particle_box_container_rollout(
+            device,
+            num_frames=300,
+            use_shape_contacts=True,
+            viscosity_coefficient=0.0,
+            xsph_coefficient=0.02,
+        )
+    )
+    speed_history_with_viscosity, max_abs_x_with_viscosity, max_abs_z_with_viscosity, min_y_with_viscosity = (
+        run_ipbf_boundary_particle_box_container_rollout(
+            device,
+            num_frames=300,
+            use_shape_contacts=True,
+            viscosity_coefficient=0.005,
+            xsph_coefficient=0.02,
+        )
+    )
+
+    test.assertLessEqual(max_abs_x_without_viscosity, 0.57)
+    test.assertLessEqual(max_abs_z_without_viscosity, 0.57)
+    test.assertGreaterEqual(min_y_without_viscosity, -0.02)
+    test.assertLessEqual(max_abs_x_with_viscosity, 0.57)
+    test.assertLessEqual(max_abs_z_with_viscosity, 0.57)
+    test.assertGreaterEqual(min_y_with_viscosity, -0.02)
+    test.assertGreater(float(np.mean(np.abs(speed_history_with_viscosity - speed_history_without_viscosity))), 1.0e-3)
+
+
 def test_ipbf_boundary_particle_example_args_override_runtime_controls(test, device):
     if wp.get_device(device).is_cpu:
         return
 
     with wp.ScopedDevice(device):
         viewer = newton.viewer.ViewerNull()
-        args = argparse.Namespace(use_shape_contacts=False, xsph_coefficient=0.035)
+        args = argparse.Namespace(use_shape_contacts=False, viscosity_coefficient=0.015, xsph_coefficient=0.035)
         example = ExampleIPBFBoxContainerBoundaryParticles(viewer, args=args)
 
         test.assertFalse(example.use_shape_contacts)
+        test.assertAlmostEqual(example.solver.viscosity_coefficient, 0.015, places=7)
         test.assertAlmostEqual(example.solver.xsph_coefficient, 0.035, places=7)
 
 
@@ -1338,6 +1408,22 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field",
     test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_viscosity_reduces_two_particle_relative_speed",
+    test_ipbf_viscosity_reduces_two_particle_relative_speed,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_particle_box_container_viscosity_changes_velocity_field",
+    test_ipbf_boundary_particle_box_container_viscosity_changes_velocity_field,
     devices=devices,
     check_output=False,
 )

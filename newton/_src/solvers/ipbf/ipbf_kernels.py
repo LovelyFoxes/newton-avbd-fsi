@@ -1051,6 +1051,147 @@ def apply_xsph_velocity_smoothing_without_grid(
 
 
 @wp.kernel
+def apply_viscosity_velocity_diffusion(
+    grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    density: wp.array(dtype=float),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_grid: wp.uint64,
+    boundary_q: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_world: wp.array(dtype=wp.int32),
+    boundary_particle_count: int,
+    support_radius: float,
+    kernel_family: int,
+    viscosity_coefficient: float,
+    dt: float,
+    diffused_particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply a Morris-style SPH viscosity diffusion step to particle velocities."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or viscosity_coefficient <= 0.0 or dt <= 0.0:
+        diffused_particle_qd[tid] = particle_qd[tid]
+        return
+
+    xi = particle_q[tid]
+    vi = particle_qd[tid]
+    world_i = particle_world[tid]
+    h2 = support_radius * support_radius
+    eps2 = 1.0e-2 * h2
+    diffusion = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if index == tid or (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+
+        world_j = particle_world[index]
+        if world_i >= 0 and world_j >= 0 and world_i != world_j:
+            continue
+
+        rho_j = density[index]
+        if rho_j <= 0.0:
+            continue
+
+        displacement = xi - particle_q[index]
+        dist2 = wp.dot(displacement, displacement)
+        if dist2 <= 0.0 or dist2 >= h2:
+            continue
+
+        grad = kernel_gradient(displacement, support_radius, kernel_family)
+        laplace_weight = -wp.dot(displacement, grad) / (dist2 + eps2)
+        if laplace_weight <= 0.0:
+            continue
+
+        diffusion += (particle_mass[index] / rho_j) * (particle_qd[index] - vi) * laplace_weight
+
+    if boundary_particle_count > 0:
+        boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+        boundary_index = int(0)
+
+        while wp.hash_grid_query_next(boundary_query, boundary_index):
+            world_b = boundary_world[boundary_index]
+            if world_i >= 0 and world_b >= 0 and world_i != world_b:
+                continue
+
+            displacement = xi - boundary_q[boundary_index]
+            dist2 = wp.dot(displacement, displacement)
+            if dist2 <= 0.0 or dist2 >= h2:
+                continue
+
+            grad = kernel_gradient(displacement, support_radius, kernel_family)
+            laplace_weight = -wp.dot(displacement, grad) / (dist2 + eps2)
+            if laplace_weight <= 0.0:
+                continue
+
+            # Static boundary particles correspond to zero wall velocity.
+            diffusion += boundary_volume[boundary_index] * (wp.vec3(0.0) - vi) * laplace_weight
+
+    diffused_particle_qd[tid] = vi + 10.0 * viscosity_coefficient * dt * diffusion
+
+
+@wp.kernel
+def apply_viscosity_velocity_diffusion_without_grid(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_grid: wp.uint64,
+    boundary_q: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_world: wp.array(dtype=wp.int32),
+    boundary_particle_count: int,
+    support_radius: float,
+    kernel_family: int,
+    viscosity_coefficient: float,
+    dt: float,
+    diffused_particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply viscosity diffusion for cases without a particle hash grid."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or viscosity_coefficient <= 0.0 or dt <= 0.0:
+        diffused_particle_qd[tid] = particle_qd[tid]
+        return
+
+    xi = particle_q[tid]
+    vi = particle_qd[tid]
+    world_i = particle_world[tid]
+    h2 = support_radius * support_radius
+    eps2 = 1.0e-2 * h2
+    diffusion = wp.vec3(0.0)
+
+    if boundary_particle_count > 0:
+        boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+        boundary_index = int(0)
+
+        while wp.hash_grid_query_next(boundary_query, boundary_index):
+            world_b = boundary_world[boundary_index]
+            if world_i >= 0 and world_b >= 0 and world_i != world_b:
+                continue
+
+            displacement = xi - boundary_q[boundary_index]
+            dist2 = wp.dot(displacement, displacement)
+            if dist2 <= 0.0 or dist2 >= h2:
+                continue
+
+            grad = kernel_gradient(displacement, support_radius, kernel_family)
+            laplace_weight = -wp.dot(displacement, grad) / (dist2 + eps2)
+            if laplace_weight <= 0.0:
+                continue
+
+            diffusion += boundary_volume[boundary_index] * (wp.vec3(0.0) - vi) * laplace_weight
+
+    diffused_particle_qd[tid] = vi + 10.0 * viscosity_coefficient * dt * diffusion
+
+
+@wp.kernel
 def update_velocity_from_positions(
     x_new: wp.array(dtype=wp.vec3),
     x_old: wp.array(dtype=wp.vec3),
