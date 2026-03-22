@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import numpy as np
 import warp as wp
 
@@ -47,6 +49,7 @@ class Example:
         self.viewer._paused = True
         self.args = args
         self._reset_key_prev = False
+        self._capture_dirty = False
 
         self.container_half_width = 0.55
         self.container_half_depth = 0.55
@@ -57,7 +60,8 @@ class Example:
         # A small global damping still helps the current prototype settle,
         # even when boundary particles provide near-wall density support.
         self.velocity_damping = 0.99
-        self.use_shape_contacts = True
+        self.use_shape_contacts = bool(getattr(args, "use_shape_contacts", True))
+        self.initial_xsph_coefficient = float(getattr(args, "xsph_coefficient", 0.02))
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -91,7 +95,7 @@ class Example:
                 boundary_mode=SolverIPBF.Config.BoundaryMode.BOUNDARY_PARTICLES,
                 iterations=5,
                 relaxation=0.5,
-                xsph_coefficient=0.02,
+                xsph_coefficient=self.initial_xsph_coefficient,
             ),
         )
         self.solver.setup_boundary_particles_box(
@@ -167,6 +171,24 @@ class Example:
     def gui(self, ui):
         if ui.button("Reset"):
             self.reset()
+        changed, value = ui.checkbox("Use Shape Contacts", self.use_shape_contacts)
+        if changed:
+            self.set_use_shape_contacts(value)
+        changed, value = ui.slider_float("XSPH Coefficient", self.solver.xsph_coefficient, 0.0, 0.1)
+        if changed:
+            self.set_xsph_coefficient(value)
+
+    def _mark_capture_dirty(self) -> None:
+        self._capture_dirty = True
+        self.graph = None
+
+    def set_use_shape_contacts(self, enabled: bool) -> None:
+        self.use_shape_contacts = bool(enabled)
+        self._mark_capture_dirty()
+
+    def set_xsph_coefficient(self, coefficient: float) -> None:
+        self.solver.xsph_coefficient = float(coefficient)
+        self._mark_capture_dirty()
 
     def reset(self):
         self.sim_time = 0.0
@@ -182,6 +204,7 @@ class Example:
             self.graph = capture.graph
         else:
             self.graph = None
+        self._capture_dirty = False
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -203,6 +226,9 @@ class Example:
             if reset_down and not self._reset_key_prev:
                 self.reset()
             self._reset_key_prev = reset_down
+
+        if self._capture_dirty:
+            self.capture()
 
         if self.graph:
             wp.capture_launch(self.graph)
@@ -234,6 +260,19 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument(
+        "--use-shape-contacts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable static shape contacts as a fallback anti-tunneling mechanism.",
+    )
+    parser.add_argument(
+        "--xsph-coefficient",
+        type=float,
+        default=0.02,
+        help="XSPH velocity smoothing coefficient.",
+    )
+    viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)

@@ -1,3 +1,4 @@
+import argparse
 import unittest
 
 import numpy as np
@@ -1152,6 +1153,19 @@ def test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field(test, 
     test.assertGreater(float(np.mean(np.abs(speed_history_with_xsph - speed_history_without_xsph))), 1.0e-3)
 
 
+def test_ipbf_boundary_particle_example_args_override_runtime_controls(test, device):
+    if wp.get_device(device).is_cpu:
+        return
+
+    with wp.ScopedDevice(device):
+        viewer = newton.viewer.ViewerNull()
+        args = argparse.Namespace(use_shape_contacts=False, xsph_coefficient=0.035)
+        example = ExampleIPBFBoxContainerBoundaryParticles(viewer, args=args)
+
+        test.assertFalse(example.use_shape_contacts)
+        test.assertAlmostEqual(example.solver.xsph_coefficient, 0.035, places=7)
+
+
 def test_ipbf_ground_contact_tangential_damping_reduces_speed(test, device):
     _, contacts, _, velocities = run_single_particle_ground_rollout(
         device,
@@ -1324,6 +1338,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field",
     test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_particle_example_args_override_runtime_controls",
+    test_ipbf_boundary_particle_example_args_override_runtime_controls,
     devices=devices,
     check_output=False,
 )
