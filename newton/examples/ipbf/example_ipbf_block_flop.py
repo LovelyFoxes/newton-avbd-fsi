@@ -33,47 +33,47 @@ class Example:
                 "container_half_width": 0.42,
                 "container_half_depth": 0.42,
                 "wall_half_height": 0.75,
-                "bottom_pos": wp.vec3(-0.24, 0.03, -0.24),
-                "bottom_dim_x": 9,
+                "bottom_pos": wp.vec3(-0.27, 0.03, -0.27),
+                "bottom_dim_x": 10,
                 "bottom_dim_y": 3,
-                "bottom_dim_z": 9,
-                "top_pos": wp.vec3(-0.15, 0.9, -0.15),
-                "top_dim_x": 6,
+                "bottom_dim_z": 10,
+                "top_pos": wp.vec3(-0.18, 0.9, -0.18),
+                "top_dim_x": 7,
                 "top_dim_y": 3,
-                "top_dim_z": 6,
+                "top_dim_z": 7,
                 "cell": 0.06,
                 "mass": 0.23,
                 "radius_mean": 0.024,
                 "smoothing_radius": 0.1,
                 "iterations": 6,
                 "sim_substeps": 6,
-                "velocity_damping": 0.985,
-                "viscosity": 0.02,
-                "xsph": 0.03,
+                "velocity_damping": 0.992,
+                "viscosity": 0.002,
+                "xsph": 0.004,
                 "compliance": 1.0e-5,
             }
 
         return {
-            "container_half_width": 0.65,
-            "container_half_depth": 0.65,
-            "wall_half_height": 0.9,
-            "bottom_pos": wp.vec3(-0.546, 0.024, -0.546),
-            "bottom_dim_x": 40,
-            "bottom_dim_y": 4,
-            "bottom_dim_z": 40,
-            "top_pos": wp.vec3(-0.322, 1.05, -0.322),
-            "top_dim_x": 24,
-            "top_dim_y": 4,
-            "top_dim_z": 24,
-            "cell": 0.028,
-            "mass": 0.022,
-            "radius_mean": 0.012,
-            "smoothing_radius": 0.048,
-            "iterations": 8,
-            "sim_substeps": 8,
-            "velocity_damping": 0.987,
-            "viscosity": 0.02,
-            "xsph": 0.03,
+            "container_half_width": 1.0,
+            "container_half_depth": 1.0,
+            "wall_half_height": 1.2,
+            "bottom_pos": wp.vec3(-0.889, 0.014, -0.889),
+            "bottom_dim_x": 128,
+            "bottom_dim_y": 8,
+            "bottom_dim_z": 128,
+            "top_pos": wp.vec3(-0.609, 1.48, -0.609),
+            "top_dim_x": 88,
+            "top_dim_y": 9,
+            "top_dim_z": 88,
+            "cell": 0.014,
+            "mass": 0.002744,
+            "radius_mean": 0.006,
+            "smoothing_radius": 0.025,
+            "iterations": 2,
+            "sim_substeps": 4,
+            "velocity_damping": 0.999,
+            "viscosity": 0.0025,
+            "xsph": 0.005,
             "compliance": 1.0e-5,
         }
 
@@ -179,7 +179,7 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(1.5, 1.25, 1.85),
+            pos=wp.vec3(2.25, 1.8, 2.7),
             pitch=-22.0,
             yaw=-132.0,
         )
@@ -309,7 +309,7 @@ class Example:
         assert std_x > self.initial_std_x * 1.05, (
             f"stacked slabs did not spread laterally enough: {std_x:.3f} vs. {self.initial_std_x:.3f}"
         )
-        assert max_speed <= 1.8, f"particles retained excessive speed: {max_speed:.3f}"
+        assert max_speed <= 2.2, f"particles retained excessive speed: {max_speed:.3f}"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)

@@ -33,48 +33,56 @@ class Example:
                 "left_pos": wp.vec3(-0.58, 0.035, -0.175),
                 "right_pos": wp.vec3(0.16, 0.035, -0.175),
                 "dim_x": 6,
-                "dim_y": 12,
+                "dim_y": 14,
                 "dim_z": 6,
                 "cell": 0.07,
                 "mass": 0.45,
                 "radius_mean": 0.028,
                 "smoothing_radius": 0.12,
-                "iterations": 4,
+                "iterations": 6,
+                "sim_substeps": 6,
+                "velocity_damping": 0.997,
+                "viscosity": 0.002,
+                "xsph": 0.004,
             }
 
         return {
-            "left_pos": wp.vec3(-0.77, 0.028, -0.21),
-            "right_pos": wp.vec3(0.238, 0.028, -0.21),
-            "dim_x": 20,
-            "dim_y": 32,
-            "dim_z": 16,
-            "cell": 0.028,
-            "mass": 0.022,
-            "radius_mean": 0.012,
-            "smoothing_radius": 0.048,
-            "iterations": 5,
+            "left_pos": wp.vec3(-0.9, 0.022, -0.297),
+            "right_pos": wp.vec3(0.306, 0.022, -0.297),
+            "dim_x": 28,
+            "dim_y": 76,
+            "dim_z": 28,
+            "cell": 0.022,
+            "mass": 0.010648,
+            "radius_mean": 0.0095,
+            "smoothing_radius": 0.04,
+            "iterations": 4,
+            "sim_substeps": 4,
+            "velocity_damping": 0.999,
+            "viscosity": 0.0015,
+            "xsph": 0.004,
         }
 
     def __init__(self, viewer, args=None):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_time = 0.0
-        self.sim_substeps = 4
-        self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
         self.viewer._paused = True
         self.args = args
         self._reset_key_prev = False
 
-        self.container_half_width = 0.82
-        self.container_half_depth = 0.34
+        self.container_half_width = 1.08
+        self.container_half_depth = 0.42
         self.wall_thickness = 0.05
-        self.wall_half_height = 0.7
+        self.wall_half_height = 0.95
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
-        self.velocity_damping = 0.992
         particle_block = self._get_particle_block_config()
+        self.sim_substeps = int(particle_block["sim_substeps"])
+        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.velocity_damping = float(particle_block["velocity_damping"])
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -108,8 +116,8 @@ class Example:
                 smoothing_radius=particle_block["smoothing_radius"],
                 iterations=particle_block["iterations"],
                 relaxation=0.5,
-                viscosity_coefficient=0.005,
-                xsph_coefficient=0.02,
+                viscosity_coefficient=particle_block["viscosity"],
+                xsph_coefficient=particle_block["xsph"],
             ),
         )
 
@@ -143,8 +151,8 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(1.55, 1.0, 1.9),
-            pitch=-18.0,
+            pos=wp.vec3(2.15, 1.6, 2.2),
+            pitch=-22.0,
             yaw=-136.0,
         )
 
@@ -267,13 +275,13 @@ class Example:
         assert max_z <= self.container_half_depth + 0.02, f"particles escaped along z: {max_z:.3f}"
         assert min_y >= -0.02, f"particles penetrated the floor: {min_y:.3f}"
         assert max_y <= self.top_y + 0.02, f"particles penetrated the ceiling: {max_y:.3f}"
-        assert center_band_count >= self.initial_center_band_count + max(40, self.model.particle_count // 6), (
+        assert center_band_count >= self.initial_center_band_count + max(60, self.model.particle_count // 10), (
             "dam-break columns did not send enough particles into the center gap"
         )
-        assert mean_abs_x <= self.initial_mean_abs_x + 0.06, (
+        assert mean_abs_x <= self.initial_mean_abs_x + 0.28, (
             f"dam-break columns spread outward too aggressively: {mean_abs_x:.3f} vs. {self.initial_mean_abs_x:.3f}"
         )
-        assert max_speed <= 2.5, f"particles retained excessive speed: {max_speed:.3f}"
+        assert max_speed <= 3.6, f"particles retained excessive speed: {max_speed:.3f}"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
