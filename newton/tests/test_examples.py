@@ -744,5 +744,32 @@ add_example_test(
 )
 
 
+class TestIPBFExamples(unittest.TestCase):
+    pass
+
+
+add_example_test(
+    TestIPBFExamples,
+    name="ipbf.example_ipbf_double_dam_break",
+    devices=test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+add_example_test(
+    TestIPBFExamples,
+    name="ipbf.example_ipbf_block_flop",
+    devices=test_devices,
+    test_options={"num-frames": 120},
+    use_viewer=True,
+)
+add_example_test(
+    TestIPBFExamples,
+    name="ipbf.example_ipbf_3d_compression",
+    devices=test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
