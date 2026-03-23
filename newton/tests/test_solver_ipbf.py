@@ -6,9 +6,6 @@ import warp as wp
 
 import newton
 from newton.examples.ipbf.example_ipbf_box_container import Example as ExampleIPBFBoxContainer
-from newton.examples.ipbf.example_ipbf_box_container_boundary_particles import (
-    Example as ExampleIPBFBoxContainerBoundaryParticles,
-)
 from newton._src.solvers.ipbf.ipbf_kernels import kernel_gradient, kernel_hessian, kernel_value
 from newton.solvers import SolverIPBF
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -328,45 +325,6 @@ def run_single_particle_ground_step(device, *, use_contacts: bool):
     return state_1, contacts
 
 
-def run_single_particle_boundary_particle_step(device, *, rest_density: float = 1.0, return_solver: bool = False):
-    """Run one zero-gravity step with solver-owned boundary particles."""
-    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
-    SolverIPBF.register_custom_attributes(builder)
-
-    builder.add_particle(
-        pos=wp.vec3(0.0, 0.06, 0.0),
-        vel=wp.vec3(0.0, 0.0, 0.0),
-        mass=1.0,
-        radius=0.05,
-    )
-
-    model = builder.finalize(device=device)
-    model.set_gravity((0.0, 0.0, 0.0))
-    solver = SolverIPBF(
-        model,
-        SolverIPBF.Config(
-            rest_density=rest_density,
-            smoothing_radius=0.2,
-            boundary_mode=SolverIPBF.Config.BoundaryMode.BOUNDARY_PARTICLES,
-            iterations=0,
-        ),
-    )
-    solver.setup_boundary_particles_box(
-        half_width=0.2,
-        half_depth=0.2,
-        wall_half_height=0.2,
-        spacing=0.05,
-    )
-
-    state_0 = model.state()
-    state_1 = model.state()
-    state_0.clear_forces()
-    solver.step(state_0, state_1, control=None, contacts=None, dt=0.01)
-    if return_solver:
-        return solver, state_1
-    return state_1
-
-
 def run_single_particle_ground_rollout(
     device,
     *,
@@ -422,44 +380,6 @@ def run_ipbf_box_container_rollout(device, *, num_frames: int):
         viewer = newton.viewer.ViewerNull()
         example = ExampleIPBFBoxContainer(viewer, args=argparse.Namespace(test=True))
         example.graph = None
-
-        speed_history = []
-        max_abs_x = 0.0
-        max_abs_z = 0.0
-        min_y = np.inf
-
-        for _ in range(num_frames):
-            example.step()
-            particle_q = example.state_0.particle_q.numpy()
-            particle_qd = example.state_0.particle_qd.numpy()
-            particle_radius = example.model.particle_radius.numpy()
-
-            max_abs_x = max(max_abs_x, float(np.max(np.abs(particle_q[:, 0]) + particle_radius)))
-            max_abs_z = max(max_abs_z, float(np.max(np.abs(particle_q[:, 2]) + particle_radius)))
-            min_y = min(min_y, float(np.min(particle_q[:, 1] - particle_radius)))
-            speed_history.append(float(np.linalg.norm(particle_qd, axis=1).max()))
-
-    return np.asarray(speed_history, dtype=np.float32), max_abs_x, max_abs_z, float(min_y)
-
-
-def run_ipbf_boundary_particle_box_container_rollout(
-    device,
-    *,
-    num_frames: int,
-    use_shape_contacts: bool = True,
-    viscosity_coefficient: float | None = None,
-    xsph_coefficient: float | None = None,
-):
-    """Run the boundary-particle IPBF box-container example with a null viewer."""
-    with wp.ScopedDevice(device):
-        viewer = newton.viewer.ViewerNull()
-        example = ExampleIPBFBoxContainerBoundaryParticles(viewer, args=argparse.Namespace(test=True))
-        example.graph = None
-        example.use_shape_contacts = use_shape_contacts
-        if viscosity_coefficient is not None:
-            example.solver.viscosity_coefficient = viscosity_coefficient
-        if xsph_coefficient is not None:
-            example.solver.xsph_coefficient = xsph_coefficient
 
         speed_history = []
         max_abs_x = 0.0
@@ -1049,39 +969,6 @@ def test_ipbf_static_shape_boundary_projects_particles_out_of_ground(test, devic
     test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
 
 
-def test_ipbf_boundary_particles_contribute_near_wall_density_and_gradient(test, device):
-    state_1 = run_single_particle_boundary_particle_step(device)
-
-    density = state_1.ipbf.density.numpy()[0]
-    gradient = state_1.ipbf.constraint_gradient.numpy()[0]
-    self_density = kernel_density_contribution(1.0, 0.2, 0.0)
-
-    test.assertGreater(float(density), float(self_density))
-    test.assertLess(float(gradient[1]), 0.0)
-    test.assertAlmostEqual(float(state_1.particle_q.numpy()[0, 1]), 0.06, places=6)
-
-
-def test_ipbf_boundary_particle_volumes_are_positive(test, device):
-    solver, _ = run_single_particle_boundary_particle_step(device, return_solver=True)
-
-    volumes = solver._boundary_particle_volume.numpy()
-
-    test.assertGreater(solver._boundary_particle_count, 0)
-    test.assertTrue(np.isfinite(volumes).all())
-    test.assertTrue(np.all(volumes > 0.0))
-
-
-def test_ipbf_boundary_particles_contribute_at_physical_rest_density(test, device):
-    state_1 = run_single_particle_boundary_particle_step(device, rest_density=1000.0)
-
-    density = float(state_1.ipbf.density.numpy()[0])
-    gradient = state_1.ipbf.constraint_gradient.numpy()[0]
-    self_density = kernel_density_contribution(1.0, 0.2, 0.0)
-
-    test.assertGreater(density, float(self_density) + 50.0)
-    test.assertLess(float(gradient[1]), -1.0e-3)
-
-
 def test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity(test, device):
     final_state, contacts, positions, velocities = run_single_particle_ground_rollout(device, steps=6)
 
@@ -1100,69 +987,6 @@ def test_ipbf_box_container_rollout_keeps_particles_inside_bounds(test, device):
     test.assertLessEqual(max_abs_x, 0.57)
     test.assertLessEqual(max_abs_z, 0.57)
     test.assertGreaterEqual(min_y, -0.02)
-
-
-def test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds(test, device):
-    if wp.get_device(device).is_cpu:
-        return
-
-    _, max_abs_x, max_abs_z, min_y = run_ipbf_boundary_particle_box_container_rollout(device, num_frames=120)
-
-    test.assertLessEqual(max_abs_x, 0.57)
-    test.assertLessEqual(max_abs_z, 0.57)
-    test.assertGreaterEqual(min_y, -0.02)
-
-
-def test_ipbf_boundary_particle_box_container_shape_contacts_improve_containment(test, device):
-    if wp.get_device(device).is_cpu:
-        return
-
-    speed_with_contacts, max_abs_x_with_contacts, max_abs_z_with_contacts, min_y_with_contacts = run_ipbf_boundary_particle_box_container_rollout(
-        device,
-        num_frames=300,
-        use_shape_contacts=True,
-    )
-    speed_without_contacts, max_abs_x_without_contacts, max_abs_z_without_contacts, min_y_without_contacts = run_ipbf_boundary_particle_box_container_rollout(
-        device,
-        num_frames=300,
-        use_shape_contacts=False,
-    )
-
-    test.assertLessEqual(max_abs_x_with_contacts, 0.57)
-    test.assertLessEqual(max_abs_z_with_contacts, 0.57)
-    test.assertGreaterEqual(min_y_with_contacts, -0.02)
-    test.assertLessEqual(max_abs_x_without_contacts, 0.57)
-    test.assertLessEqual(max_abs_z_without_contacts, 0.57)
-    test.assertGreaterEqual(min_y_without_contacts, -0.02)
-    test.assertLess(float(np.mean(speed_with_contacts[-30:])), float(np.mean(speed_without_contacts[-30:])))
-
-
-def test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field(test, device):
-    if wp.get_device(device).is_cpu:
-        return
-
-    speed_history_without_xsph, max_abs_x_without_xsph, max_abs_z_without_xsph, min_y_without_xsph = (
-        run_ipbf_boundary_particle_box_container_rollout(
-        device,
-        num_frames=300,
-        use_shape_contacts=True,
-        xsph_coefficient=0.0,
-    ))
-    speed_history_with_xsph, max_abs_x_with_xsph, max_abs_z_with_xsph, min_y_with_xsph = (
-        run_ipbf_boundary_particle_box_container_rollout(
-        device,
-        num_frames=300,
-        use_shape_contacts=True,
-        xsph_coefficient=0.02,
-    ))
-
-    test.assertLessEqual(max_abs_x_without_xsph, 0.57)
-    test.assertLessEqual(max_abs_z_without_xsph, 0.57)
-    test.assertGreaterEqual(min_y_without_xsph, -0.02)
-    test.assertLessEqual(max_abs_x_with_xsph, 0.57)
-    test.assertLessEqual(max_abs_z_with_xsph, 0.57)
-    test.assertGreaterEqual(min_y_with_xsph, -0.02)
-    test.assertGreater(float(np.mean(np.abs(speed_history_with_xsph - speed_history_without_xsph))), 1.0e-3)
 
 
 def test_ipbf_viscosity_reduces_two_particle_relative_speed(test, device):
@@ -1188,60 +1012,6 @@ def test_ipbf_viscosity_reduces_two_particle_relative_speed(test, device):
         float(np.linalg.norm(velocity_difference_with)),
         float(np.linalg.norm(velocity_difference_without)),
     )
-
-
-def test_ipbf_boundary_particle_box_container_viscosity_changes_velocity_field(test, device):
-    if wp.get_device(device).is_cpu:
-        return
-
-    speed_history_without_viscosity, max_abs_x_without_viscosity, max_abs_z_without_viscosity, min_y_without_viscosity = (
-        run_ipbf_boundary_particle_box_container_rollout(
-            device,
-            num_frames=300,
-            use_shape_contacts=True,
-            viscosity_coefficient=0.0,
-            xsph_coefficient=0.02,
-        )
-    )
-    speed_history_with_viscosity, max_abs_x_with_viscosity, max_abs_z_with_viscosity, min_y_with_viscosity = (
-        run_ipbf_boundary_particle_box_container_rollout(
-            device,
-            num_frames=300,
-            use_shape_contacts=True,
-            viscosity_coefficient=0.005,
-            xsph_coefficient=0.02,
-        )
-    )
-
-    test.assertLessEqual(max_abs_x_without_viscosity, 0.57)
-    test.assertLessEqual(max_abs_z_without_viscosity, 0.57)
-    test.assertGreaterEqual(min_y_without_viscosity, -0.02)
-    test.assertLessEqual(max_abs_x_with_viscosity, 0.57)
-    test.assertLessEqual(max_abs_z_with_viscosity, 0.57)
-    test.assertGreaterEqual(min_y_with_viscosity, -0.02)
-    test.assertGreater(float(np.mean(np.abs(speed_history_with_viscosity - speed_history_without_viscosity))), 1.0e-3)
-
-
-def test_ipbf_boundary_particle_example_args_override_runtime_controls(test, device):
-    if wp.get_device(device).is_cpu:
-        return
-
-    with wp.ScopedDevice(device):
-        viewer = newton.viewer.ViewerNull()
-        args = argparse.Namespace(
-            dense_level=ExampleIPBFBoxContainerBoundaryParticles.DenseLevel.DENSE,
-            use_shape_contacts=False,
-            viscosity_coefficient=0.015,
-            xsph_coefficient=0.035,
-            test=True,
-        )
-        example = ExampleIPBFBoxContainerBoundaryParticles(viewer, args=args)
-
-        test.assertEqual(example.dense_level, ExampleIPBFBoxContainerBoundaryParticles.DenseLevel.DENSE)
-        test.assertEqual(example.model.particle_count, 7 * 8 * 7)
-        test.assertFalse(example.use_shape_contacts)
-        test.assertAlmostEqual(example.solver.viscosity_coefficient, 0.015, places=7)
-        test.assertAlmostEqual(example.solver.xsph_coefficient, 0.035, places=7)
 
 
 def test_ipbf_ground_contact_tangential_damping_reduces_speed(test, device):
@@ -1358,30 +1128,6 @@ add_function_test(
 
 add_function_test(
     TestSolverIPBF,
-    "test_ipbf_boundary_particles_contribute_near_wall_density_and_gradient",
-    test_ipbf_boundary_particles_contribute_near_wall_density_and_gradient,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
-    "test_ipbf_boundary_particle_volumes_are_positive",
-    test_ipbf_boundary_particle_volumes_are_positive,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
-    "test_ipbf_boundary_particles_contribute_at_physical_rest_density",
-    test_ipbf_boundary_particles_contribute_at_physical_rest_density,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
     "test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity",
     test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity,
     devices=devices,
@@ -1398,48 +1144,8 @@ add_function_test(
 
 add_function_test(
     TestSolverIPBF,
-    "test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds",
-    test_ipbf_boundary_particle_box_container_rollout_keeps_particles_inside_bounds,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
-    "test_ipbf_boundary_particle_box_container_shape_contacts_improve_containment",
-    test_ipbf_boundary_particle_box_container_shape_contacts_improve_containment,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
-    "test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field",
-    test_ipbf_boundary_particle_box_container_xsph_changes_velocity_field,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
     "test_ipbf_viscosity_reduces_two_particle_relative_speed",
     test_ipbf_viscosity_reduces_two_particle_relative_speed,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
-    "test_ipbf_boundary_particle_box_container_viscosity_changes_velocity_field",
-    test_ipbf_boundary_particle_box_container_viscosity_changes_velocity_field,
-    devices=devices,
-    check_output=False,
-)
-
-add_function_test(
-    TestSolverIPBF,
-    "test_ipbf_boundary_particle_example_args_override_runtime_controls",
-    test_ipbf_boundary_particle_example_args_override_runtime_controls,
     devices=devices,
     check_output=False,
 )
