@@ -23,6 +23,7 @@ import newton.examples
 from newton.examples.ipbf.common import (
     build_box_wireframe,
     build_ellipsoid_particle_cloud,
+    get_box_center,
     scale_velocities,
 )
 from newton.solvers import SolverIPBF
@@ -36,7 +37,7 @@ class Example:
             return {
                 "container_half_extent": 0.62,
                 "wall_half_height": 0.62,
-                "center": (0.0, 0.84, 0.0),
+                "center_offset": (0.0, 0.22, 0.0),
                 "radii": (0.18, 0.18, 0.18),
                 "compression_scale": 0.8,
                 "spacing": 0.038,
@@ -53,7 +54,7 @@ class Example:
         return {
             "container_half_extent": 0.50,
             "wall_half_height": 0.50,
-            "center": (0.0, 0.50, 0.0),
+            "center_offset": (0.0, 0.0, 0.0),
             "radii": (0.30, 0.30, 0.30),
             "compression_scale": 0.76,
             "spacing": 0.012,
@@ -93,8 +94,16 @@ class Example:
         builder.default_shape_cfg.mu = 0.0
         self._add_container(builder)
 
+        box_center = get_box_center(wall_half_height=self.wall_half_height, floor_y=self.floor_y)
+        center_offset = scene["center_offset"]
+        cloud_center = (
+            box_center[0] + center_offset[0],
+            box_center[1] + center_offset[1],
+            box_center[2] + center_offset[2],
+        )
+
         positions, velocities, masses, radii = build_ellipsoid_particle_cloud(
-            center=scene["center"],
+            center=cloud_center,
             radii=scene["radii"],
             spacing=scene["spacing"],
             velocity=(0.0, 0.0, 0.0),
@@ -104,7 +113,7 @@ class Example:
         compression_scale = float(scene["compression_scale"])
         if compression_scale != 1.0:
             positions_np = np.asarray(positions, dtype=np.float32)
-            center_np = np.asarray(scene["center"], dtype=np.float32)
+            center_np = np.asarray(cloud_center, dtype=np.float32)
             positions_np = center_np + compression_scale * (positions_np - center_np)
             positions = positions_np.tolist()
         builder.add_particles(

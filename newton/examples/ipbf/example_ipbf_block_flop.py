@@ -20,7 +20,12 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.ipbf.common import build_box_wireframe, scale_velocities
+from newton.examples.ipbf.common import (
+    build_box_wireframe,
+    get_box_center,
+    get_particle_grid_origin_from_center,
+    scale_velocities,
+)
 from newton.solvers import SolverIPBF
 
 
@@ -33,11 +38,9 @@ class Example:
                 "container_half_width": 0.42,
                 "container_half_depth": 0.42,
                 "wall_half_height": 0.75,
-                "bottom_pos": wp.vec3(-0.27, 0.03, -0.27),
                 "bottom_dim_x": 10,
                 "bottom_dim_y": 3,
                 "bottom_dim_z": 10,
-                "top_pos": wp.vec3(-0.18, 0.9, -0.18),
                 "top_dim_x": 7,
                 "top_dim_y": 3,
                 "top_dim_z": 7,
@@ -45,6 +48,8 @@ class Example:
                 "mass": 0.23,
                 "radius_mean": 0.024,
                 "smoothing_radius": 0.1,
+                "bottom_center_offset_y": -0.63,
+                "top_center_offset_y": 0.24,
                 "iterations": 6,
                 "sim_substeps": 6,
                 "velocity_damping": 0.992,
@@ -54,21 +59,21 @@ class Example:
             }
 
         return {
-            "container_half_width": 1.0,
-            "container_half_depth": 1.0,
+            "container_half_width": 0.75,
+            "container_half_depth": 0.75,
             "wall_half_height": 1.2,
-            "bottom_pos": wp.vec3(-0.889, 0.014, -0.889),
-            "bottom_dim_x": 128,
-            "bottom_dim_y": 8,
-            "bottom_dim_z": 128,
-            "top_pos": wp.vec3(-0.609, 1.48, -0.609),
-            "top_dim_x": 88,
-            "top_dim_y": 9,
-            "top_dim_z": 88,
+            "bottom_dim_x": 96,
+            "bottom_dim_y": 12,
+            "bottom_dim_z": 96,
+            "top_dim_x": 72,
+            "top_dim_y": 8,
+            "top_dim_z": 96,
             "cell": 0.014,
             "mass": 0.002744,
             "radius_mean": 0.006,
             "smoothing_radius": 0.025,
+            "bottom_center_offset_y": -1.137,
+            "top_center_offset_y": 0.672,
             "iterations": 2,
             "sim_substeps": 4,
             "velocity_damping": 0.999,
@@ -104,8 +109,22 @@ class Example:
         builder.default_shape_cfg.mu = 0.0
         self._add_container(builder)
 
+        box_center = get_box_center(wall_half_height=self.wall_half_height, floor_y=self.floor_y)
+
         builder.add_particle_grid(
-            pos=scene["bottom_pos"],
+            pos=get_particle_grid_origin_from_center(
+                center=(
+                    box_center[0],
+                    box_center[1] + float(scene["bottom_center_offset_y"]),
+                    box_center[2],
+                ),
+                dim_x=scene["bottom_dim_x"],
+                dim_y=scene["bottom_dim_y"],
+                dim_z=scene["bottom_dim_z"],
+                cell_x=scene["cell"],
+                cell_y=scene["cell"],
+                cell_z=scene["cell"],
+            ),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0, 0.0, 0.0),
             dim_x=scene["bottom_dim_x"],
@@ -119,7 +138,19 @@ class Example:
             radius_mean=scene["radius_mean"],
         )
         builder.add_particle_grid(
-            pos=scene["top_pos"],
+            pos=get_particle_grid_origin_from_center(
+                center=(
+                    box_center[0],
+                    box_center[1] + float(scene["top_center_offset_y"]),
+                    box_center[2],
+                ),
+                dim_x=scene["top_dim_x"],
+                dim_y=scene["top_dim_y"],
+                dim_z=scene["top_dim_z"],
+                cell_x=scene["cell"],
+                cell_y=scene["cell"],
+                cell_z=scene["cell"],
+            ),
             rot=wp.quat_identity(),
             vel=wp.vec3(0.0, 0.0, 0.0),
             dim_x=scene["top_dim_x"],
@@ -179,7 +210,7 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(2.25, 1.8, 2.7),
+            pos=wp.vec3(2.75, 2.5, 3.25),
             pitch=-22.0,
             yaw=-132.0,
         )

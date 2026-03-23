@@ -20,7 +20,13 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.ipbf.common import build_box_wireframe, scale_velocities
+from newton.examples.ipbf.common import (
+    build_box_wireframe,
+    get_particle_grid_half_span,
+    get_particle_grid_origin_from_center,
+    get_symmetric_wall_aligned_center_offset_x,
+    scale_velocities,
+)
 from newton.solvers import SolverIPBF
 
 
@@ -30,8 +36,6 @@ class Example:
     def _get_particle_block_config(self) -> dict[str, object]:
         if bool(getattr(self.args, "test", False)):
             return {
-                "left_pos": wp.vec3(-0.58, 0.035, -0.175),
-                "right_pos": wp.vec3(0.16, 0.035, -0.175),
                 "dim_x": 6,
                 "dim_y": 14,
                 "dim_z": 6,
@@ -39,6 +43,9 @@ class Example:
                 "mass": 0.45,
                 "radius_mean": 0.028,
                 "smoothing_radius": 0.12,
+                "column_center_offset_x": None,
+                "column_wall_gap_x": 0.04,
+                "bottom_clearance_y": 0.035,
                 "iterations": 6,
                 "sim_substeps": 6,
                 "velocity_damping": 0.997,
@@ -47,15 +54,16 @@ class Example:
             }
 
         return {
-            "left_pos": wp.vec3(-0.9, 0.022, -0.297),
-            "right_pos": wp.vec3(0.306, 0.022, -0.297),
             "dim_x": 28,
-            "dim_y": 76,
-            "dim_z": 28,
+            "dim_y": 84,
+            "dim_z": 12,
             "cell": 0.022,
             "mass": 0.010648,
             "radius_mean": 0.0095,
             "smoothing_radius": 0.04,
+            "column_center_offset_x": None,
+            "column_wall_gap_x": 0.03,
+            "bottom_clearance_y": 0.022,
             "iterations": 4,
             "sim_substeps": 4,
             "velocity_damping": 0.999,
@@ -74,7 +82,7 @@ class Example:
         self._reset_key_prev = False
 
         self.container_half_width = 1.08
-        self.container_half_depth = 0.42
+        self.container_half_depth = 0.2
         self.wall_thickness = 0.05
         self.wall_half_height = 0.95
         self.floor_y = 0.0
@@ -90,7 +98,43 @@ class Example:
         builder.default_shape_cfg.mu = 0.0
         self._add_container(builder)
 
-        for pos in (particle_block["left_pos"], particle_block["right_pos"]):
+        _, half_span_y, _ = get_particle_grid_half_span(
+            dim_x=particle_block["dim_x"],
+            dim_y=particle_block["dim_y"],
+            dim_z=particle_block["dim_z"],
+            cell_x=particle_block["cell"],
+            cell_y=particle_block["cell"],
+            cell_z=particle_block["cell"],
+        )
+        center_offset_x = particle_block["column_center_offset_x"]
+        if center_offset_x is None:
+            center_offset_x = get_symmetric_wall_aligned_center_offset_x(
+                container_half_width=self.container_half_width,
+                dim_x=particle_block["dim_x"],
+                cell_x=particle_block["cell"],
+                gap_x=particle_block["column_wall_gap_x"],
+            )
+        center_y = self.floor_y + particle_block["bottom_clearance_y"] + half_span_y
+        left_origin = get_particle_grid_origin_from_center(
+            center=(-float(center_offset_x), center_y, 0.0),
+            dim_x=particle_block["dim_x"],
+            dim_y=particle_block["dim_y"],
+            dim_z=particle_block["dim_z"],
+            cell_x=particle_block["cell"],
+            cell_y=particle_block["cell"],
+            cell_z=particle_block["cell"],
+        )
+        right_origin = get_particle_grid_origin_from_center(
+            center=(float(center_offset_x), center_y, 0.0),
+            dim_x=particle_block["dim_x"],
+            dim_y=particle_block["dim_y"],
+            dim_z=particle_block["dim_z"],
+            cell_x=particle_block["cell"],
+            cell_y=particle_block["cell"],
+            cell_z=particle_block["cell"],
+        )
+
+        for pos in (left_origin, right_origin):
             builder.add_particle_grid(
                 pos=pos,
                 rot=wp.quat_identity(),
@@ -151,7 +195,7 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(2.15, 1.6, 2.2),
+            pos=wp.vec3(2.15, 2.0, 2.2),
             pitch=-22.0,
             yaw=-136.0,
         )

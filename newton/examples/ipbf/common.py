@@ -69,6 +69,70 @@ def build_box_wireframe(
     return starts, ends
 
 
+def get_box_center(*, wall_half_height: float, floor_y: float = 0.0) -> tuple[float, float, float]:
+    """Return the geometric center of an axis-aligned container box."""
+    return (0.0, floor_y + wall_half_height, 0.0)
+
+
+def get_particle_grid_half_span(
+    *,
+    dim_x: int,
+    dim_y: int,
+    dim_z: int,
+    cell_x: float,
+    cell_y: float,
+    cell_z: float,
+) -> tuple[float, float, float]:
+    """Return half the center-to-center extent of a particle grid."""
+    return (
+        0.5 * (dim_x - 1) * cell_x,
+        0.5 * (dim_y - 1) * cell_y,
+        0.5 * (dim_z - 1) * cell_z,
+    )
+
+
+def get_particle_grid_origin_from_center(
+    *,
+    center: tuple[float, float, float],
+    dim_x: int,
+    dim_y: int,
+    dim_z: int,
+    cell_x: float,
+    cell_y: float,
+    cell_z: float,
+) -> wp.vec3:
+    """Convert a desired particle-grid center to the origin expected by ``add_particle_grid``."""
+    hx, hy, hz = get_particle_grid_half_span(
+        dim_x=dim_x,
+        dim_y=dim_y,
+        dim_z=dim_z,
+        cell_x=cell_x,
+        cell_y=cell_y,
+        cell_z=cell_z,
+    )
+    cx, cy, cz = center
+    return wp.vec3(cx - hx, cy - hy, cz - hz)
+
+
+def get_symmetric_wall_aligned_center_offset_x(
+    *,
+    container_half_width: float,
+    dim_x: int,
+    cell_x: float,
+    gap_x: float = 0.0,
+) -> float:
+    """Return the symmetric x-offset that places a particle block near both side walls."""
+    hx, _, _ = get_particle_grid_half_span(
+        dim_x=dim_x,
+        dim_y=1,
+        dim_z=1,
+        cell_x=cell_x,
+        cell_y=1.0,
+        cell_z=1.0,
+    )
+    return container_half_width - gap_x - hx
+
+
 def build_ellipsoid_particle_cloud(
     *,
     center: tuple[float, float, float],
