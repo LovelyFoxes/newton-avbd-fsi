@@ -436,6 +436,7 @@ def main():
         "cloth",
         "contacts",
         "diffsim",
+        "fsi",
         "ipbf",
         "ik",
         "mpm",

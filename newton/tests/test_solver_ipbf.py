@@ -444,6 +444,57 @@ def run_dynamic_box_projection_reaction_step(device):
     return state_0, state_1, solver, boundary_model, contacts, body, particle_mass, dt
 
 
+def run_dynamic_box_velocity_reaction_step(device):
+    """Run an approaching particle that is stopped by boundary velocity projection."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    particle_mass = 1.0
+    builder.add_particle(
+        pos=wp.vec3(-0.13, 0.0, 0.0),
+        vel=wp.vec3(1.0, 0.0, 0.0),
+        mass=particle_mass,
+        radius=0.02,
+    )
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        mass=1.0,
+    )
+    builder.add_shape_box(
+        body=body,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        hx=0.1,
+        hy=0.1,
+        hz=0.1,
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(model, spacing=0.1, support_radius=0.2, device=device)
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            smoothing_radius=0.2,
+            iterations=0,
+            boundary_velocity_damping=1.0,
+            fsi_reaction_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
+    contacts = model.contacts(collision_pipeline=collision_pipeline)
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    dt = 0.005
+    solver.step(state_0, state_1, control=None, contacts=contacts, dt=dt)
+
+    return state_1, boundary_model, contacts, body
+
+
 def run_single_particle_ground_rollout(
     device,
     *,
@@ -1157,6 +1208,18 @@ def test_ipbf_projection_reaction_accumulates_body_wrench(test, device):
     np.testing.assert_allclose(body_torque, np.zeros(3, dtype=np.float32), rtol=1.0e-5, atol=1.0e-5)
 
 
+def test_ipbf_velocity_projection_reaction_accumulates_body_wrench(test, device):
+    state_1, boundary_model, contacts, body = run_dynamic_box_velocity_reaction_step(device)
+
+    body_force = boundary_model.body_force.numpy()[body]
+
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+    test.assertGreater(float(body_force[0]), 0.0)
+    test.assertAlmostEqual(float(body_force[1]), 0.0, places=5)
+    test.assertAlmostEqual(float(body_force[2]), 0.0, places=5)
+    test.assertLessEqual(float(state_1.particle_qd.numpy()[0, 0]), 1.0e-5)
+
+
 def test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity(test, device):
     final_state, contacts, positions, velocities = run_single_particle_ground_rollout(device, steps=6)
 
@@ -1318,6 +1381,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_projection_reaction_accumulates_body_wrench",
     test_ipbf_projection_reaction_accumulates_body_wrench,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_velocity_projection_reaction_accumulates_body_wrench",
+    test_ipbf_velocity_projection_reaction_accumulates_body_wrench,
     devices=devices,
     check_output=False,
 )
