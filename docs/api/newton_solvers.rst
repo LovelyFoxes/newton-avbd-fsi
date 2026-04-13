@@ -420,6 +420,7 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    BoundarySampleFlags
    FSIBoundaryModel
    SolverBase
+   SolverFSI
    SolverFeatherstone
    SolverIPBF
    SolverImplicitMPM

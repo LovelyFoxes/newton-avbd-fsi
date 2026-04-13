@@ -15,7 +15,7 @@
 
 from .featherstone import SolverFeatherstone
 from .flags import SolverNotifyFlags
-from .fsi import BoundarySampleFlags, FSIBoundaryModel
+from .fsi import BoundarySampleFlags, FSIBoundaryModel, SolverFSI
 from .implicit_mpm import SolverImplicitMPM
 from .ipbf import SolverIPBF
 from .kamino import SolverKamino
@@ -30,6 +30,7 @@ __all__ = [
     "BoundarySampleFlags",
     "FSIBoundaryModel",
     "SolverBase",
+    "SolverFSI",
     "SolverFeatherstone",
     "SolverIPBF",
     "SolverImplicitMPM",

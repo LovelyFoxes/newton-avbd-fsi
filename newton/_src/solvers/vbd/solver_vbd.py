@@ -165,6 +165,7 @@ class SolverVBD(SolverBase):
         iterations: int = 10,
         friction_epsilon: float = 1e-2,
         integrate_with_external_rigid_solver: bool = False,
+        integrate_particles: bool = True,
         # Particle parameters
         particle_enable_self_contact: bool = False,
         particle_self_contact_radius: float = 0.2,
@@ -205,6 +206,8 @@ class SolverVBD(SolverBase):
             iterations: Number of VBD iterations per step.
             friction_epsilon: Threshold to smooth small relative velocities in friction computation (used for both particle
                 and rigid body contacts).
+            integrate_particles: Whether SolverVBD integrates model particles. Set to ``False`` for rigid-only
+                AVBD when another solver owns particles in the same model.
 
             Particle parameters:
 
@@ -290,27 +293,29 @@ class SolverVBD(SolverBase):
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
+        self.integrate_particles = bool(integrate_particles)
         self.fsi_boundary_model = None
         self.fsi_force_relaxation = float(fsi_force_relaxation)
         self.set_fsi_boundary_model(fsi_boundary_model)
 
         # Initialize particle system
-        self._init_particle_system(
-            model,
-            particle_enable_self_contact,
-            particle_self_contact_radius,
-            particle_self_contact_margin,
-            particle_conservative_bound_relaxation,
-            particle_vertex_contact_buffer_size,
-            particle_edge_contact_buffer_size,
-            particle_collision_detection_interval,
-            particle_edge_parallel_epsilon,
-            particle_enable_tile_solve,
-            particle_topological_contact_filter_threshold,
-            particle_rest_shape_contact_exclusion_radius,
-            particle_external_vertex_contact_filtering_map,
-            particle_external_edge_contact_filtering_map,
-        )
+        if self.integrate_particles:
+            self._init_particle_system(
+                model,
+                particle_enable_self_contact,
+                particle_self_contact_radius,
+                particle_self_contact_margin,
+                particle_conservative_bound_relaxation,
+                particle_vertex_contact_buffer_size,
+                particle_edge_contact_buffer_size,
+                particle_collision_detection_interval,
+                particle_edge_parallel_epsilon,
+                particle_enable_tile_solve,
+                particle_topological_contact_filter_threshold,
+                particle_rest_shape_contact_exclusion_radius,
+                particle_external_vertex_contact_filtering_map,
+                particle_external_edge_contact_filtering_map,
+            )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
@@ -1223,14 +1228,33 @@ class SolverVBD(SolverBase):
         self.update_rigid_history = True
 
         self._initialize_rigid_bodies(state_in, contacts, dt, update_rigid_history)
-        self._initialize_particles(state_in, state_out, dt)
+        if self.integrate_particles:
+            self._initialize_particles(state_in, state_out, dt)
+        else:
+            self._copy_external_particle_state(state_in, state_out)
 
         for iter_num in range(self.iterations):
             self._solve_rigid_body_iteration(state_in, state_out, contacts, dt)
-            self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
+            if self.integrate_particles:
+                self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
         self._finalize_rigid_bodies(state_out, dt)
-        self._finalize_particles(state_out, dt)
+        if self.integrate_particles:
+            self._finalize_particles(state_out, dt)
+        else:
+            self._copy_external_particle_state(state_in, state_out)
+
+    def _copy_external_particle_state(self, state_in: State, state_out: State) -> None:
+        """Preserve particle state when another solver owns model particles."""
+        if self.model.particle_count == 0:
+            return
+
+        if state_in.particle_q is not None and state_out.particle_q is not None:
+            state_out.particle_q.assign(state_in.particle_q)
+        if state_in.particle_qd is not None and state_out.particle_qd is not None:
+            state_out.particle_qd.assign(state_in.particle_qd)
+        if state_in.particle_f is not None and state_out.particle_f is not None:
+            state_out.particle_f.assign(state_in.particle_f)
 
     def _penetration_free_truncation(self, particle_q_out=None):
         """
@@ -1469,7 +1493,7 @@ class SolverVBD(SolverBase):
         # ---------------------------
         # Body-particle interaction
         # ---------------------------
-        if model.particle_count > 0 and update_rigid_history and contacts is not None:
+        if self.integrate_particles and model.particle_count > 0 and update_rigid_history and contacts is not None:
             # Build body-particle (rigid-particle) contact lists only when SolverVBD
             # is integrating rigid bodies itself; the external rigid solver path
             # does not use these per-body adjacency structures. Also skip if there
@@ -1724,7 +1748,7 @@ class SolverVBD(SolverBase):
         #   ground plane where shape_body == -1).
         skip_rigid_solve = self.integrate_with_external_rigid_solver or model.body_count == 0
         if skip_rigid_solve:
-            if model.particle_count > 0 and contacts is not None:
+            if self.integrate_particles and model.particle_count > 0 and contacts is not None:
                 # Use external rigid poses when enabled; otherwise use the current VBD poses.
                 body_q = state_out.body_q if self.integrate_with_external_rigid_solver else state_in.body_q
 
@@ -1770,7 +1794,7 @@ class SolverVBD(SolverBase):
 
             # Gauss-Seidel contact accumulation: evaluate contacts for bodies in this color
             # Accumulate body-particle forces and Hessians on bodies (per-body, per-color)
-            if model.particle_count > 0 and contacts is not None:
+            if self.integrate_particles and model.particle_count > 0 and contacts is not None:
                 wp.launch(
                     kernel=accumulate_body_particle_contacts_per_body,
                     dim=color_group.size * _NUM_CONTACT_THREADS_PER_BODY,
@@ -1944,7 +1968,7 @@ class SolverVBD(SolverBase):
             )
 
             # Update body-particle contact penalties
-            if model.particle_count > 0:
+            if self.integrate_particles and model.particle_count > 0:
                 soft_contact_launch_dim = contacts.soft_contact_max
                 wp.launch(
                     kernel=update_duals_body_particle_contacts,

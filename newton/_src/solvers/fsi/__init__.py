@@ -14,8 +14,10 @@
 # limitations under the License.
 
 from .boundary_model import BoundarySampleFlags, FSIBoundaryModel
+from .solver_fsi import SolverFSI
 
 __all__ = [
     "BoundarySampleFlags",
     "FSIBoundaryModel",
+    "SolverFSI",
 ]
