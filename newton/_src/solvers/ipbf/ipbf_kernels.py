@@ -23,6 +23,7 @@ from ...geometry import ParticleFlags
 
 KERNEL_FAMILY_CUBIC_SPLINE = 0
 KERNEL_FAMILY_POLY6 = 1
+_BOUNDARY_SAMPLE_ACTIVE = wp.constant(1)
 
 
 @wp.func
@@ -278,6 +279,60 @@ def initialize_density_and_neighbor_count(
 
 
 @wp.kernel
+def initialize_density_and_neighbor_count_with_boundary(
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    density: wp.array(dtype=float),
+    neighbor_count: wp.array(dtype=wp.int32),
+    density_boundary: wp.array(dtype=float),
+    boundary_neighbor_count: wp.array(dtype=wp.int32),
+):
+    """Initialize density including boundary samples when no particle grid exists."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        density[tid] = 0.0
+        neighbor_count[tid] = 0
+        density_boundary[tid] = 0.0
+        boundary_neighbor_count[tid] = 0
+        return
+
+    xi = particle_q[tid]
+    rho = particle_mass[tid] * kernel_value(0.0, support_radius, kernel_family)
+    rho_boundary = float(0.0)
+    boundary_count = int(0)
+
+    query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if (boundary_flags[index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+
+        dist = xi - boundary_x[index]
+        dist2 = wp.dot(dist, dist)
+        kernel = kernel_value(dist2, support_radius, kernel_family)
+        if kernel <= 0.0:
+            continue
+
+        rho_boundary += rest_density * boundary_volume[index] * kernel
+        boundary_count += 1
+
+    density[tid] = rho + rho_boundary
+    neighbor_count[tid] = boundary_count
+    density_boundary[tid] = rho_boundary
+    boundary_neighbor_count[tid] = boundary_count
+
+
+@wp.kernel
 def initialize_constraint_and_gradient(
     density: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
@@ -300,6 +355,53 @@ def initialize_constraint_and_gradient(
 
     constraint[tid] = c
     constraint_gradient[tid] = wp.vec3(0.0)
+
+
+@wp.kernel
+def initialize_constraint_and_gradient_with_boundary(
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_flags: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    density: wp.array(dtype=float),
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    use_constraint_clamp: int,
+    constraint: wp.array(dtype=float),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+):
+    """Initialize constraints including boundary gradients when no particle grid exists."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or rest_density <= 0.0:
+        constraint[tid] = 0.0
+        constraint_gradient[tid] = wp.vec3(0.0)
+        return
+
+    c = density[tid] / rest_density - 1.0
+    if use_constraint_clamp != 0 and c < 0.0:
+        constraint[tid] = 0.0
+        constraint_gradient[tid] = wp.vec3(0.0)
+        return
+
+    xi = particle_q[tid]
+    grad = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if (boundary_flags[index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+
+        displacement = xi - boundary_x[index]
+        grad += rest_density * boundary_volume[index] * kernel_gradient(displacement, support_radius, kernel_family)
+
+    constraint[tid] = c
+    constraint_gradient[tid] = grad / rest_density
 
 
 @wp.kernel
@@ -353,6 +455,85 @@ def compute_density_and_neighbor_count(
 
 
 @wp.kernel
+def compute_density_and_neighbor_count_with_boundary(
+    grid: wp.uint64,
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    density: wp.array(dtype=float),
+    neighbor_count: wp.array(dtype=wp.int32),
+    density_boundary: wp.array(dtype=float),
+    boundary_neighbor_count: wp.array(dtype=wp.int32),
+):
+    """Compute SPH density estimates with Akinci-style boundary samples."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        density[tid] = 0.0
+        neighbor_count[tid] = 0
+        density_boundary[tid] = 0.0
+        boundary_neighbor_count[tid] = 0
+        return
+
+    xi = particle_q[tid]
+    world_i = particle_world[tid]
+    rho = float(0.0)
+    fluid_count = int(0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+
+        world_j = particle_world[index]
+        if world_i >= 0 and world_j >= 0 and world_i != world_j:
+            continue
+
+        dist = xi - particle_q[index]
+        dist2 = wp.dot(dist, dist)
+        kernel = kernel_value(dist2, support_radius, kernel_family)
+        if kernel <= 0.0:
+            continue
+
+        rho += particle_mass[index] * kernel
+        if index != tid:
+            fluid_count += 1
+
+    rho_boundary = float(0.0)
+    boundary_count = int(0)
+    boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+    boundary_index = int(0)
+
+    while wp.hash_grid_query_next(boundary_query, boundary_index):
+        if (boundary_flags[boundary_index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+
+        dist = xi - boundary_x[boundary_index]
+        dist2 = wp.dot(dist, dist)
+        kernel = kernel_value(dist2, support_radius, kernel_family)
+        if kernel <= 0.0:
+            continue
+
+        rho_boundary += rest_density * boundary_volume[boundary_index] * kernel
+        boundary_count += 1
+
+    density[tid] = rho + rho_boundary
+    neighbor_count[tid] = fluid_count + boundary_count
+    density_boundary[tid] = rho_boundary
+    boundary_neighbor_count[tid] = boundary_count
+
+
+@wp.kernel
 def compute_constraint_and_gradient(
     grid: wp.uint64,
     particle_q: wp.array(dtype=wp.vec3),
@@ -398,6 +579,75 @@ def compute_constraint_and_gradient(
 
         displacement = xi - particle_q[index]
         grad += particle_mass[index] * kernel_gradient(displacement, support_radius, kernel_family)
+
+    constraint[tid] = c
+    constraint_gradient[tid] = grad / rest_density
+
+
+@wp.kernel
+def compute_constraint_and_gradient_with_boundary(
+    grid: wp.uint64,
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    density: wp.array(dtype=float),
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    use_constraint_clamp: int,
+    constraint: wp.array(dtype=float),
+    constraint_gradient: wp.array(dtype=wp.vec3),
+):
+    """Compute density constraints and gradients including boundary samples."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or rest_density <= 0.0:
+        constraint[tid] = 0.0
+        constraint_gradient[tid] = wp.vec3(0.0)
+        return
+
+    c = density[tid] / rest_density - 1.0
+    if use_constraint_clamp != 0 and c < 0.0:
+        constraint[tid] = 0.0
+        constraint_gradient[tid] = wp.vec3(0.0)
+        return
+
+    xi = particle_q[tid]
+    world_i = particle_world[tid]
+    grad = wp.vec3(0.0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+
+        world_j = particle_world[index]
+        if world_i >= 0 and world_j >= 0 and world_i != world_j:
+            continue
+
+        displacement = xi - particle_q[index]
+        grad += particle_mass[index] * kernel_gradient(displacement, support_radius, kernel_family)
+
+    boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+    boundary_index = int(0)
+
+    while wp.hash_grid_query_next(boundary_query, boundary_index):
+        if (boundary_flags[boundary_index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+
+        displacement = xi - boundary_x[boundary_index]
+        grad += (
+            rest_density
+            * boundary_volume[boundary_index]
+            * kernel_gradient(displacement, support_radius, kernel_family)
+        )
 
     constraint[tid] = c
     constraint_gradient[tid] = grad / rest_density

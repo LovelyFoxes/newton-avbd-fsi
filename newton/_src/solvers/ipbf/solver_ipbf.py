@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 import numpy as np
 import warp as wp
@@ -41,14 +42,18 @@ from .ipbf_kernels import (
     apply_xsph_velocity_smoothing,
     apply_xsph_velocity_smoothing_without_grid,
     compute_constraint_and_gradient,
+    compute_constraint_and_gradient_with_boundary,
     compute_density_and_neighbor_count,
+    compute_density_and_neighbor_count_with_boundary,
     compute_force,
     compute_force_without_grid,
     compute_hessian,
     compute_hessian_without_grid,
     finalize_particle_shape_boundary_velocity_projection,
     initialize_constraint_and_gradient,
+    initialize_constraint_and_gradient_with_boundary,
     initialize_density_and_neighbor_count,
+    initialize_density_and_neighbor_count_with_boundary,
     initialize_guess_positions,
     initialize_particle_shape_boundary_velocity_projection,
     predict_inertial_positions,
@@ -56,6 +61,9 @@ from .ipbf_kernels import (
     solve_local_system,
     update_velocity_from_positions,
 )
+
+if TYPE_CHECKING:
+    from ..fsi import FSIBoundaryModel
 
 __all__ = ["SolverIPBF"]
 
@@ -71,6 +79,8 @@ class SolverIPBF(SolverBase):
     Args:
         model: The model to solve.
         config: The solver configuration.
+        boundary_model: Optional FSI boundary sample model used to add
+            solid-boundary density contributions.
 
     Returns:
         The solver.
@@ -142,7 +152,8 @@ class SolverIPBF(SolverBase):
             - ``ipbf:x_new``: Updated relaxed Jacobi iterate
             - ``ipbf:x_star``: Alternative final-iteration position used by artificial damping
             - ``ipbf:density``: Current SPH density estimate :math:`\\rho_i` [kg/m^3]
-            - ``ipbf:neighbor_count``: Number of active neighboring particles inside the support radius
+            - ``ipbf:neighbor_count``: Number of active neighboring particles inside the support radius, plus
+              boundary samples when a boundary model is enabled
             - ``ipbf:constraint``: Density constraint value :math:`C_i = \\rho_i / \\rho_0 - 1`
             - ``ipbf:constraint_gradient``: Local constraint gradient :math:`\\partial C_i / \\partial x_i`
             - ``ipbf:force``: Local Newton-step force term :math:`f_i`
@@ -277,6 +288,7 @@ class SolverIPBF(SolverBase):
         self,
         model: Model,
         config: Config | None = None,
+        boundary_model: FSIBoundaryModel | None = None,
     ):
         super().__init__(model)
 
@@ -294,6 +306,8 @@ class SolverIPBF(SolverBase):
         self.viscosity_coefficient = float(self.config.viscosity_coefficient)
         self.xsph_coefficient = float(self.config.xsph_coefficient)
         self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
+        self.boundary_model = None
+        self.set_boundary_model(boundary_model)
 
         if not hasattr(model, "ipbf"):
             raise ValueError(
@@ -312,10 +326,27 @@ class SolverIPBF(SolverBase):
             self._boundary_projected_contact_count = wp.zeros(model.particle_count, dtype=int)
             self._viscosity_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._xsph_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._boundary_density = wp.zeros(model.particle_count, dtype=float)
+            self._boundary_neighbor_count = wp.zeros(model.particle_count, dtype=wp.int32)
 
         if model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
                 model.particle_grid.reserve(model.particle_count)
+
+    def set_boundary_model(self, boundary_model: FSIBoundaryModel | None) -> None:
+        """Set the optional FSI boundary sample model used by density assembly.
+
+        Args:
+            boundary_model: Boundary sample model, or ``None`` to disable
+                solid-boundary density contributions.
+        """
+        if boundary_model is not None:
+            if getattr(boundary_model, "model", self.model) is not self.model:
+                raise ValueError("IPBF boundary model must be built from this solver's model.")
+            if getattr(boundary_model, "device", self.model.device) != self.model.device:
+                raise ValueError("IPBF boundary model device must match the solver model device.")
+
+        self.boundary_model = boundary_model
 
     def reset(self, state_out: State) -> None:
         """Reset a state to the solver's initial particle configuration.
@@ -544,6 +575,7 @@ class SolverIPBF(SolverBase):
         *,
         recompute_density_constraint: bool = True,
         compliance: float | None = None,
+        boundary_model: FSIBoundaryModel | None = None,
     ) -> None:
         """Assemble IPBF local solve quantities for the given particle positions.
 
@@ -558,75 +590,186 @@ class SolverIPBF(SolverBase):
             compliance: Compliance override used when assembling force and
                 Hessian terms. If ``None``, uses the solver's default
                 compliance.
+            boundary_model: Optional FSI boundary sample model whose samples
+                contribute to fluid density and constraint gradients.
         """
         model = self.model
         compliance_value = self.compliance if compliance is None else float(compliance)
+        boundary_model = self.boundary_model if boundary_model is None else boundary_model
+        has_boundary = (
+            boundary_model is not None
+            and getattr(boundary_model, "sample_count", 0) > 0
+            and getattr(boundary_model, "boundary_grid", None) is not None
+        )
+
+        if recompute_density_constraint:
+            self._boundary_density.zero_()
+            self._boundary_neighbor_count.zero_()
+
+        if recompute_density_constraint and has_boundary:
+            boundary_model.update_world_kinematics(state)
+            boundary_model.build_grid()
 
         if recompute_density_constraint and model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
                 model.particle_grid.build(particle_q, radius=self.smoothing_radius)
 
-            wp.launch(
-                compute_density_and_neighbor_count,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_grid.id,
-                    particle_q,
-                    model.particle_mass,
-                    model.particle_flags,
-                    model.particle_world,
-                    self.smoothing_radius,
-                    self.kernel_family,
-                ],
-                outputs=[state.ipbf.density, state.ipbf.neighbor_count],
-                device=model.device,
-            )
+            if has_boundary:
+                wp.launch(
+                    compute_density_and_neighbor_count_with_boundary,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        boundary_model.boundary_grid.id,
+                        particle_q,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_volume,
+                        boundary_model.sample_flags,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                    ],
+                    outputs=[
+                        state.ipbf.density,
+                        state.ipbf.neighbor_count,
+                        self._boundary_density,
+                        self._boundary_neighbor_count,
+                    ],
+                    device=model.device,
+                )
 
-            wp.launch(
-                compute_constraint_and_gradient,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_grid.id,
-                    particle_q,
-                    model.particle_mass,
-                    model.particle_flags,
-                    model.particle_world,
-                    state.ipbf.density,
-                    self.rest_density,
-                    self.smoothing_radius,
-                    self.kernel_family,
-                    int(self.use_constraint_clamp),
-                ],
-                outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
-                device=model.device,
-            )
+                wp.launch(
+                    compute_constraint_and_gradient_with_boundary,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        boundary_model.boundary_grid.id,
+                        particle_q,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_volume,
+                        boundary_model.sample_flags,
+                        state.ipbf.density,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        int(self.use_constraint_clamp),
+                    ],
+                    outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    compute_density_and_neighbor_count,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        particle_q,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                    ],
+                    outputs=[state.ipbf.density, state.ipbf.neighbor_count],
+                    device=model.device,
+                )
+
+                wp.launch(
+                    compute_constraint_and_gradient,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        particle_q,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        state.ipbf.density,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        int(self.use_constraint_clamp),
+                    ],
+                    outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
+                    device=model.device,
+                )
         elif recompute_density_constraint:
-            wp.launch(
-                initialize_density_and_neighbor_count,
-                dim=model.particle_count,
-                inputs=[
-                    particle_q,
-                    model.particle_mass,
-                    model.particle_flags,
-                    self.smoothing_radius,
-                    self.kernel_family,
-                ],
-                outputs=[state.ipbf.density, state.ipbf.neighbor_count],
-                device=model.device,
-            )
+            if has_boundary:
+                wp.launch(
+                    initialize_density_and_neighbor_count_with_boundary,
+                    dim=model.particle_count,
+                    inputs=[
+                        boundary_model.boundary_grid.id,
+                        particle_q,
+                        model.particle_mass,
+                        model.particle_flags,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_volume,
+                        boundary_model.sample_flags,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                    ],
+                    outputs=[
+                        state.ipbf.density,
+                        state.ipbf.neighbor_count,
+                        self._boundary_density,
+                        self._boundary_neighbor_count,
+                    ],
+                    device=model.device,
+                )
 
-            wp.launch(
-                initialize_constraint_and_gradient,
-                dim=model.particle_count,
-                inputs=[
-                    state.ipbf.density,
-                    model.particle_flags,
-                    self.rest_density,
-                    int(self.use_constraint_clamp),
-                ],
-                outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
-                device=model.device,
-            )
+                wp.launch(
+                    initialize_constraint_and_gradient_with_boundary,
+                    dim=model.particle_count,
+                    inputs=[
+                        boundary_model.boundary_grid.id,
+                        particle_q,
+                        model.particle_flags,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_volume,
+                        boundary_model.sample_flags,
+                        state.ipbf.density,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        int(self.use_constraint_clamp),
+                    ],
+                    outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    initialize_density_and_neighbor_count,
+                    dim=model.particle_count,
+                    inputs=[
+                        particle_q,
+                        model.particle_mass,
+                        model.particle_flags,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                    ],
+                    outputs=[state.ipbf.density, state.ipbf.neighbor_count],
+                    device=model.device,
+                )
+
+                wp.launch(
+                    initialize_constraint_and_gradient,
+                    dim=model.particle_count,
+                    inputs=[
+                        state.ipbf.density,
+                        model.particle_flags,
+                        self.rest_density,
+                        int(self.use_constraint_clamp),
+                    ],
+                    outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
+                    device=model.device,
+                )
 
         if model.particle_count > 1 and model.particle_grid is not None:
             wp.launch(

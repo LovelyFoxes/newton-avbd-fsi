@@ -22,7 +22,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.fsi import BoundarySampleFlags, FSIBoundaryModel
+from newton.solvers import BoundarySampleFlags, FSIBoundaryModel
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 

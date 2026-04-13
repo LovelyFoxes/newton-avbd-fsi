@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,9 +20,9 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.examples.ipbf.example_ipbf_box_container import Example as ExampleIPBFBoxContainer
 from newton._src.solvers.ipbf.ipbf_kernels import kernel_gradient, kernel_hessian, kernel_value
-from newton.solvers import SolverIPBF
+from newton.examples.ipbf.example_ipbf_box_container import Example as ExampleIPBFBoxContainer
+from newton.solvers import FSIBoundaryModel, SolverIPBF
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 KernelFamily = SolverIPBF.Config.KernelFamily
@@ -155,7 +155,9 @@ def expected_neighbor_constraint_hessian(
         return np.zeros((3, 3), dtype=np.float32)
 
     return (
-        mass_self * kernel_hessian_reference(support_radius, displacement_neighbor_minus_self, kernel_family) / rest_density
+        mass_self
+        * kernel_hessian_reference(support_radius, displacement_neighbor_minus_self, kernel_family)
+        / rest_density
     ).astype(np.float32)
 
 
@@ -340,6 +342,58 @@ def run_single_particle_ground_step(device, *, use_contacts: bool):
     return state_1, contacts
 
 
+def run_boundary_density_step(device, *, use_boundary_model: bool):
+    """Run a zero-iteration IPBF step near a static box boundary."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(-0.05, 0.5, 0.0),
+            wp.vec3(0.05, 0.5, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0],
+        radius=[0.05, 0.05],
+    )
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        hx=0.25,
+        hy=0.25,
+        hz=0.25,
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = None
+    if use_boundary_model:
+        boundary_model = FSIBoundaryModel(model, spacing=0.25, support_radius=0.6, device=device)
+
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.6,
+            hessian_regularization=1.0e-6,
+            iterations=0,
+            use_constraint_clamp=False,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.01)
+
+    return state_1, solver
+
+
 def run_single_particle_ground_rollout(
     device,
     *,
@@ -467,10 +521,14 @@ def test_ipbf_registers_attributes_and_applies_inertial_prediction(test, device)
     np.testing.assert_allclose(state_1.ipbf.x_new.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.particle_q.numpy()[0], expected_y, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.particle_qd.numpy()[0], expected_v, rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(state_1.ipbf.density.numpy(), np.array([expected_density], dtype=np.float32), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        state_1.ipbf.density.numpy(), np.array([expected_density], dtype=np.float32), rtol=1e-5, atol=1e-5
+    )
     np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.array([0], dtype=np.int32))
     np.testing.assert_allclose(state_1.ipbf.constraint.numpy(), np.zeros(1, dtype=np.float32), rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(state_1.ipbf.constraint_gradient.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        state_1.ipbf.constraint_gradient.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6
+    )
     np.testing.assert_allclose(state_1.ipbf.force.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.hessian.numpy()[0], expected_hessian, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(state_1.ipbf.delta_q.numpy(), np.zeros((1, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
@@ -546,8 +604,32 @@ def test_ipbf_multi_particle_shell_step_builds_neighbor_search(test, device):
     np.testing.assert_allclose(density[0], density[1], rtol=1e-5, atol=1e-5)
     test.assertGreater(float(density[0]), 0.0)
     np.testing.assert_allclose(state_0.ipbf.constraint.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(state_0.ipbf.constraint_gradient.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        state_0.ipbf.constraint_gradient.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6
+    )
     np.testing.assert_allclose(state_0.ipbf.force.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+
+
+def test_ipbf_boundary_model_contributes_density_and_gradient(test, device):
+    state_without_boundary, solver_without_boundary = run_boundary_density_step(device, use_boundary_model=False)
+    state_with_boundary, solver_with_boundary = run_boundary_density_step(device, use_boundary_model=True)
+
+    density_without_boundary = state_without_boundary.ipbf.density.numpy()
+    density_with_boundary = state_with_boundary.ipbf.density.numpy()
+    gradient_without_boundary = state_without_boundary.ipbf.constraint_gradient.numpy()
+    gradient_with_boundary = state_with_boundary.ipbf.constraint_gradient.numpy()
+    boundary_density = solver_with_boundary._boundary_density.numpy()
+    boundary_neighbor_count = solver_with_boundary._boundary_neighbor_count.numpy()
+
+    test.assertIsNone(solver_without_boundary.boundary_model)
+    test.assertIsNotNone(solver_with_boundary.boundary_model)
+    test.assertTrue(np.all(boundary_density > 0.0))
+    test.assertTrue(np.all(boundary_neighbor_count > 0))
+    test.assertTrue(np.all(density_with_boundary > density_without_boundary))
+    test.assertTrue(np.all(np.linalg.norm(gradient_with_boundary - gradient_without_boundary, axis=1) > 0.0))
+    test.assertTrue(
+        np.all(state_with_boundary.ipbf.neighbor_count.numpy() > state_without_boundary.ipbf.neighbor_count.numpy())
+    )
 
 
 def test_ipbf_computes_constraint_and_gradient(test, device):
@@ -601,11 +683,14 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         1.0, support_radius, distance
     )
     expected_constraint = expected_density / rest_density - 1.0
-    expected_gradient_0 = kernel_gradient_contribution(
-        1.0,
-        support_radius,
-        np.array([-distance, 0.0, 0.0], dtype=np.float32),
-    ) / rest_density
+    expected_gradient_0 = (
+        kernel_gradient_contribution(
+            1.0,
+            support_radius,
+            np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        )
+        / rest_density
+    )
     expected_gradient_1 = -expected_gradient_0
     expected_constraint_hessian_0 = expected_constraint_hessian(
         [1.0, 1.0],
@@ -625,16 +710,22 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         ],
         rest_density,
     )
-    expected_neighbor_gradient_0 = kernel_gradient_contribution(
-        1.0,
-        support_radius,
-        np.array([distance, 0.0, 0.0], dtype=np.float32),
-    ) / rest_density
-    expected_neighbor_gradient_1 = kernel_gradient_contribution(
-        1.0,
-        support_radius,
-        np.array([-distance, 0.0, 0.0], dtype=np.float32),
-    ) / rest_density
+    expected_neighbor_gradient_0 = (
+        kernel_gradient_contribution(
+            1.0,
+            support_radius,
+            np.array([distance, 0.0, 0.0], dtype=np.float32),
+        )
+        / rest_density
+    )
+    expected_neighbor_gradient_1 = (
+        kernel_gradient_contribution(
+            1.0,
+            support_radius,
+            np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        )
+        / rest_density
+    )
     expected_neighbor_constraint_hessian_0 = expected_neighbor_constraint_hessian(
         1.0,
         support_radius,
@@ -688,7 +779,9 @@ def test_ipbf_computes_constraint_and_gradient(test, device):
         neighbor_constraint_hessians=[expected_neighbor_constraint_hessian_1],
     )
 
-    np.testing.assert_allclose(density, np.array([expected_density, expected_density], dtype=np.float32), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        density, np.array([expected_density, expected_density], dtype=np.float32), rtol=1e-5, atol=1e-5
+    )
     np.testing.assert_allclose(
         constraint,
         np.array([expected_constraint, expected_constraint], dtype=np.float32),
@@ -724,11 +817,14 @@ def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
         1.0, support_radius, distance
     )
     expected_constraint = expected_density / rest_density - 1.0
-    expected_gradient_0 = kernel_gradient_contribution(
-        1.0,
-        support_radius,
-        np.array([-distance, 0.0, 0.0], dtype=np.float32),
-    ) / rest_density
+    expected_gradient_0 = (
+        kernel_gradient_contribution(
+            1.0,
+            support_radius,
+            np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        )
+        / rest_density
+    )
     expected_gradient_1 = -expected_gradient_0
     expected_constraint_hessian_0 = expected_constraint_hessian(
         [1.0, 1.0],
@@ -748,16 +844,22 @@ def test_ipbf_single_iteration_applies_relaxed_jacobi_update(test, device):
         ],
         rest_density,
     )
-    expected_neighbor_gradient_0 = kernel_gradient_contribution(
-        1.0,
-        support_radius,
-        np.array([distance, 0.0, 0.0], dtype=np.float32),
-    ) / rest_density
-    expected_neighbor_gradient_1 = kernel_gradient_contribution(
-        1.0,
-        support_radius,
-        np.array([-distance, 0.0, 0.0], dtype=np.float32),
-    ) / rest_density
+    expected_neighbor_gradient_0 = (
+        kernel_gradient_contribution(
+            1.0,
+            support_radius,
+            np.array([distance, 0.0, 0.0], dtype=np.float32),
+        )
+        / rest_density
+    )
+    expected_neighbor_gradient_1 = (
+        kernel_gradient_contribution(
+            1.0,
+            support_radius,
+            np.array([-distance, 0.0, 0.0], dtype=np.float32),
+        )
+        / rest_density
+    )
     expected_neighbor_constraint_hessian_0 = expected_neighbor_constraint_hessian(
         1.0,
         support_radius,
@@ -944,7 +1046,9 @@ def test_ipbf_reset_restores_initial_particle_state(test, device):
     np.testing.assert_allclose(state_1.ipbf.density.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_array_equal(state_1.ipbf.neighbor_count.numpy(), np.zeros(2, dtype=np.int32))
     np.testing.assert_allclose(state_1.ipbf.constraint.numpy(), np.zeros(2, dtype=np.float32), rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(state_1.ipbf.constraint_gradient.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        state_1.ipbf.constraint_gradient.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6
+    )
     np.testing.assert_allclose(state_1.ipbf.force.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(state_1.ipbf.delta_q.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
 

@@ -417,8 +417,11 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    :toctree: _generated
    :nosignatures:
 
+   BoundarySampleFlags
+   FSIBoundaryModel
    SolverBase
    SolverFeatherstone
+   SolverIPBF
    SolverImplicitMPM
    SolverKamino
    SolverMuJoCo
