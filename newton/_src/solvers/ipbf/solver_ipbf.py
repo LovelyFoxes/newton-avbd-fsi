@@ -35,6 +35,7 @@ from ...sim import (
 from ..solver import SolverBase
 from .ipbf_kernels import (
     accumulate_particle_shape_boundary_velocity_projection,
+    accumulate_particle_shape_boundary_velocity_projection_with_reaction,
     apply_artificial_damping,
     apply_relaxed_jacobi_update,
     apply_viscosity_velocity_diffusion,
@@ -490,7 +491,7 @@ class SolverIPBF(SolverBase):
 
         particle_q.assign(state.particle_q)
 
-    def _apply_shape_boundary_velocity_projection(self, state: State, contacts: Contacts | None) -> None:
+    def _apply_shape_boundary_velocity_projection(self, state: State, contacts: Contacts | None, dt: float) -> None:
         """Project final particle velocities against active particle-shape contacts."""
         if not self._has_shape_boundary_contacts(contacts):
             return
@@ -511,25 +512,66 @@ class SolverIPBF(SolverBase):
             device=model.device,
         )
 
-        wp.launch(
-            accumulate_particle_shape_boundary_velocity_projection,
-            dim=contacts.soft_contact_max,
-            inputs=[
-                state.particle_qd,
-                model.particle_flags,
-                contacts.soft_contact_count,
-                contacts.soft_contact_particle,
-                contacts.soft_contact_body_vel,
-                contacts.soft_contact_normal,
-                contacts.soft_contact_max,
-                self.boundary_velocity_damping,
-            ],
-            outputs=[
-                self._boundary_projected_particle_qd,
-                self._boundary_projected_contact_count,
-            ],
-            device=model.device,
+        boundary_model = self.boundary_model
+        has_reaction_target = (
+            boundary_model is not None
+            and model.body_count > 0
+            and state.body_q is not None
+            and model.body_com is not None
+            and getattr(boundary_model, "shape_sample_count", None) is not None
         )
+
+        if has_reaction_target:
+            wp.launch(
+                accumulate_particle_shape_boundary_velocity_projection_with_reaction,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    state.particle_qd,
+                    model.particle_mass,
+                    model.particle_flags,
+                    state.body_q,
+                    model.body_com,
+                    model.shape_body,
+                    boundary_model.shape_sample_count,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_particle,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_body_vel,
+                    contacts.soft_contact_normal,
+                    contacts.soft_contact_max,
+                    self.boundary_velocity_damping,
+                    dt,
+                    self.fsi_reaction_relaxation,
+                ],
+                outputs=[
+                    self._boundary_projected_particle_qd,
+                    self._boundary_projected_contact_count,
+                    boundary_model.body_force,
+                    boundary_model.body_torque,
+                ],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                accumulate_particle_shape_boundary_velocity_projection,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    state.particle_qd,
+                    model.particle_flags,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_particle,
+                    contacts.soft_contact_body_vel,
+                    contacts.soft_contact_normal,
+                    contacts.soft_contact_max,
+                    self.boundary_velocity_damping,
+                ],
+                outputs=[
+                    self._boundary_projected_particle_qd,
+                    self._boundary_projected_contact_count,
+                ],
+                device=model.device,
+            )
 
         wp.launch(
             finalize_particle_shape_boundary_velocity_projection,
@@ -1116,6 +1158,6 @@ class SolverIPBF(SolverBase):
                 device=model.device,
             )
 
-        self._apply_shape_boundary_velocity_projection(state_out, contacts)
+        self._apply_shape_boundary_velocity_projection(state_out, contacts, dt)
         self._apply_viscosity_velocity_diffusion(state_out, dt)
         self._apply_xsph_velocity_smoothing(state_out)

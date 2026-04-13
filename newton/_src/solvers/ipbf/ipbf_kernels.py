@@ -1066,6 +1066,75 @@ def accumulate_particle_shape_boundary_velocity_projection(
 
 
 @wp.kernel
+def accumulate_particle_shape_boundary_velocity_projection_with_reaction(
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    shape_body: wp.array(dtype=int),
+    boundary_shape_sample_count: wp.array(dtype=wp.int32),
+    contact_count: wp.array(dtype=int),
+    contact_particle: wp.array(dtype=int),
+    contact_shape: wp.array(dtype=int),
+    contact_body_pos: wp.array(dtype=wp.vec3),
+    contact_body_vel: wp.array(dtype=wp.vec3),
+    contact_normal: wp.array(dtype=wp.vec3),
+    contact_max: int,
+    tangential_damping: float,
+    dt: float,
+    reaction_relaxation: float,
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+    body_force: wp.array(dtype=wp.vec3),
+    body_torque: wp.array(dtype=wp.vec3),
+):
+    """Project boundary velocities and accumulate equal-opposite contact reaction."""
+    tid = wp.tid()
+
+    count = min(contact_max, contact_count[0])
+    if tid >= count:
+        return
+
+    particle_index = contact_particle[tid]
+    shape_index = contact_shape[tid]
+    if particle_index < 0 or shape_index < 0:
+        return
+
+    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    n = contact_normal[tid]
+    body_v = contact_body_vel[tid]
+    old_v = particle_qd[particle_index]
+    rel_v = old_v - body_v
+    rel_v_n = wp.dot(rel_v, n)
+    rel_v_t = rel_v - rel_v_n * n
+    rel_v_projected = wp.max(rel_v_n, 0.0) * n + tangential_damping * rel_v_t
+    projected_v = body_v + rel_v_projected
+
+    wp.atomic_add(projected_particle_qd, particle_index, projected_v)
+    wp.atomic_add(projected_contact_count, particle_index, 1)
+
+    body_index = shape_body[shape_index]
+    if body_index < 0 or dt <= 0.0 or reaction_relaxation == 0.0 or boundary_shape_sample_count[shape_index] <= 0:
+        return
+
+    delta_v = projected_v - old_v
+    if wp.dot(delta_v, delta_v) == 0.0:
+        return
+
+    body_reaction = -reaction_relaxation * particle_mass[particle_index] * delta_v / dt
+    X_wb = body_q[body_index]
+    bx = wp.transform_point(X_wb, contact_body_pos[tid])
+    com_world = wp.transform_point(X_wb, body_com[body_index])
+    torque = wp.cross(bx - com_world, body_reaction)
+
+    wp.atomic_add(body_force, body_index, body_reaction)
+    wp.atomic_add(body_torque, body_index, torque)
+
+
+@wp.kernel
 def finalize_particle_shape_boundary_velocity_projection(
     particle_qd: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
