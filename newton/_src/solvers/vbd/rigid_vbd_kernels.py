@@ -2173,6 +2173,23 @@ def solve_rigid_body(
 
 
 @wp.kernel
+def add_fsi_wrenches_to_body_accumulators(
+    body_ids_in_color: wp.array(dtype=wp.int32),
+    fsi_body_force: wp.array(dtype=wp.vec3),
+    fsi_body_torque: wp.array(dtype=wp.vec3),
+    force_relaxation: float,
+    body_forces: wp.array(dtype=wp.vec3),
+    body_torques: wp.array(dtype=wp.vec3),
+):
+    """Add fluid-solid interface body wrenches to VBD rigid accumulators."""
+    tid = wp.tid()
+    body_index = body_ids_in_color[tid]
+
+    body_forces[body_index] = body_forces[body_index] + force_relaxation * fsi_body_force[body_index]
+    body_torques[body_index] = body_torques[body_index] + force_relaxation * fsi_body_torque[body_index]
+
+
+@wp.kernel
 def copy_rigid_body_transforms_back(
     body_ids_in_color: wp.array(dtype=wp.int32),
     body_q_in: wp.array(dtype=wp.transform),

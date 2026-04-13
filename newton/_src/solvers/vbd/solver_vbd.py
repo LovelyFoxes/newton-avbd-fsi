@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import warp as wp
@@ -65,9 +65,10 @@ from .rigid_vbd_kernels import (
     # Adjacency building kernels
     _count_num_adjacent_joints,
     _fill_adjacent_joints,
-    # Iteration kernels
     accumulate_body_body_contacts_per_body,  # Body-body (rigid-rigid) contacts (Gauss-Seidel mode)
     accumulate_body_particle_contacts_per_body,  # Body-particle soft contacts (two-way coupling)
+    # Iteration kernels
+    add_fsi_wrenches_to_body_accumulators,
     build_body_body_contact_lists,  # Body-body (rigid-rigid) contact adjacency
     build_body_particle_contact_lists,  # Body-particle (rigid-particle) soft-contact adjacency
     compute_cable_dahl_parameters,  # Cable bending plasticity
@@ -90,6 +91,9 @@ from .tri_mesh_collision import (
     TriMeshCollisionDetector,
     TriMeshCollisionInfo,
 )
+
+if TYPE_CHECKING:
+    from ..fsi import FSIBoundaryModel
 
 # Export accumulate_contact_force_and_hessian for legacy collision_legacy.py compatibility
 __all__ = ["SolverVBD"]
@@ -188,6 +192,8 @@ class SolverVBD(SolverBase):
         rigid_body_contact_buffer_size: int = 64,
         rigid_body_particle_contact_buffer_size: int = 256,
         rigid_enable_dahl_friction: bool = False,  # Cable bending plasticity/hysteresis
+        fsi_boundary_model: FSIBoundaryModel | None = None,
+        fsi_force_relaxation: float = 1.0,
     ):
         """
         Args:
@@ -258,6 +264,9 @@ class SolverVBD(SolverBase):
             rigid_enable_dahl_friction: Enable Dahl hysteresis friction model for cable bending (default: False).
                 Configure per-joint Dahl parameters via the solver-registered custom model attributes
                 ``model.vbd.dahl_eps_max`` and ``model.vbd.dahl_tau``.
+            fsi_boundary_model: Optional FSI boundary sample model whose body_force [N] and body_torque [N*m]
+                buffers are injected into AVBD rigid body iterations.
+            fsi_force_relaxation: Unitless multiplier applied to injected FSI body forces [N] and torques [N*m].
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -281,6 +290,9 @@ class SolverVBD(SolverBase):
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
+        self.fsi_boundary_model = None
+        self.fsi_force_relaxation = float(fsi_force_relaxation)
+        self.set_fsi_boundary_model(fsi_boundary_model)
 
         # Initialize particle system
         self._init_particle_system(
@@ -328,6 +340,27 @@ class SolverVBD(SolverBase):
 
         # Cached empty arrays for kernels that require wp.array arguments even when counts are zero.
         self._empty_body_q = wp.empty(0, dtype=wp.transform, device=self.device)
+
+    def set_fsi_boundary_model(self, fsi_boundary_model: FSIBoundaryModel | None) -> None:
+        """Set the optional FSI boundary model used as a rigid body force source.
+
+        Args:
+            fsi_boundary_model: Boundary model whose body force [N] and body
+                torque [N*m] buffers are injected into AVBD rigid iterations,
+                or ``None`` to disable FSI wrench injection.
+        """
+        if fsi_boundary_model is not None:
+            if getattr(fsi_boundary_model, "model", self.model) is not self.model:
+                raise ValueError("SolverVBD FSI boundary model must be built from this solver's model.")
+            if getattr(fsi_boundary_model, "device", self.device) != self.device:
+                raise ValueError("SolverVBD FSI boundary model device must match the solver model device.")
+            if (
+                getattr(fsi_boundary_model, "body_force", None) is None
+                or getattr(fsi_boundary_model, "body_torque", None) is None
+            ):
+                raise ValueError("SolverVBD FSI boundary model must provide body_force and body_torque buffers.")
+
+        self.fsi_boundary_model = fsi_boundary_model
 
     def _init_particle_system(
         self,
@@ -1819,6 +1852,23 @@ class SolverVBD(SolverBase):
                         self.body_hessian_ll,
                         self.body_hessian_al,
                         self.body_hessian_aa,
+                    ],
+                    device=self.device,
+                )
+
+            if self.fsi_boundary_model is not None and self.fsi_force_relaxation != 0.0:
+                wp.launch(
+                    kernel=add_fsi_wrenches_to_body_accumulators,
+                    dim=color_group.size,
+                    inputs=[
+                        color_group,
+                        self.fsi_boundary_model.body_force,
+                        self.fsi_boundary_model.body_torque,
+                        self.fsi_force_relaxation,
+                    ],
+                    outputs=[
+                        self.body_forces,
+                        self.body_torques,
                     ],
                     device=self.device,
                 )

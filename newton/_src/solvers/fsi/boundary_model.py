@@ -91,8 +91,13 @@ class FSIBoundaryModel:
         )
 
         self.sample_count = len(sample_body)
+        shape_sample_count = [0 for _ in range(model.shape_count)]
+        for shape in sample_shape:
+            shape_sample_count[shape] += 1
+
         self.sample_body = wp.array(sample_body, dtype=wp.int32, device=self.device)
         self.sample_shape = wp.array(sample_shape, dtype=wp.int32, device=self.device)
+        self.shape_sample_count = wp.array(shape_sample_count, dtype=wp.int32, device=self.device)
         self.sample_flags = wp.array(
             [
                 int(BoundarySampleFlags.ACTIVE)
@@ -116,7 +121,7 @@ class FSIBoundaryModel:
         self.body_force = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
         self.body_torque = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
 
-        self.boundary_grid = wp.HashGrid(128, 128, 128) if self.sample_count > 0 else None
+        self.boundary_grid = wp.HashGrid(128, 128, 128, device=self.device) if self.sample_count > 0 else None
 
         self._empty_body_q = wp.zeros(0, dtype=wp.transform, device=self.device)
         self._empty_body_qd = wp.zeros(0, dtype=wp.spatial_vector, device=self.device)

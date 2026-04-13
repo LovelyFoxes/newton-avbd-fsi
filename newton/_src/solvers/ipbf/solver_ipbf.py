@@ -58,6 +58,7 @@ from .ipbf_kernels import (
     initialize_particle_shape_boundary_velocity_projection,
     predict_inertial_positions,
     project_particle_shape_contacts,
+    project_particle_shape_contacts_with_reaction,
     solve_local_system,
     update_velocity_from_positions,
 )
@@ -111,6 +112,9 @@ class SolverIPBF(SolverBase):
                 the position solve.
             boundary_velocity_damping: Tangential damping multiplier applied to
                 particle velocities at final particle-shape contacts.
+            fsi_reaction_relaxation: Unitless multiplier applied when converting
+                particle-shape projection corrections into FSI body reaction
+                forces and torques.
         """
 
         class KernelFamily(IntEnum):
@@ -132,6 +136,7 @@ class SolverIPBF(SolverBase):
         viscosity_coefficient: float = 0.0
         xsph_coefficient: float = 0.0
         boundary_velocity_damping: float = 1.0
+        fsi_reaction_relaxation: float = 1.0
 
     @override
     @classmethod
@@ -306,6 +311,7 @@ class SolverIPBF(SolverBase):
         self.viscosity_coefficient = float(self.config.viscosity_coefficient)
         self.xsph_coefficient = float(self.config.xsph_coefficient)
         self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
+        self.fsi_reaction_relaxation = float(self.config.fsi_reaction_relaxation)
         self.boundary_model = None
         self.set_boundary_model(boundary_model)
 
@@ -328,6 +334,10 @@ class SolverIPBF(SolverBase):
             self._xsph_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_density = wp.zeros(model.particle_count, dtype=float)
             self._boundary_neighbor_count = wp.zeros(model.particle_count, dtype=wp.int32)
+            self._boundary_projection_x_before = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._boundary_projection_x_after = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._boundary_projection_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._boundary_projection_delta_total = wp.zeros(model.particle_count, dtype=wp.vec3)
 
         if model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
@@ -382,6 +392,12 @@ class SolverIPBF(SolverBase):
         state_out.ipbf.constraint_gradient.zero_()
         state_out.ipbf.force.zero_()
         state_out.ipbf.delta_q.zero_()
+        self._boundary_density.zero_()
+        self._boundary_neighbor_count.zero_()
+        self._boundary_projection_x_before.zero_()
+        self._boundary_projection_x_after.zero_()
+        self._boundary_projection_delta.zero_()
+        self._boundary_projection_delta_total.zero_()
 
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
             with wp.ScopedDevice(self.model.device):
@@ -396,6 +412,7 @@ class SolverIPBF(SolverBase):
         state: State,
         particle_q: wp.array(dtype=wp.vec3),
         contacts: Contacts | None,
+        dt: float,
     ) -> None:
         """Project the given particle positions out of shape contacts."""
         if not self._has_shape_boundary_contacts(contacts):
@@ -405,25 +422,71 @@ class SolverIPBF(SolverBase):
         state.particle_q.assign(particle_q)
         model.collide(state, contacts)
 
-        wp.launch(
-            project_particle_shape_contacts,
-            dim=contacts.soft_contact_max,
-            inputs=[
-                state.particle_q,
-                model.particle_radius,
-                model.particle_flags,
-                state.body_q if state.body_q is not None else self._empty_body_q,
-                model.shape_body,
-                contacts.soft_contact_count,
-                contacts.soft_contact_particle,
-                contacts.soft_contact_shape,
-                contacts.soft_contact_body_pos,
-                contacts.soft_contact_normal,
-                contacts.soft_contact_max,
-                1.0,
-            ],
-            device=model.device,
+        boundary_model = self.boundary_model
+        has_reaction_target = (
+            boundary_model is not None
+            and model.body_count > 0
+            and state.body_q is not None
+            and model.body_com is not None
+            and getattr(boundary_model, "shape_sample_count", None) is not None
         )
+
+        if has_reaction_target:
+            self._boundary_projection_x_before.assign(state.particle_q)
+            self._boundary_projection_delta.zero_()
+
+            wp.launch(
+                project_particle_shape_contacts_with_reaction,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    state.particle_q,
+                    model.particle_mass,
+                    model.particle_radius,
+                    model.particle_flags,
+                    state.body_q,
+                    model.body_com,
+                    model.shape_body,
+                    boundary_model.shape_sample_count,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_particle,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_normal,
+                    contacts.soft_contact_max,
+                    1.0,
+                    dt,
+                    self.fsi_reaction_relaxation,
+                ],
+                outputs=[
+                    self._boundary_projection_delta,
+                    self._boundary_projection_delta_total,
+                    boundary_model.body_force,
+                    boundary_model.body_torque,
+                ],
+                device=model.device,
+            )
+
+            self._boundary_projection_x_after.assign(state.particle_q)
+        else:
+            wp.launch(
+                project_particle_shape_contacts,
+                dim=contacts.soft_contact_max,
+                inputs=[
+                    state.particle_q,
+                    model.particle_radius,
+                    model.particle_flags,
+                    state.body_q if state.body_q is not None else self._empty_body_q,
+                    model.shape_body,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_particle,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_normal,
+                    contacts.soft_contact_max,
+                    1.0,
+                ],
+                device=model.device,
+            )
 
         particle_q.assign(state.particle_q)
 
@@ -899,6 +962,10 @@ class SolverIPBF(SolverBase):
         if model.particle_count == 0:
             return
 
+        if self.boundary_model is not None:
+            self.boundary_model.clear_forces()
+            self._boundary_projection_delta_total.zero_()
+
         state_out.particle_q.assign(state_in.particle_q)
         state_out.particle_qd.assign(state_in.particle_qd)
         if model.body_count and state_in.body_q is not None and state_out.body_q is not None:
@@ -932,7 +999,7 @@ class SolverIPBF(SolverBase):
         state_out.ipbf.x_star.assign(state_out.ipbf.y)
 
         if self.iterations <= 0:
-            self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_guess, contacts)
+            self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_guess, contacts, dt)
             state_out.ipbf.x_new.assign(state_out.ipbf.x_guess)
             state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
             self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
@@ -975,7 +1042,7 @@ class SolverIPBF(SolverBase):
                         outputs=[state_out.ipbf.x_star],
                         device=model.device,
                     )
-                    self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_star, contacts)
+                    self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_star, contacts, dt)
 
                     self._compute_iteration_fields(
                         state_out,
@@ -1011,7 +1078,7 @@ class SolverIPBF(SolverBase):
                     outputs=[state_out.ipbf.x_new],
                     device=model.device,
                 )
-                self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_new, contacts)
+                self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_new, contacts, dt)
 
                 state_out.ipbf.x_guess.assign(state_out.ipbf.x_new)
 
