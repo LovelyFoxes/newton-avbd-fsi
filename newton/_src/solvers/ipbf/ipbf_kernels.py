@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """IPBF solver kernels."""
 
 from __future__ import annotations
@@ -147,9 +162,8 @@ def kernel_hessian_poly6(displacement: wp.vec3, support_radius: float) -> wp.mat
     x = h2 - dist2
     identity = wp.identity(n=3, dtype=float)
 
-    return (
-        -945.0 / (32.0 * wp.pi * h9) * x * x * identity
-        + 945.0 / (8.0 * wp.pi * h9) * x * wp.outer(displacement, displacement)
+    return -945.0 / (32.0 * wp.pi * h9) * x * x * identity + 945.0 / (8.0 * wp.pi * h9) * x * wp.outer(
+        displacement, displacement
     )
 
 
@@ -443,7 +457,10 @@ def compute_force(
 
             displacement = x_guess[index] - xi
             pressure_force += (
-                cj * particle_mass[tid] * inv_rest_density * kernel_gradient(displacement, support_radius, kernel_family)
+                cj
+                * particle_mass[tid]
+                * inv_rest_density
+                * kernel_gradient(displacement, support_radius, kernel_family)
             )
 
     force[tid] = inertial_force + pressure_force
@@ -541,9 +558,7 @@ def compute_hessian(
             h += wp.outer(neighbor_gradient, neighbor_gradient)
             if constraint[index] != 0.0:
                 neighbor_constraint_hessian = (
-                    particle_mass[tid]
-                    * inv_rest_density
-                    * kernel_hessian(-displacement, support_radius, kernel_family)
+                    particle_mass[tid] * inv_rest_density * kernel_hessian(-displacement, support_radius, kernel_family)
                 )
                 h += wp.abs(constraint[index]) * diagonal_from_column_norms(neighbor_constraint_hessian)
 

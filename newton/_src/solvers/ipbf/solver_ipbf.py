@@ -1,4 +1,19 @@
-﻿"""Implicit Position-Based Fluids solver."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Implicit Position-Based Fluids solver."""
 
 from __future__ import annotations
 
@@ -32,10 +47,10 @@ from .ipbf_kernels import (
     compute_hessian,
     compute_hessian_without_grid,
     finalize_particle_shape_boundary_velocity_projection,
-    initialize_particle_shape_boundary_velocity_projection,
-    initialize_guess_positions,
     initialize_constraint_and_gradient,
     initialize_density_and_neighbor_count,
+    initialize_guess_positions,
+    initialize_particle_shape_boundary_velocity_projection,
     predict_inertial_positions,
     project_particle_shape_contacts,
     solve_local_system,
@@ -315,8 +330,7 @@ class SolverIPBF(SolverBase):
 
         if not hasattr(state_out, "ipbf"):
             raise ValueError(
-                "State is missing IPBF attributes. "
-                "Rebuild the model with SolverIPBF.register_custom_attributes()."
+                "State is missing IPBF attributes. Rebuild the model with SolverIPBF.register_custom_attributes()."
             )
 
         state_out.assign(self._initial_state)
@@ -734,7 +748,9 @@ class SolverIPBF(SolverBase):
             raise ValueError("SolverIPBF requires particle forces and writable output particle state.")
 
         if not hasattr(state_out, "ipbf"):
-            raise ValueError("State is missing IPBF attributes. Rebuild the model with SolverIPBF.register_custom_attributes().")
+            raise ValueError(
+                "State is missing IPBF attributes. Rebuild the model with SolverIPBF.register_custom_attributes()."
+            )
 
         model = self.model
         if model.particle_count == 0:

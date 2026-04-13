@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 ###########################################################################
 # Example IPBF Box Moving Wall
 #
@@ -12,7 +27,6 @@
 
 from __future__ import annotations
 
-import argparse
 import math
 
 import numpy as np
@@ -253,7 +267,9 @@ class Example:
 
     def _moving_wall_state(self, time_s: float) -> tuple[float, float]:
         omega = 2.0 * math.pi * self.wall_frequency
-        center_x = self.container_half_width + self.wall_thickness - 0.5 * self.wall_travel * (1.0 - math.cos(omega * time_s))
+        center_x = (
+            self.container_half_width + self.wall_thickness - 0.5 * self.wall_travel * (1.0 - math.cos(omega * time_s))
+        )
         velocity_x = -0.5 * self.wall_travel * omega * math.sin(omega * time_s)
         return center_x, velocity_x
 
