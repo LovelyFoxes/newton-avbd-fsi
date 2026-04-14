@@ -52,10 +52,13 @@ def test_dynamic_box_samples_follow_body(test: unittest.TestCase, device):
     x_world = boundary.sample_x_world.numpy()
     n_local = boundary.sample_normal_local.numpy()
     n_world = boundary.sample_normal_world.numpy()
+    sample_volume = boundary.sample_volume.numpy()
     flags = boundary.sample_flags.numpy()
 
     np.testing.assert_allclose(x_world, x_local, atol=1.0e-6)
     np.testing.assert_allclose(n_world, n_local, atol=1.0e-6)
+    test.assertTrue(np.all(np.isfinite(sample_volume)))
+    test.assertTrue(np.all(sample_volume > 0.0))
     test.assertTrue(np.all((flags & int(BoundarySampleFlags.DYNAMIC)) != 0))
 
     extents = np.max(np.abs(x_local), axis=0)
@@ -112,9 +115,12 @@ def test_static_box_samples_do_not_require_bodies(test: unittest.TestCase, devic
     flags = boundary.sample_flags.numpy()
     velocities = boundary.sample_v_world.numpy()
     x_world = boundary.sample_x_world.numpy()
+    sample_volume = boundary.sample_volume.numpy()
 
     test.assertGreater(boundary.sample_count, 0)
     test.assertTrue(np.all((flags & int(BoundarySampleFlags.STATIC)) != 0))
+    test.assertTrue(np.all(np.isfinite(sample_volume)))
+    test.assertTrue(np.all(sample_volume > 0.0))
     np.testing.assert_allclose(velocities, np.zeros_like(velocities), atol=1.0e-6)
     np.testing.assert_allclose(np.mean(x_world, axis=0), [1.0, 2.0, 3.0], atol=1.0e-6)
 

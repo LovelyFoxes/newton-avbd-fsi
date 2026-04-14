@@ -54,6 +54,9 @@ class FSIBoundaryModel:
         spacing: Boundary sample spacing [m].
         support_radius: Neighbor query support radius [m]. Defaults to
             ``spacing`` until IPBF density kernels are wired in.
+        kernel_family: SPH kernel used to calibrate Akinci-style sample
+            volumes. Defaults to cubic spline and should usually match the
+            fluid solver kernel family.
         shape_indices: Optional subset of shape indices to sample.
         include_static: Whether static shapes with ``shape_body == -1`` are sampled.
         include_dynamic: Whether body-attached shapes are sampled.
@@ -63,12 +66,19 @@ class FSIBoundaryModel:
         Boundary sample model.
     """
 
+    class KernelFamily(IntEnum):
+        """Selectable SPH kernels used for boundary-volume calibration."""
+
+        CUBIC_SPLINE = 0
+        POLY6 = 1
+
     def __init__(
         self,
         model: Model,
         spacing: float,
         *,
         support_radius: float | None = None,
+        kernel_family: KernelFamily = KernelFamily.CUBIC_SPLINE,
         shape_indices: Sequence[int] | None = None,
         include_static: bool = True,
         include_dynamic: bool = True,
@@ -80,14 +90,24 @@ class FSIBoundaryModel:
         self.model = model
         self.spacing = float(spacing)
         self.support_radius = float(support_radius) if support_radius is not None else float(spacing)
+        if self.support_radius <= 0.0:
+            raise ValueError("Boundary sample support radius must be positive.")
+
+        self.kernel_family = int(self.KernelFamily(kernel_family))
         self.device = wp.get_device(device if device is not None else model.device)
 
-        sample_body, sample_shape, sample_x_local, sample_normal_local, sample_volume = self._sample_model_boxes(
+        sample_body, sample_shape, sample_x_local, sample_normal_local = self._sample_model_boxes(
             model,
             self.spacing,
             shape_indices=shape_indices,
             include_static=include_static,
             include_dynamic=include_dynamic,
+        )
+        sample_volume = self._calibrate_sample_volumes(
+            sample_body,
+            sample_x_local,
+            self.support_radius,
+            self.kernel_family,
         )
 
         self.sample_count = len(sample_body)
@@ -174,9 +194,9 @@ class FSIBoundaryModel:
         shape_indices: Sequence[int] | None,
         include_static: bool,
         include_dynamic: bool,
-    ) -> tuple[list[int], list[int], list[tuple[float, float, float]], list[tuple[float, float, float]], list[float]]:
+    ) -> tuple[list[int], list[int], list[tuple[float, float, float]], list[tuple[float, float, float]]]:
         if model.shape_count == 0:
-            return [], [], [], [], []
+            return [], [], [], []
 
         shape_type = model.shape_type.numpy()
         shape_body = model.shape_body.numpy()
@@ -192,7 +212,6 @@ class FSIBoundaryModel:
         sample_shape: list[int] = []
         sample_x_local: list[tuple[float, float, float]] = []
         sample_normal_local: list[tuple[float, float, float]] = []
-        sample_volume: list[float] = []
 
         for shape_idx in indices:
             if shape_idx < 0 or shape_idx >= model.shape_count:
@@ -220,9 +239,120 @@ class FSIBoundaryModel:
                 sample_shape.append(int(shape_idx))
                 sample_x_local.append(cls._vec3_to_tuple(point_parent))
                 sample_normal_local.append(cls._vec3_to_tuple(normal_parent))
-                sample_volume.append(spacing * spacing * spacing)
 
-        return sample_body, sample_shape, sample_x_local, sample_normal_local, sample_volume
+        return sample_body, sample_shape, sample_x_local, sample_normal_local
+
+    @classmethod
+    def _calibrate_sample_volumes(
+        cls,
+        sample_body: Sequence[int],
+        sample_x_local: Sequence[tuple[float, float, float]],
+        support_radius: float,
+        kernel_family: int,
+    ) -> list[float]:
+        if len(sample_x_local) == 0:
+            return []
+
+        positions = np.asarray(sample_x_local, dtype=np.float32)
+        volumes = np.zeros(len(sample_x_local), dtype=np.float32)
+        group_indices: dict[tuple[str, int], list[int]] = {}
+
+        for sample_index, body in enumerate(sample_body):
+            # Dynamic samples live in body-local frames, so calibrate them
+            # per body to avoid unrelated local frames overlapping.
+            group_key = ("static", 0) if body < 0 else ("body", int(body))
+            group_indices.setdefault(group_key, []).append(sample_index)
+
+        for group in group_indices.values():
+            group_index_array = np.asarray(group, dtype=np.int32)
+            group_positions = positions[group_index_array]
+            deltas = cls._compute_boundary_volume_deltas(group_positions, support_radius, kernel_family)
+            volumes[group_index_array] = np.where(deltas > 0.0, 1.0 / deltas, 0.0).astype(np.float32)
+
+        return volumes.tolist()
+
+    @classmethod
+    def _compute_boundary_volume_deltas(
+        cls,
+        positions: np.ndarray,
+        support_radius: float,
+        kernel_family: int,
+    ) -> np.ndarray:
+        if len(positions) == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        cell_size = support_radius
+        cell_indices = np.floor(positions / cell_size).astype(np.int32)
+        cells: dict[tuple[int, int, int], list[int]] = {}
+        for sample_index, cell_index in enumerate(cell_indices):
+            cell_key = (int(cell_index[0]), int(cell_index[1]), int(cell_index[2]))
+            cells.setdefault(cell_key, []).append(sample_index)
+
+        offsets = [
+            (dx, dy, dz)
+            for dx in (-1, 0, 1)
+            for dy in (-1, 0, 1)
+            for dz in (-1, 0, 1)
+        ]
+        delta = np.full(len(positions), cls._kernel_value_numpy(0.0, support_radius, kernel_family), dtype=np.float64)
+
+        for sample_index, position in enumerate(positions):
+            base_cell = cell_indices[sample_index]
+            for dx, dy, dz in offsets:
+                cell_key = (int(base_cell[0] + dx), int(base_cell[1] + dy), int(base_cell[2] + dz))
+                candidate_indices = cells.get(cell_key)
+                if candidate_indices is None:
+                    continue
+
+                displacement = positions[candidate_indices] - position
+                dist2 = np.einsum("ij,ij->i", displacement, displacement, dtype=np.float64)
+                neighbor_mask = dist2 > 0.0
+                if not np.any(neighbor_mask):
+                    continue
+
+                delta[sample_index] += np.sum(
+                    cls._kernel_value_numpy(dist2[neighbor_mask], support_radius, kernel_family)
+                )
+
+        return delta.astype(np.float32)
+
+    @classmethod
+    def _kernel_value_numpy(
+        cls,
+        dist2: float | np.ndarray,
+        support_radius: float,
+        kernel_family: int,
+    ) -> float | np.ndarray:
+        if support_radius <= 0.0:
+            if np.ndim(dist2) == 0:
+                return 0.0
+            return np.zeros_like(np.asarray(dist2, dtype=np.float64), dtype=np.float64)
+
+        dist2_array = np.asarray(dist2, dtype=np.float64)
+        values = np.zeros_like(dist2_array, dtype=np.float64)
+
+        if kernel_family == int(cls.KernelFamily.POLY6):
+            support_radius2 = support_radius * support_radius
+            inside = dist2_array < support_radius2
+            x = support_radius2 - dist2_array[inside]
+            values[inside] = 315.0 / (64.0 * np.pi * support_radius**9) * x * x * x
+        else:
+            distances = np.sqrt(dist2_array)
+            inside = distances < support_radius
+            q = 2.0 * distances[inside] / support_radius
+            normalization = 8.0 / (np.pi * support_radius**3)
+            inside_q = q < 1.0
+
+            values_inside = np.empty_like(q)
+            values_inside[inside_q] = normalization * (1.0 - 1.5 * q[inside_q] ** 2 + 0.75 * q[inside_q] ** 3)
+            two_minus_q = 2.0 - q[~inside_q]
+            values_inside[~inside_q] = normalization * 0.25 * two_minus_q * two_minus_q * two_minus_q
+            values[inside] = values_inside
+
+        if values.ndim == 0:
+            return float(values)
+
+        return values
 
     @staticmethod
     def _sample_box_surface(

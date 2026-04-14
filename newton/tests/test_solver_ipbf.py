@@ -342,7 +342,7 @@ def run_single_particle_ground_step(device, *, use_contacts: bool):
     return state_1, contacts
 
 
-def run_boundary_density_step(device, *, use_boundary_model: bool):
+def run_boundary_density_step(device, *, use_boundary_model: bool, boundary_spacing: float = 0.25):
     """Run a zero-iteration IPBF step near a static box boundary."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
@@ -372,7 +372,7 @@ def run_boundary_density_step(device, *, use_boundary_model: bool):
 
     boundary_model = None
     if use_boundary_model:
-        boundary_model = FSIBoundaryModel(model, spacing=0.25, support_radius=0.6, device=device)
+        boundary_model = FSIBoundaryModel(model, spacing=boundary_spacing, support_radius=0.6, device=device)
 
     solver = SolverIPBF(
         model,
@@ -779,6 +779,18 @@ def test_ipbf_boundary_model_contributes_density_and_gradient(test, device):
     test.assertTrue(
         np.all(state_with_boundary.ipbf.neighbor_count.numpy() > state_without_boundary.ipbf.neighbor_count.numpy())
     )
+
+
+def test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing(test, device):
+    _, coarse_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.25)
+    _, fine_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.125)
+
+    coarse_boundary_density = coarse_solver._boundary_density.numpy()
+    fine_boundary_density = fine_solver._boundary_density.numpy()
+
+    test.assertTrue(np.all(coarse_boundary_density > 0.0))
+    test.assertTrue(np.all(fine_boundary_density > 0.0))
+    np.testing.assert_allclose(coarse_boundary_density, fine_boundary_density, rtol=0.15, atol=1.0e-3)
 
 
 def test_ipbf_boundary_pressure_reaction_accumulates_body_wrench(test, device):
