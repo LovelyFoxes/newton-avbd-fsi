@@ -34,6 +34,7 @@ from ...sim import (
 )
 from ..solver import SolverBase
 from .ipbf_kernels import (
+    accumulate_boundary_pressure_reaction,
     accumulate_particle_shape_boundary_velocity_projection,
     accumulate_particle_shape_boundary_velocity_projection_with_reaction,
     apply_artificial_damping,
@@ -116,6 +117,9 @@ class SolverIPBF(SolverBase):
             fsi_reaction_relaxation: Unitless multiplier applied when converting
                 particle-shape projection corrections into FSI body reaction
                 forces and torques.
+            fsi_pressure_reaction_relaxation: Unitless multiplier applied when
+                converting boundary pressure-gradient position increments into
+                FSI body reaction forces and torques.
         """
 
         class KernelFamily(IntEnum):
@@ -138,6 +142,7 @@ class SolverIPBF(SolverBase):
         xsph_coefficient: float = 0.0
         boundary_velocity_damping: float = 1.0
         fsi_reaction_relaxation: float = 1.0
+        fsi_pressure_reaction_relaxation: float = 1.0
 
     @override
     @classmethod
@@ -313,6 +318,7 @@ class SolverIPBF(SolverBase):
         self.xsph_coefficient = float(self.config.xsph_coefficient)
         self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
         self.fsi_reaction_relaxation = float(self.config.fsi_reaction_relaxation)
+        self.fsi_pressure_reaction_relaxation = float(self.config.fsi_pressure_reaction_relaxation)
         self.boundary_model = None
         self.set_boundary_model(boundary_model)
 
@@ -399,6 +405,9 @@ class SolverIPBF(SolverBase):
         self._boundary_projection_x_after.zero_()
         self._boundary_projection_delta.zero_()
         self._boundary_projection_delta_total.zero_()
+
+        if self.boundary_model is not None:
+            self.boundary_model.clear_forces()
 
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
             with wp.ScopedDevice(self.model.device):
@@ -1125,6 +1134,8 @@ class SolverIPBF(SolverBase):
         elif is_last_iteration:
             state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
 
+        self._accumulate_boundary_pressure_reaction(state_out, state_out.ipbf.x_guess, dt)
+
         wp.launch(
             solve_local_system,
             dim=model.particle_count,
@@ -1152,6 +1163,53 @@ class SolverIPBF(SolverBase):
         self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_new, contacts, dt)
 
         state_out.ipbf.x_guess.assign(state_out.ipbf.x_new)
+
+    def _accumulate_boundary_pressure_reaction(
+        self,
+        state: State,
+        particle_q: wp.array(dtype=wp.vec3),
+        dt: float,
+    ) -> None:
+        """Accumulate pressure-gradient FSI reaction from boundary samples."""
+        boundary_model = self.boundary_model
+        if (
+            boundary_model is None
+            or self.fsi_pressure_reaction_relaxation == 0.0
+            or getattr(boundary_model, "sample_count", 0) == 0
+            or getattr(boundary_model, "boundary_grid", None) is None
+        ):
+            return
+
+        model = self.model
+        wp.launch(
+            accumulate_boundary_pressure_reaction,
+            dim=model.particle_count,
+            inputs=[
+                boundary_model.boundary_grid.id,
+                particle_q,
+                model.particle_mass,
+                model.particle_flags,
+                state.ipbf.constraint,
+                state.ipbf.hessian,
+                boundary_model.sample_x_world,
+                boundary_model.sample_body,
+                boundary_model.sample_volume,
+                boundary_model.sample_flags,
+                state.body_q if state.body_q is not None else boundary_model._empty_body_q,
+                model.body_com if model.body_com is not None else boundary_model._empty_body_com,
+                self.smoothing_radius,
+                self.kernel_family,
+                dt,
+                self.relaxation,
+                self.fsi_pressure_reaction_relaxation,
+            ],
+            outputs=[
+                boundary_model.sample_force,
+                boundary_model.body_force,
+                boundary_model.body_torque,
+            ],
+            device=model.device,
+        )
 
     def _finalize_step(
         self,

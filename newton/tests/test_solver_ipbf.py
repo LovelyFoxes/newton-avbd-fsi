@@ -394,6 +394,54 @@ def run_boundary_density_step(device, *, use_boundary_model: bool):
     return state_1, solver
 
 
+def run_dynamic_box_pressure_reaction_step(device, *, reaction_relaxation: float):
+    """Run one IPBF pressure iteration near a sampled dynamic box boundary."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particle(
+        pos=wp.vec3(0.0, 0.16, 0.0),
+        vel=wp.vec3(0.0, 0.0, 0.0),
+        mass=1.0,
+        radius=0.02,
+    )
+    body = builder.add_body(
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        mass=1.0,
+    )
+    builder.add_shape_box(
+        body=body,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        hx=0.2,
+        hy=0.1,
+        hz=0.2,
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(model, spacing=0.2, support_radius=0.4, device=device)
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.4,
+            iterations=1,
+            relaxation=1.0,
+            fsi_reaction_relaxation=0.0,
+            fsi_pressure_reaction_relaxation=reaction_relaxation,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.1)
+
+    return state_0, state_1, solver, boundary_model, body
+
+
 def run_dynamic_box_projection_reaction_step(device):
     """Run a penetrating particle against a sampled dynamic box boundary."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -731,6 +779,30 @@ def test_ipbf_boundary_model_contributes_density_and_gradient(test, device):
     test.assertTrue(
         np.all(state_with_boundary.ipbf.neighbor_count.numpy() > state_without_boundary.ipbf.neighbor_count.numpy())
     )
+
+
+def test_ipbf_boundary_pressure_reaction_accumulates_body_wrench(test, device):
+    state_0, state_1, solver, boundary_model, body = run_dynamic_box_pressure_reaction_step(
+        device, reaction_relaxation=1.0
+    )
+    _, _, _, disabled_boundary_model, disabled_body = run_dynamic_box_pressure_reaction_step(
+        device, reaction_relaxation=0.0
+    )
+
+    body_force = boundary_model.body_force.numpy()[body]
+    sample_force_norm = np.linalg.norm(boundary_model.sample_force.numpy(), axis=1)
+    disabled_body_force = disabled_boundary_model.body_force.numpy()[disabled_body]
+    disabled_sample_force = disabled_boundary_model.sample_force.numpy()
+
+    test.assertGreater(float(state_1.ipbf.constraint.numpy()[0]), 0.0)
+    test.assertGreater(float(solver._boundary_density.numpy()[0]), 0.0)
+    test.assertGreater(float(state_1.particle_q.numpy()[0, 1]), float(state_0.particle_q.numpy()[0, 1]))
+    test.assertGreater(float(np.max(sample_force_norm)), 0.0)
+    test.assertLess(float(body_force[1]), 0.0)
+    test.assertLess(abs(float(body_force[0])), 1.0e-3)
+    test.assertLess(abs(float(body_force[2])), 1.0e-3)
+    np.testing.assert_allclose(disabled_body_force, np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(disabled_sample_force, np.zeros_like(disabled_sample_force), rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_ipbf_computes_constraint_and_gradient(test, device):
@@ -1373,6 +1445,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_static_shape_boundary_projects_particles_out_of_ground",
     test_ipbf_static_shape_boundary_projects_particles_out_of_ground,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_pressure_reaction_accumulates_body_wrench",
+    test_ipbf_boundary_pressure_reaction_accumulates_body_wrench,
     devices=devices,
     check_output=False,
 )

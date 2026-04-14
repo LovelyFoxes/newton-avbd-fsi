@@ -857,6 +857,77 @@ def compute_hessian_without_grid(
 
 
 @wp.kernel
+def accumulate_boundary_pressure_reaction(
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    constraint: wp.array(dtype=float),
+    hessian: wp.array(dtype=wp.mat33),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_body: wp.array(dtype=wp.int32),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    support_radius: float,
+    kernel_family: int,
+    dt: float,
+    solve_relaxation: float,
+    reaction_relaxation: float,
+    sample_force: wp.array(dtype=wp.vec3),
+    body_force: wp.array(dtype=wp.vec3),
+    body_torque: wp.array(dtype=wp.vec3),
+):
+    """Accumulate equal-opposite body reaction from boundary pressure gradients."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+    if dt <= 0.0 or solve_relaxation == 0.0 or reaction_relaxation == 0.0:
+        return
+
+    c = constraint[tid]
+    if c <= 0.0:
+        return
+
+    xi = particle_q[tid]
+    inv_h = wp.inverse(hessian[tid])
+    inv_dt2 = 1.0 / (dt * dt)
+
+    query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+    boundary_index = int(0)
+
+    while wp.hash_grid_query_next(query, boundary_index):
+        if (boundary_flags[boundary_index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+
+        displacement = xi - boundary_x[boundary_index]
+        boundary_grad = boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
+        if wp.dot(boundary_grad, boundary_grad) == 0.0:
+            continue
+
+        pressure_rhs = -c * boundary_grad
+        pressure_delta = solve_relaxation * (inv_h * pressure_rhs)
+        if wp.dot(pressure_delta, pressure_delta) == 0.0:
+            continue
+
+        force_on_boundary = -reaction_relaxation * particle_mass[tid] * pressure_delta * inv_dt2
+        wp.atomic_add(sample_force, boundary_index, force_on_boundary)
+
+        body_index = boundary_body[boundary_index]
+        if body_index < 0:
+            continue
+
+        X_wb = body_q[body_index]
+        com_world = wp.transform_point(X_wb, body_com[body_index])
+        torque = wp.cross(boundary_x[boundary_index] - com_world, force_on_boundary)
+
+        wp.atomic_add(body_force, body_index, force_on_boundary)
+        wp.atomic_add(body_torque, body_index, torque)
+
+
+@wp.kernel
 def solve_local_system(
     particle_flags: wp.array(dtype=wp.int32),
     force: wp.array(dtype=wp.vec3),
