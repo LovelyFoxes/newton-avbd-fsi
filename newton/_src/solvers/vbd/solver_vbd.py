@@ -367,6 +367,67 @@ class SolverVBD(SolverBase):
 
         self.fsi_boundary_model = fsi_boundary_model
 
+    def reset(self, state: State | None = None) -> None:
+        """Reset VBD-owned warm-start history.
+
+        Args:
+            state: State whose body poses [m] should become the rigid history.
+                If ``None``, the model's initial body poses are used.
+        """
+        if self.model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+            body_q = self.model.body_q if state is None else state.body_q
+            if body_q is None:
+                raise ValueError("SolverVBD.reset() requires body poses when the model has bodies.")
+
+            if hasattr(self, "body_q_prev"):
+                self.body_q_prev.assign(body_q)
+            if hasattr(self, "body_inertia_q"):
+                self.body_inertia_q.assign(body_q)
+
+            for name in (
+                "body_forces",
+                "body_torques",
+                "body_hessian_aa",
+                "body_hessian_al",
+                "body_hessian_ll",
+                "body_body_contact_counts",
+                "body_body_contact_indices",
+                "body_particle_contact_counts",
+                "body_particle_contact_indices",
+                "joint_sigma_prev",
+                "joint_kappa_prev",
+                "joint_dkappa_prev",
+                "joint_sigma_start",
+                "joint_C_fric",
+            ):
+                array = getattr(self, name, None)
+                if array is not None:
+                    array.zero_()
+
+            penalty = getattr(self, "body_body_contact_penalty_k", None)
+            if penalty is not None:
+                penalty.fill_(self.k_start_body_contact)
+
+            joint_penalty = getattr(self, "joint_penalty_k", None)
+            if joint_penalty is not None:
+                joint_penalty.fill_(0.0)
+
+        body_particle_penalty = getattr(self, "body_particle_contact_penalty_k", None)
+        if body_particle_penalty is not None:
+            body_particle_penalty.fill_(self.k_start_body_contact)
+
+        for name in (
+            "body_particle_contact_material_ke",
+            "body_particle_contact_material_kd",
+            "body_particle_contact_material_mu",
+            "body_body_contact_material_ke",
+            "body_body_contact_material_kd",
+            "body_body_contact_material_mu",
+        ):
+            array = getattr(self, name, None)
+            if array is not None:
+                array.zero_()
+
     def _init_particle_system(
         self,
         model: Model,

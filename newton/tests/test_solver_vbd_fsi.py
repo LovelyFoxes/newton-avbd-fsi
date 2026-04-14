@@ -90,6 +90,20 @@ def test_vbd_fsi_force_relaxation_scales_body_response(test, device):
     np.testing.assert_allclose(final_q[:3] - initial_q[:3], expected_delta, rtol=1.0e-5, atol=1.0e-6)
 
 
+def test_vbd_reset_restores_rigid_history(test, device):
+    initial_q, state_1, solver, _, body, _ = run_vbd_fsi_body_force_step(device)
+
+    moved_history = solver.body_q_prev.numpy()[body]
+    test.assertGreater(float(moved_history[0] - initial_q[0]), 0.0)
+
+    reset_state = solver.model.state()
+    solver.reset(reset_state)
+    np.testing.assert_allclose(
+        solver.body_q_prev.numpy()[body], reset_state.body_q.numpy()[body], rtol=1.0e-6, atol=1.0e-6
+    )
+    np.testing.assert_allclose(solver.body_q_prev.numpy()[body], initial_q, rtol=1.0e-6, atol=1.0e-6)
+
+
 devices = get_test_devices()
 
 
@@ -109,6 +123,14 @@ add_function_test(
     TestSolverVBDFSI,
     "test_vbd_fsi_force_relaxation_scales_body_response",
     test_vbd_fsi_force_relaxation_scales_body_response,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverVBDFSI,
+    "test_vbd_reset_restores_rigid_history",
+    test_vbd_reset_restores_rigid_history,
     devices=devices,
     check_output=False,
 )

@@ -279,6 +279,7 @@ class Example:
         self.sim_time = 0.0
         self.fluid_solver.reset(self.state_0)
         self.fluid_solver.reset(self.state_1)
+        self.solid_solver.reset(self.state_0)
         self.contacts.clear()
         self.boundary_model.clear_forces()
         self.boundary_model.update_world_kinematics(self.state_0)
