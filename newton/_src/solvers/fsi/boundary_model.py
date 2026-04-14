@@ -288,12 +288,7 @@ class FSIBoundaryModel:
             cell_key = (int(cell_index[0]), int(cell_index[1]), int(cell_index[2]))
             cells.setdefault(cell_key, []).append(sample_index)
 
-        offsets = [
-            (dx, dy, dz)
-            for dx in (-1, 0, 1)
-            for dy in (-1, 0, 1)
-            for dz in (-1, 0, 1)
-        ]
+        offsets = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)]
         delta = np.full(len(positions), cls._kernel_value_numpy(0.0, support_radius, kernel_family), dtype=np.float64)
 
         for sample_index, position in enumerate(positions):

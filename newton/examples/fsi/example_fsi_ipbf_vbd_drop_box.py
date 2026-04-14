@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import numpy as np
 import warp as wp
 
@@ -48,6 +50,12 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument(
+            "--coupling-mode",
+            choices=["interlinked", "loose"],
+            default="interlinked",
+            help="FSI scheduler mode used by the drop-box validation scene.",
+        )
+        parser.add_argument(
             "--coupling-iterations",
             type=int,
             default=3,
@@ -60,6 +68,12 @@ class Example:
             help="Scale applied to particle-shape projection reaction forces.",
         )
         parser.add_argument(
+            "--velocity-reaction-relaxation",
+            type=float,
+            default=None,
+            help="Scale applied to boundary velocity projection reaction forces.",
+        )
+        parser.add_argument(
             "--pressure-reaction-relaxation",
             type=float,
             default=None,
@@ -70,71 +84,96 @@ class Example:
             action="store_true",
             help="Enable per-frame host-side diagnostics in interactive runs.",
         )
+        parser.add_argument(
+            "--use-cuda-graph",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help=(
+                "Capture simulation launches in a CUDA graph. Disabled by default "
+                "for this scene because dynamic fluid-solid contact and boundary "
+                "updates need fresh launches for correct behavior."
+            ),
+        )
         return parser
 
     def _get_scene_config(self) -> dict[str, object]:
         projection_relaxation = getattr(self.args, "projection_reaction_relaxation", None)
+        velocity_reaction_relaxation = getattr(self.args, "velocity_reaction_relaxation", None)
         pressure_relaxation = getattr(self.args, "pressure_reaction_relaxation", None)
 
         if bool(getattr(self.args, "test", False)):
             return {
-                "container_half_width": 0.34,
-                "container_half_depth": 0.34,
-                "wall_half_height": 0.48,
-                "pool_dim_x": 8,
-                "pool_dim_y": 3,
-                "pool_dim_z": 8,
-                "cell": 0.05,
-                "mass": 0.11,
-                "radius_mean": 0.02,
-                "smoothing_radius": 0.09,
+                "container_half_width": 0.44,
+                "container_half_depth": 0.44,
+                "wall_half_height": 0.72,
+                "pool_dim_x": 14,
+                "pool_dim_y": 5,
+                "pool_dim_z": 14,
+                "cell": 0.04,
+                "mass": 0.064,
+                "radius_mean": 0.016,
+                "smoothing_radius": 0.075,
                 "pool_bottom_clearance": 0.03,
-                "box_half_extent": wp.vec3(0.08, 0.05, 0.08),
-                "box_bottom_gap": 0.08,
-                "box_density": 650.0,
-                "ipbf_iterations": 5,
+                "box_half_extent": wp.vec3(0.10, 0.055, 0.10),
+                "box_bottom_gap": 0.09,
+                "box_density": 1400.0,
+                "rest_density": 1000.0,
+                "ipbf_iterations": 6,
                 "ipbf_relaxation": 0.5,
                 "compliance": 1.0e-5,
                 "sim_substeps": 6,
-                "velocity_damping": 0.994,
+                "velocity_damping": 0.996,
                 "viscosity": 0.002,
                 "xsph": 0.004,
                 "rigid_iterations": 2,
-                "boundary_spacing": 0.05,
+                "boundary_spacing": 0.04,
                 "projection_reaction_relaxation": (
-                    0.004 if projection_relaxation is None else float(projection_relaxation)
+                    0.15 if projection_relaxation is None else float(projection_relaxation)
                 ),
-                "pressure_reaction_relaxation": (0.08 if pressure_relaxation is None else float(pressure_relaxation)),
+                "velocity_reaction_relaxation": (
+                    0.08 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
+                ),
+                "pressure_reaction_relaxation": (0.8 if pressure_relaxation is None else float(pressure_relaxation)),
+                "expected_min_box_drop": 0.035,
+                "expected_min_surface_rise": 0.01,
+                "expected_min_body_force_norm": 0.1,
+                "expected_min_sample_force_norm": 0.01,
             }
 
         return {
-            "container_half_width": 0.34,
-            "container_half_depth": 0.34,
-            "wall_half_height": 0.48,
-            "pool_dim_x": 8,
-            "pool_dim_y": 3,
-            "pool_dim_z": 8,
-            "cell": 0.05,
-            "mass": 0.11,
-            "radius_mean": 0.02,
-            "smoothing_radius": 0.09,
+            "container_half_width": 0.60,
+            "container_half_depth": 0.60,
+            "wall_half_height": 0.92,
+            "pool_dim_x": 72,
+            "pool_dim_y": 10,
+            "pool_dim_z": 72,
+            "cell": 0.014,
+            "mass": 0.002744,
+            "radius_mean": 0.006,
+            "smoothing_radius": 0.025,
             "pool_bottom_clearance": 0.03,
-            "box_half_extent": wp.vec3(0.08, 0.05, 0.08),
-            "box_bottom_gap": 0.08,
-            "box_density": 650.0,
-            "ipbf_iterations": 5,
+            "box_half_extent": wp.vec3(0.09, 0.06, 0.09),
+            "box_bottom_gap": 0.18,
+            "box_density": 1600.0,
+            "rest_density": 1000.0,
+            "ipbf_iterations": 2,
             "ipbf_relaxation": 0.5,
             "compliance": 1.0e-5,
-            "sim_substeps": 6,
-            "velocity_damping": 0.994,
-            "viscosity": 0.002,
-            "xsph": 0.004,
+            "sim_substeps": 4,
+            "velocity_damping": 0.999,
+            "viscosity": 0.0025,
+            "xsph": 0.005,
             "rigid_iterations": 2,
-            "boundary_spacing": 0.05,
-            "projection_reaction_relaxation": (
-                0.004 if projection_relaxation is None else float(projection_relaxation)
+            "boundary_spacing": 0.014,
+            "projection_reaction_relaxation": (0.15 if projection_relaxation is None else float(projection_relaxation)),
+            "velocity_reaction_relaxation": (
+                0.08 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
             ),
-            "pressure_reaction_relaxation": (0.08 if pressure_relaxation is None else float(pressure_relaxation)),
+            "pressure_reaction_relaxation": (0.8 if pressure_relaxation is None else float(pressure_relaxation)),
+            "expected_min_box_drop": 0.0,
+            "expected_min_surface_rise": 0.0,
+            "expected_min_body_force_norm": 0.0,
+            "expected_min_sample_force_norm": 0.0,
         }
 
     def __init__(self, viewer, args=None):
@@ -146,6 +185,7 @@ class Example:
         self.viewer._paused = True
         self.args = args
         self._reset_key_prev = False
+        self.use_cuda_graph = bool(getattr(self.args, "use_cuda_graph", False))
 
         self.config = self._get_scene_config()
         self.sim_substeps = int(self.config["sim_substeps"])
@@ -182,7 +222,7 @@ class Example:
         self.fluid_solver = SolverIPBF(
             self.model,
             SolverIPBF.Config(
-                rest_density=1000.0,
+                rest_density=float(self.config["rest_density"]),
                 smoothing_radius=float(self.config["smoothing_radius"]),
                 compliance=float(self.config["compliance"]),
                 iterations=int(self.config["ipbf_iterations"]),
@@ -190,7 +230,7 @@ class Example:
                 viscosity_coefficient=float(self.config["viscosity"]),
                 xsph_coefficient=float(self.config["xsph"]),
                 fsi_projection_reaction_relaxation=float(self.config["projection_reaction_relaxation"]),
-                fsi_velocity_projection_reaction_relaxation=float(self.config["projection_reaction_relaxation"]),
+                fsi_velocity_projection_reaction_relaxation=float(self.config["velocity_reaction_relaxation"]),
                 fsi_pressure_reaction_relaxation=float(self.config["pressure_reaction_relaxation"]),
             ),
             boundary_model=self.boundary_model,
@@ -208,7 +248,11 @@ class Example:
             solid_solver=self.solid_solver,
             boundary_model=self.boundary_model,
             config=SolverFSI.Config(
-                mode=SolverFSI.Config.CouplingMode.INTERLINKED,
+                mode=(
+                    SolverFSI.Config.CouplingMode.INTERLINKED
+                    if getattr(self.args, "coupling_mode", "interlinked") == "interlinked"
+                    else SolverFSI.Config.CouplingMode.LOOSE
+                ),
                 coupling_iterations=max(1, int(getattr(self.args, "coupling_iterations", 3))),
             ),
         )
@@ -259,6 +303,11 @@ class Example:
         self.max_body_force_norm = 0.0
         self.max_sample_force_norm = 0.0
         self.max_density = 0.0
+        self.max_density_ratio = 0.0
+        self.max_particle_speed = 0.0
+        self.max_box_linear_speed = 0.0
+        self.max_box_angular_speed = 0.0
+        self.states_remain_finite = True
         self.enable_runtime_diagnostics = bool(getattr(self.args, "enable_runtime_diagnostics", False)) or bool(
             getattr(self.args, "test", False)
         )
@@ -266,8 +315,8 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
         self.viewer.set_camera(
-            pos=wp.vec3(1.35, 1.0, 1.45),
-            pitch=-18.0,
+            pos=wp.vec3(2.05, 1.45, 2.25),
+            pitch=-20.0,
             yaw=-132.0,
         )
 
@@ -419,10 +468,18 @@ class Example:
         self.max_body_force_norm = 0.0
         self.max_sample_force_norm = 0.0
         self.max_density = 0.0
+        self.max_density_ratio = 0.0
+        self.max_particle_speed = 0.0
+        self.max_box_linear_speed = 0.0
+        self.max_box_angular_speed = 0.0
+        self.states_remain_finite = True
         self.viewer._paused = True
 
     def capture(self):
-        if wp.get_device().is_cuda:
+        # Keep graph capture opt-in here: this scene rebuilds collision/boundary
+        # state as the box enters the pool, and replaying one captured step can
+        # hide or amplify those state changes.
+        if self.use_cuda_graph and wp.get_device().is_cuda:
             with wp.ScopedCapture() as capture:
                 self.simulate()
             self.graph = capture.graph
@@ -434,12 +491,21 @@ class Example:
         sample_force = self.boundary_model.sample_force.numpy()
         density = self.state_0.ipbf.density.numpy()
         body_q = self.state_0.body_q.numpy()
+        body_qd = self.state_0.body_qd.numpy()
         particle_q = self.state_0.particle_q.numpy()
+        particle_qd = self.state_0.particle_qd.numpy()
         particle_radius = self.model.particle_radius.numpy()
 
         box_y = float(body_q[self.box_body, 1])
         self.min_box_y = min(self.min_box_y, box_y)
         self.max_particle_y = max(self.max_particle_y, float(np.max(particle_q[:, 1] + particle_radius)))
+        self.states_remain_finite = self.states_remain_finite and bool(
+            np.isfinite(body_q).all()
+            and np.isfinite(body_qd).all()
+            and np.isfinite(particle_q).all()
+            and np.isfinite(particle_qd).all()
+            and np.isfinite(density).all()
+        )
 
         if body_force.size:
             self.max_body_force_norm = max(self.max_body_force_norm, float(np.linalg.norm(body_force, axis=1).max()))
@@ -450,6 +516,21 @@ class Example:
             )
         if density.size:
             self.max_density = max(self.max_density, float(np.max(density)))
+            self.max_density_ratio = max(
+                self.max_density_ratio,
+                float(np.max(density) / max(float(self.config["rest_density"]), 1.0e-8)),
+            )
+        if particle_qd.size:
+            self.max_particle_speed = max(self.max_particle_speed, float(np.linalg.norm(particle_qd, axis=1).max()))
+        if body_qd.size:
+            self.max_box_linear_speed = max(
+                self.max_box_linear_speed,
+                float(np.linalg.norm(body_qd[:, :3], axis=1).max()),
+            )
+            self.max_box_angular_speed = max(
+                self.max_box_angular_speed,
+                float(np.linalg.norm(body_qd[:, 3:], axis=1).max()),
+            )
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -487,21 +568,34 @@ class Example:
         max_x = float(np.max(np.abs(particle_q[:, 0]) + particle_radius))
         max_z = float(np.max(np.abs(particle_q[:, 2]) + particle_radius))
         min_particle_y = float(np.min(particle_q[:, 1] - particle_radius))
+        expected_min_box_drop = float(self.config["expected_min_box_drop"])
+        expected_min_surface_rise = float(self.config["expected_min_surface_rise"])
+        expected_min_body_force_norm = float(self.config["expected_min_body_force_norm"])
+        expected_min_sample_force_norm = float(self.config["expected_min_sample_force_norm"])
 
+        assert self.states_remain_finite, "simulation produced non-finite particle/body state"
         assert self.max_density > 0.0, "IPBF density diagnostics were not updated"
-        assert self.max_body_force_norm > 0.0, "FSI body reaction was never accumulated"
-        assert self.max_sample_force_norm > 0.0, "boundary sample forces were never accumulated"
-        assert self.min_box_y < self.initial_box_y - 0.04, (
+        assert self.max_density_ratio < 2.5, f"peak density ratio is too large: rho/rho0={self.max_density_ratio:.3f}"
+        assert self.max_particle_speed < 25.0, f"particle speed blew up: vmax={self.max_particle_speed:.3f}"
+        assert self.max_box_linear_speed < 20.0, f"box linear speed blew up: vmax={self.max_box_linear_speed:.3f}"
+        assert self.max_box_angular_speed < 80.0, f"box angular speed blew up: wmax={self.max_box_angular_speed:.3f}"
+        assert self.max_body_force_norm > expected_min_body_force_norm, "FSI body reaction was never accumulated"
+        assert self.max_sample_force_norm > expected_min_sample_force_norm, (
+            "boundary sample forces were never accumulated"
+        )
+        assert self.min_box_y < self.initial_box_y - expected_min_box_drop, (
             f"drop box did not descend enough: min_y={self.min_box_y:.4f}, initial_y={self.initial_box_y:.4f}"
         )
-        assert self.max_particle_y > self.initial_particle_max_y + 0.01, (
+        assert self.max_particle_y > self.initial_particle_max_y + expected_min_surface_rise, (
             f"fluid surface did not respond enough: max_y={self.max_particle_y:.4f}, "
             f"initial={self.initial_particle_max_y:.4f}"
         )
-        assert box_y < self.initial_box_y - 0.01, f"drop box final height barely changed: y={box_y:.4f}"
+        assert box_y < self.initial_box_y - max(0.5 * expected_min_box_drop, 0.01), (
+            f"drop box final height barely changed: y={box_y:.4f}"
+        )
         assert min_particle_y >= -0.02, f"particles penetrated the floor too much: y={min_particle_y:.4f}"
-        assert max_x <= self.container_half_width + 0.08, f"particles escaped along x: {max_x:.4f}"
-        assert max_z <= self.container_half_depth + 0.08, f"particles escaped along z: {max_z:.4f}"
+        assert max_x <= self.container_half_width + 0.05, f"particles escaped along x: {max_x:.4f}"
+        assert max_z <= self.container_half_depth + 0.05, f"particles escaped along z: {max_z:.4f}"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
