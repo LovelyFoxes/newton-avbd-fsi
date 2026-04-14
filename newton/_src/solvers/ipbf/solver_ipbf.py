@@ -114,9 +114,15 @@ class SolverIPBF(SolverBase):
                 the position solve.
             boundary_velocity_damping: Tangential damping multiplier applied to
                 particle velocities at final particle-shape contacts.
-            fsi_reaction_relaxation: Unitless multiplier applied when converting
-                particle-shape projection corrections into FSI body reaction
-                forces and torques.
+            fsi_reaction_relaxation: Legacy compatibility multiplier applied to
+                both position- and velocity-projection reaction terms when the
+                dedicated reaction multipliers are omitted.
+            fsi_projection_reaction_relaxation: Unitless multiplier applied when
+                converting particle-shape position corrections into FSI body
+                reaction forces and torques.
+            fsi_velocity_projection_reaction_relaxation: Unitless multiplier
+                applied when converting boundary velocity projection deltas into
+                FSI body reaction forces and torques.
             fsi_pressure_reaction_relaxation: Unitless multiplier applied when
                 converting boundary pressure-gradient position increments into
                 FSI body reaction forces and torques.
@@ -141,7 +147,9 @@ class SolverIPBF(SolverBase):
         viscosity_coefficient: float = 0.0
         xsph_coefficient: float = 0.0
         boundary_velocity_damping: float = 1.0
-        fsi_reaction_relaxation: float = 1.0
+        fsi_reaction_relaxation: float | None = None
+        fsi_projection_reaction_relaxation: float | None = None
+        fsi_velocity_projection_reaction_relaxation: float | None = None
         fsi_pressure_reaction_relaxation: float = 1.0
 
     @override
@@ -317,7 +325,19 @@ class SolverIPBF(SolverBase):
         self.viscosity_coefficient = float(self.config.viscosity_coefficient)
         self.xsph_coefficient = float(self.config.xsph_coefficient)
         self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
-        self.fsi_reaction_relaxation = float(self.config.fsi_reaction_relaxation)
+        legacy_reaction_relaxation = self.config.fsi_reaction_relaxation
+        projection_reaction_relaxation = self.config.fsi_projection_reaction_relaxation
+        velocity_projection_reaction_relaxation = self.config.fsi_velocity_projection_reaction_relaxation
+        self.fsi_projection_reaction_relaxation = float(
+            projection_reaction_relaxation
+            if projection_reaction_relaxation is not None
+            else (legacy_reaction_relaxation if legacy_reaction_relaxation is not None else 1.0)
+        )
+        self.fsi_velocity_projection_reaction_relaxation = float(
+            velocity_projection_reaction_relaxation
+            if velocity_projection_reaction_relaxation is not None
+            else (legacy_reaction_relaxation if legacy_reaction_relaxation is not None else 1.0)
+        )
         self.fsi_pressure_reaction_relaxation = float(self.config.fsi_pressure_reaction_relaxation)
         self.boundary_model = None
         self.set_boundary_model(boundary_model)
@@ -417,6 +437,17 @@ class SolverIPBF(SolverBase):
         """Return whether shape boundary projection can be applied."""
         return contacts is not None and self.model.shape_count > 0 and contacts.soft_contact_max > 0
 
+    def _has_fsi_body_reaction_target(self, state: State) -> bool:
+        """Return whether FSI body reaction accumulation is available."""
+        boundary_model = self.boundary_model
+        return (
+            boundary_model is not None
+            and self.model.body_count > 0
+            and state.body_q is not None
+            and self.model.body_com is not None
+            and getattr(boundary_model, "shape_sample_count", None) is not None
+        )
+
     def _apply_shape_boundary_contacts(
         self,
         state: State,
@@ -433,13 +464,7 @@ class SolverIPBF(SolverBase):
         model.collide(state, contacts)
 
         boundary_model = self.boundary_model
-        has_reaction_target = (
-            boundary_model is not None
-            and model.body_count > 0
-            and state.body_q is not None
-            and model.body_com is not None
-            and getattr(boundary_model, "shape_sample_count", None) is not None
-        )
+        has_reaction_target = self._has_fsi_body_reaction_target(state)
 
         if has_reaction_target:
             self._boundary_projection_x_before.assign(state.particle_q)
@@ -465,7 +490,7 @@ class SolverIPBF(SolverBase):
                     contacts.soft_contact_max,
                     1.0,
                     dt,
-                    self.fsi_reaction_relaxation,
+                    self.fsi_projection_reaction_relaxation,
                 ],
                 outputs=[
                     self._boundary_projection_delta,
@@ -522,13 +547,7 @@ class SolverIPBF(SolverBase):
         )
 
         boundary_model = self.boundary_model
-        has_reaction_target = (
-            boundary_model is not None
-            and model.body_count > 0
-            and state.body_q is not None
-            and model.body_com is not None
-            and getattr(boundary_model, "shape_sample_count", None) is not None
-        )
+        has_reaction_target = self._has_fsi_body_reaction_target(state)
 
         if has_reaction_target:
             wp.launch(
@@ -551,7 +570,7 @@ class SolverIPBF(SolverBase):
                     contacts.soft_contact_max,
                     self.boundary_velocity_damping,
                     dt,
-                    self.fsi_reaction_relaxation,
+                    self.fsi_velocity_projection_reaction_relaxation,
                 ],
                 outputs=[
                     self._boundary_projected_particle_qd,

@@ -163,7 +163,8 @@ class Example:
                 smoothing_radius=float(self.config["smoothing_radius"]),
                 iterations=int(self.config["ipbf_iterations"]),
                 relaxation=0.5,
-                fsi_reaction_relaxation=float(self.config["fsi_reaction_relaxation"]),
+                fsi_projection_reaction_relaxation=float(self.config["fsi_reaction_relaxation"]),
+                fsi_velocity_projection_reaction_relaxation=float(self.config["fsi_reaction_relaxation"]),
             ),
             boundary_model=self.boundary_model,
         )

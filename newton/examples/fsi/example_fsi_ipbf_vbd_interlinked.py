@@ -206,7 +206,10 @@ class Example:
                 relaxation=float(self.config["ipbf_relaxation"]),
                 viscosity_coefficient=float(self.config["viscosity"]),
                 xsph_coefficient=float(self.config["xsph"]),
-                fsi_reaction_relaxation=float(getattr(self.args, "projection_reaction_relaxation", 0.0)),
+                fsi_projection_reaction_relaxation=float(getattr(self.args, "projection_reaction_relaxation", 0.0)),
+                fsi_velocity_projection_reaction_relaxation=float(
+                    getattr(self.args, "projection_reaction_relaxation", 0.0)
+                ),
                 fsi_pressure_reaction_relaxation=float(self.config["pressure_reaction_relaxation"]),
             ),
             boundary_model=self.boundary_model,

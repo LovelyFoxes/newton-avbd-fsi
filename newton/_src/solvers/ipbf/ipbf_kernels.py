@@ -204,6 +204,46 @@ def diagonal_from_column_norms(matrix: wp.mat33) -> wp.mat33:
     return wp.mat33(col0, 0.0, 0.0, 0.0, col1, 0.0, 0.0, 0.0, col2)
 
 
+@wp.func
+def equivalent_force_from_position_delta(
+    position_delta: wp.vec3,
+    particle_mass: float,
+    dt: float,
+    reaction_relaxation: float,
+) -> wp.vec3:
+    """Convert a position correction into an equivalent average reaction force."""
+    if dt <= 0.0 or reaction_relaxation == 0.0:
+        return wp.vec3(0.0)
+
+    return -reaction_relaxation * particle_mass * position_delta / (dt * dt)
+
+
+@wp.func
+def equivalent_force_from_velocity_delta(
+    velocity_delta: wp.vec3,
+    particle_mass: float,
+    dt: float,
+    reaction_relaxation: float,
+) -> wp.vec3:
+    """Convert a velocity correction into an equivalent average reaction force."""
+    if dt <= 0.0 or reaction_relaxation == 0.0:
+        return wp.vec3(0.0)
+
+    return -reaction_relaxation * particle_mass * velocity_delta / dt
+
+
+@wp.func
+def body_reaction_torque_from_world_point(
+    world_point: wp.vec3,
+    reaction_force: wp.vec3,
+    body_transform: wp.transform,
+    body_com_local: wp.vec3,
+) -> wp.vec3:
+    """Compute torque from a force applied at a world-space point on a body."""
+    com_world = wp.transform_point(body_transform, body_com_local)
+    return wp.cross(world_point - com_world, reaction_force)
+
+
 @wp.kernel
 def predict_inertial_positions(
     particle_q: wp.array(dtype=wp.vec3),
@@ -893,8 +933,6 @@ def accumulate_boundary_pressure_reaction(
 
     xi = particle_q[tid]
     inv_h = wp.inverse(hessian[tid])
-    inv_dt2 = 1.0 / (dt * dt)
-
     query = wp.hash_grid_query(boundary_grid, xi, support_radius)
     boundary_index = int(0)
 
@@ -912,7 +950,12 @@ def accumulate_boundary_pressure_reaction(
         if wp.dot(pressure_delta, pressure_delta) == 0.0:
             continue
 
-        force_on_boundary = -reaction_relaxation * particle_mass[tid] * pressure_delta * inv_dt2
+        force_on_boundary = equivalent_force_from_position_delta(
+            pressure_delta,
+            particle_mass[tid],
+            dt,
+            reaction_relaxation,
+        )
         wp.atomic_add(sample_force, boundary_index, force_on_boundary)
 
         body_index = boundary_body[boundary_index]
@@ -920,8 +963,12 @@ def accumulate_boundary_pressure_reaction(
             continue
 
         X_wb = body_q[body_index]
-        com_world = wp.transform_point(X_wb, body_com[body_index])
-        torque = wp.cross(boundary_x[boundary_index] - com_world, force_on_boundary)
+        torque = body_reaction_torque_from_world_point(
+            boundary_x[boundary_index],
+            force_on_boundary,
+            X_wb,
+            body_com[body_index],
+        )
 
         wp.atomic_add(body_force, body_index, force_on_boundary)
         wp.atomic_add(body_torque, body_index, torque)
@@ -1071,9 +1118,18 @@ def project_particle_shape_contacts_with_reaction(
     if body_index < 0 or dt <= 0.0 or reaction_relaxation == 0.0 or boundary_shape_sample_count[shape_index] <= 0:
         return
 
-    body_reaction = -reaction_relaxation * particle_mass[particle_index] * correction / (dt * dt)
-    com_world = wp.transform_point(X_wb, body_com[body_index])
-    torque = wp.cross(bx - com_world, body_reaction)
+    body_reaction = equivalent_force_from_position_delta(
+        correction,
+        particle_mass[particle_index],
+        dt,
+        reaction_relaxation,
+    )
+    torque = body_reaction_torque_from_world_point(
+        bx,
+        body_reaction,
+        X_wb,
+        body_com[body_index],
+    )
 
     wp.atomic_add(body_force, body_index, body_reaction)
     wp.atomic_add(body_torque, body_index, torque)
@@ -1195,11 +1251,20 @@ def accumulate_particle_shape_boundary_velocity_projection_with_reaction(
     if wp.dot(delta_v, delta_v) == 0.0:
         return
 
-    body_reaction = -reaction_relaxation * particle_mass[particle_index] * delta_v / dt
+    body_reaction = equivalent_force_from_velocity_delta(
+        delta_v,
+        particle_mass[particle_index],
+        dt,
+        reaction_relaxation,
+    )
     X_wb = body_q[body_index]
     bx = wp.transform_point(X_wb, contact_body_pos[tid])
-    com_world = wp.transform_point(X_wb, body_com[body_index])
-    torque = wp.cross(bx - com_world, body_reaction)
+    torque = body_reaction_torque_from_world_point(
+        bx,
+        body_reaction,
+        X_wb,
+        body_com[body_index],
+    )
 
     wp.atomic_add(body_force, body_index, body_reaction)
     wp.atomic_add(body_torque, body_index, torque)

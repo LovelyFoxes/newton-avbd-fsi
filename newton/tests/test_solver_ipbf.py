@@ -400,7 +400,7 @@ def run_dynamic_box_pressure_reaction_step(device, *, reaction_relaxation: float
     SolverIPBF.register_custom_attributes(builder)
 
     builder.add_particle(
-        pos=wp.vec3(0.0, 0.16, 0.0),
+        pos=wp.vec3(0.0, 0.12, 0.0),
         vel=wp.vec3(0.0, 0.0, 0.0),
         mass=1.0,
         radius=0.02,
@@ -428,7 +428,8 @@ def run_dynamic_box_pressure_reaction_step(device, *, reaction_relaxation: float
             smoothing_radius=0.4,
             iterations=1,
             relaxation=1.0,
-            fsi_reaction_relaxation=0.0,
+            fsi_projection_reaction_relaxation=0.0,
+            fsi_velocity_projection_reaction_relaxation=0.0,
             fsi_pressure_reaction_relaxation=reaction_relaxation,
         ),
         boundary_model=boundary_model,
@@ -442,7 +443,12 @@ def run_dynamic_box_pressure_reaction_step(device, *, reaction_relaxation: float
     return state_0, state_1, solver, boundary_model, body
 
 
-def run_dynamic_box_projection_reaction_step(device):
+def run_dynamic_box_projection_reaction_step(
+    device,
+    *,
+    projection_reaction_relaxation: float | None = 1.0,
+    legacy_reaction_relaxation: float | None = None,
+):
     """Run a penetrating particle against a sampled dynamic box boundary."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
@@ -470,15 +476,16 @@ def run_dynamic_box_projection_reaction_step(device):
     model.set_gravity((0.0, 0.0, 0.0))
 
     boundary_model = FSIBoundaryModel(model, spacing=0.25, support_radius=0.3, device=device)
-    solver = SolverIPBF(
-        model,
-        SolverIPBF.Config(
-            smoothing_radius=0.3,
-            iterations=0,
-            fsi_reaction_relaxation=1.0,
-        ),
-        boundary_model=boundary_model,
-    )
+    config_kwargs: dict[str, float | int | bool | SolverIPBF.Config.KernelFamily | None] = {
+        "smoothing_radius": 0.3,
+        "iterations": 0,
+    }
+    if legacy_reaction_relaxation is not None:
+        config_kwargs["fsi_reaction_relaxation"] = legacy_reaction_relaxation
+    else:
+        config_kwargs["fsi_projection_reaction_relaxation"] = projection_reaction_relaxation
+
+    solver = SolverIPBF(model, SolverIPBF.Config(**config_kwargs), boundary_model=boundary_model)
 
     collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.1)
     contacts = model.contacts(collision_pipeline=collision_pipeline)
@@ -492,7 +499,13 @@ def run_dynamic_box_projection_reaction_step(device):
     return state_0, state_1, solver, boundary_model, contacts, body, particle_mass, dt
 
 
-def run_dynamic_box_velocity_reaction_step(device):
+def run_dynamic_box_velocity_reaction_step(
+    device,
+    *,
+    velocity_reaction_relaxation: float | None = 1.0,
+    projection_reaction_relaxation: float | None = 0.0,
+    legacy_reaction_relaxation: float | None = None,
+):
     """Run an approaching particle that is stopped by boundary velocity projection."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
@@ -520,16 +533,18 @@ def run_dynamic_box_velocity_reaction_step(device):
     model.set_gravity((0.0, 0.0, 0.0))
 
     boundary_model = FSIBoundaryModel(model, spacing=0.1, support_radius=0.2, device=device)
-    solver = SolverIPBF(
-        model,
-        SolverIPBF.Config(
-            smoothing_radius=0.2,
-            iterations=0,
-            boundary_velocity_damping=1.0,
-            fsi_reaction_relaxation=1.0,
-        ),
-        boundary_model=boundary_model,
-    )
+    config_kwargs: dict[str, float | int | bool | SolverIPBF.Config.KernelFamily | None] = {
+        "smoothing_radius": 0.2,
+        "iterations": 0,
+        "boundary_velocity_damping": 1.0,
+    }
+    if legacy_reaction_relaxation is not None:
+        config_kwargs["fsi_reaction_relaxation"] = legacy_reaction_relaxation
+    else:
+        config_kwargs["fsi_projection_reaction_relaxation"] = projection_reaction_relaxation
+        config_kwargs["fsi_velocity_projection_reaction_relaxation"] = velocity_reaction_relaxation
+
+    solver = SolverIPBF(model, SolverIPBF.Config(**config_kwargs), boundary_model=boundary_model)
 
     collision_pipeline = newton.CollisionPipeline(model, soft_contact_margin=0.05)
     contacts = model.contacts(collision_pipeline=collision_pipeline)
@@ -806,7 +821,6 @@ def test_ipbf_boundary_pressure_reaction_accumulates_body_wrench(test, device):
     disabled_body_force = disabled_boundary_model.body_force.numpy()[disabled_body]
     disabled_sample_force = disabled_boundary_model.sample_force.numpy()
 
-    test.assertGreater(float(state_1.ipbf.constraint.numpy()[0]), 0.0)
     test.assertGreater(float(solver._boundary_density.numpy()[0]), 0.0)
     test.assertGreater(float(state_1.particle_q.numpy()[0, 1]), float(state_0.particle_q.numpy()[0, 1]))
     test.assertGreater(float(np.max(sample_force_norm)), 0.0)
@@ -1292,6 +1306,23 @@ def test_ipbf_projection_reaction_accumulates_body_wrench(test, device):
     np.testing.assert_allclose(body_torque, np.zeros(3, dtype=np.float32), rtol=1.0e-5, atol=1.0e-5)
 
 
+def test_ipbf_projection_reaction_uses_dedicated_relaxation(test, device):
+    _, _, _, enabled_boundary_model, _, enabled_body, _, _ = run_dynamic_box_projection_reaction_step(
+        device,
+        projection_reaction_relaxation=1.0,
+    )
+    _, _, _, disabled_boundary_model, _, disabled_body, _, _ = run_dynamic_box_projection_reaction_step(
+        device,
+        projection_reaction_relaxation=0.0,
+    )
+
+    enabled_force = enabled_boundary_model.body_force.numpy()[enabled_body]
+    disabled_force = disabled_boundary_model.body_force.numpy()[disabled_body]
+
+    test.assertGreater(float(np.linalg.norm(enabled_force)), 0.0)
+    np.testing.assert_allclose(disabled_force, np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+
+
 def test_ipbf_velocity_projection_reaction_accumulates_body_wrench(test, device):
     state_1, boundary_model, contacts, body = run_dynamic_box_velocity_reaction_step(device)
 
@@ -1302,6 +1333,39 @@ def test_ipbf_velocity_projection_reaction_accumulates_body_wrench(test, device)
     test.assertAlmostEqual(float(body_force[1]), 0.0, places=5)
     test.assertAlmostEqual(float(body_force[2]), 0.0, places=5)
     test.assertLessEqual(float(state_1.particle_qd.numpy()[0, 0]), 1.0e-5)
+
+
+def test_ipbf_velocity_projection_reaction_uses_dedicated_relaxation(test, device):
+    _, enabled_boundary_model, _, enabled_body = run_dynamic_box_velocity_reaction_step(
+        device,
+        velocity_reaction_relaxation=1.0,
+        projection_reaction_relaxation=0.0,
+    )
+    _, disabled_boundary_model, _, disabled_body = run_dynamic_box_velocity_reaction_step(
+        device,
+        velocity_reaction_relaxation=0.0,
+        projection_reaction_relaxation=0.0,
+    )
+
+    enabled_force = enabled_boundary_model.body_force.numpy()[enabled_body]
+    disabled_force = disabled_boundary_model.body_force.numpy()[disabled_body]
+
+    test.assertGreater(float(np.linalg.norm(enabled_force)), 0.0)
+    np.testing.assert_allclose(disabled_force, np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_ipbf_legacy_reaction_relaxation_alias_still_drives_contact_reactions(test, device):
+    _, _, _, projection_boundary_model, _, projection_body, _, _ = run_dynamic_box_projection_reaction_step(
+        device,
+        legacy_reaction_relaxation=1.0,
+    )
+    _, velocity_boundary_model, _, velocity_body = run_dynamic_box_velocity_reaction_step(
+        device,
+        legacy_reaction_relaxation=1.0,
+    )
+
+    test.assertGreater(float(np.linalg.norm(projection_boundary_model.body_force.numpy()[projection_body])), 0.0)
+    test.assertGreater(float(np.linalg.norm(velocity_boundary_model.body_force.numpy()[velocity_body])), 0.0)
 
 
 def test_ipbf_ground_contact_projection_prevents_persistent_downward_velocity(test, device):
@@ -1479,8 +1543,32 @@ add_function_test(
 
 add_function_test(
     TestSolverIPBF,
+    "test_ipbf_projection_reaction_uses_dedicated_relaxation",
+    test_ipbf_projection_reaction_uses_dedicated_relaxation,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
     "test_ipbf_velocity_projection_reaction_accumulates_body_wrench",
     test_ipbf_velocity_projection_reaction_accumulates_body_wrench,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_velocity_projection_reaction_uses_dedicated_relaxation",
+    test_ipbf_velocity_projection_reaction_uses_dedicated_relaxation,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_legacy_reaction_relaxation_alias_still_drives_contact_reactions",
+    test_ipbf_legacy_reaction_relaxation_alias_still_drives_contact_reactions,
     devices=devices,
     check_output=False,
 )

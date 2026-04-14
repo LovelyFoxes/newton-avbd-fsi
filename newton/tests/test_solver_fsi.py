@@ -64,7 +64,8 @@ def run_loose_fsi_step(device):
         SolverIPBF.Config(
             smoothing_radius=0.3,
             iterations=0,
-            fsi_reaction_relaxation=1.0,
+            fsi_projection_reaction_relaxation=1.0,
+            fsi_velocity_projection_reaction_relaxation=1.0,
         ),
         boundary_model=boundary_model,
     )
@@ -97,7 +98,8 @@ def run_interlinked_fsi_step(device):
         SolverIPBF.Config(
             smoothing_radius=0.3,
             iterations=0,
-            fsi_reaction_relaxation=1.0,
+            fsi_projection_reaction_relaxation=1.0,
+            fsi_velocity_projection_reaction_relaxation=1.0,
         ),
         boundary_model=boundary_model,
     )
