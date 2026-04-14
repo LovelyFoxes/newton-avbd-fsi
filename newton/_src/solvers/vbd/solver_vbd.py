@@ -1284,6 +1284,15 @@ class SolverVBD(SolverBase):
                 depend on this argument.
             dt: Time step size.
         """
+        self._begin_step(state_in, state_out, contacts, dt)
+
+        for iter_num in range(self.iterations):
+            self._solve_iteration(state_in, state_out, contacts, dt, iter_num)
+
+        self._finalize_step(state_in, state_out, dt)
+
+    def _begin_step(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float) -> None:
+        """Prepare VBD/AVBD state for one timestep."""
         # Use and reset the rigid history update flag (warmstarts).
         update_rigid_history = self.update_rigid_history
         self.update_rigid_history = True
@@ -1294,11 +1303,16 @@ class SolverVBD(SolverBase):
         else:
             self._copy_external_particle_state(state_in, state_out)
 
-        for iter_num in range(self.iterations):
-            self._solve_rigid_body_iteration(state_in, state_out, contacts, dt)
-            if self.integrate_particles:
-                self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
+    def _solve_iteration(
+        self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int
+    ) -> None:
+        """Run one interleaved AVBD rigid and VBD particle iteration."""
+        self._solve_rigid_body_iteration(state_in, state_out, contacts, dt)
+        if self.integrate_particles:
+            self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
+    def _finalize_step(self, state_in: State, state_out: State, dt: float) -> None:
+        """Finalize velocities after VBD/AVBD iterations."""
         self._finalize_rigid_bodies(state_out, dt)
         if self.integrate_particles:
             self._finalize_particles(state_out, dt)

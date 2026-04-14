@@ -989,6 +989,21 @@ class SolverIPBF(SolverBase):
         stabilization. Particle-shape contacts are handled by a minimal
         normal-direction positional projection using Newton soft contacts.
         """
+        if not self._begin_step(state_in, state_out, dt):
+            return
+
+        if self.iterations <= 0:
+            self._solve_zero_iteration(state_out, contacts, dt)
+            self._finalize_step(state_in, state_out, contacts, dt, recompute_fields=False)
+            return
+
+        for iteration in range(self.iterations):
+            self._solve_iteration(state_out, contacts, dt, iteration, self.iterations)
+
+        self._finalize_step(state_in, state_out, contacts, dt)
+
+    def _begin_step(self, state_in: State, state_out: State, dt: float) -> bool:
+        """Prepare IPBF buffers for one timestep."""
         if state_in.particle_q is None or state_in.particle_qd is None:
             raise ValueError("SolverIPBF requires particle positions and velocities.")
 
@@ -1002,7 +1017,7 @@ class SolverIPBF(SolverBase):
 
         model = self.model
         if model.particle_count == 0:
-            return
+            return False
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
@@ -1040,90 +1055,117 @@ class SolverIPBF(SolverBase):
         )
         state_out.ipbf.x_star.assign(state_out.ipbf.y)
 
-        if self.iterations <= 0:
-            self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_guess, contacts, dt)
-            state_out.ipbf.x_new.assign(state_out.ipbf.x_guess)
+        return True
+
+    def _solve_zero_iteration(self, state_out: State, contacts: Contacts | None, dt: float) -> None:
+        """Apply projection-only IPBF work for zero-iteration configurations."""
+        self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_guess, contacts, dt)
+        state_out.ipbf.x_new.assign(state_out.ipbf.x_guess)
+        state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
+        self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
+        state_out.ipbf.delta_q.zero_()
+
+    def _solve_iteration(
+        self,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+        iteration: int,
+        iteration_count: int | None = None,
+    ) -> None:
+        """Run one relaxed Jacobi IPBF iteration."""
+        model = self.model
+        iteration_count = self.iterations if iteration_count is None else int(iteration_count)
+        is_last_iteration = iteration == iteration_count - 1
+
+        self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
+
+        if is_last_iteration and self.damping_beta > 0.0 and self.smoothing_radius > 0.0:
+            self._compute_iteration_fields(
+                state_out,
+                state_out.ipbf.x_guess,
+                dt,
+                recompute_density_constraint=False,
+                compliance=self.damping_compliance,
+            )
+
+            wp.launch(
+                solve_local_system,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_flags,
+                    state_out.ipbf.force,
+                    state_out.ipbf.hessian,
+                ],
+                outputs=[state_out.ipbf.delta_q],
+                device=model.device,
+            )
+
+            wp.launch(
+                apply_relaxed_jacobi_update,
+                dim=model.particle_count,
+                inputs=[
+                    model.particle_flags,
+                    state_out.ipbf.x_guess,
+                    state_out.ipbf.delta_q,
+                    self.relaxation,
+                ],
+                outputs=[state_out.ipbf.x_star],
+                device=model.device,
+            )
+            self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_star, contacts, dt)
+
+            self._compute_iteration_fields(
+                state_out,
+                state_out.ipbf.x_guess,
+                dt,
+                recompute_density_constraint=False,
+                compliance=self.compliance,
+            )
+        elif is_last_iteration:
             state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
-            self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
-            state_out.ipbf.delta_q.zero_()
-        else:
-            for iteration in range(self.iterations):
-                is_last_iteration = iteration == self.iterations - 1
-                self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
 
-                if is_last_iteration and self.damping_beta > 0.0 and self.smoothing_radius > 0.0:
-                    self._compute_iteration_fields(
-                        state_out,
-                        state_out.ipbf.x_guess,
-                        dt,
-                        recompute_density_constraint=False,
-                        compliance=self.damping_compliance,
-                    )
+        wp.launch(
+            solve_local_system,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                state_out.ipbf.force,
+                state_out.ipbf.hessian,
+            ],
+            outputs=[state_out.ipbf.delta_q],
+            device=model.device,
+        )
 
-                    wp.launch(
-                        solve_local_system,
-                        dim=model.particle_count,
-                        inputs=[
-                            model.particle_flags,
-                            state_out.ipbf.force,
-                            state_out.ipbf.hessian,
-                        ],
-                        outputs=[state_out.ipbf.delta_q],
-                        device=model.device,
-                    )
+        wp.launch(
+            apply_relaxed_jacobi_update,
+            dim=model.particle_count,
+            inputs=[
+                model.particle_flags,
+                state_out.ipbf.x_guess,
+                state_out.ipbf.delta_q,
+                self.relaxation,
+            ],
+            outputs=[state_out.ipbf.x_new],
+            device=model.device,
+        )
+        self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_new, contacts, dt)
 
-                    wp.launch(
-                        apply_relaxed_jacobi_update,
-                        dim=model.particle_count,
-                        inputs=[
-                            model.particle_flags,
-                            state_out.ipbf.x_guess,
-                            state_out.ipbf.delta_q,
-                            self.relaxation,
-                        ],
-                        outputs=[state_out.ipbf.x_star],
-                        device=model.device,
-                    )
-                    self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_star, contacts, dt)
+        state_out.ipbf.x_guess.assign(state_out.ipbf.x_new)
 
-                    self._compute_iteration_fields(
-                        state_out,
-                        state_out.ipbf.x_guess,
-                        dt,
-                        recompute_density_constraint=False,
-                        compliance=self.compliance,
-                    )
-                elif is_last_iteration:
-                    state_out.ipbf.x_star.assign(state_out.ipbf.x_guess)
+    def _finalize_step(
+        self,
+        state_in: State,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+        *,
+        recompute_fields: bool = True,
+    ) -> None:
+        """Commit converged IPBF positions and reconstruct particle velocities."""
+        model = self.model
 
-                wp.launch(
-                    solve_local_system,
-                    dim=model.particle_count,
-                    inputs=[
-                        model.particle_flags,
-                        state_out.ipbf.force,
-                        state_out.ipbf.hessian,
-                    ],
-                    outputs=[state_out.ipbf.delta_q],
-                    device=model.device,
-                )
-
-                wp.launch(
-                    apply_relaxed_jacobi_update,
-                    dim=model.particle_count,
-                    inputs=[
-                        model.particle_flags,
-                        state_out.ipbf.x_guess,
-                        state_out.ipbf.delta_q,
-                        self.relaxation,
-                    ],
-                    outputs=[state_out.ipbf.x_new],
-                    device=model.device,
-                )
-                self._apply_shape_boundary_contacts(state_out, state_out.ipbf.x_new, contacts, dt)
-
-                state_out.ipbf.x_guess.assign(state_out.ipbf.x_new)
-
+        if recompute_fields:
             self._compute_iteration_fields(state_out, state_out.ipbf.x_guess, dt)
 
         state_out.particle_q.assign(state_out.ipbf.x_guess)

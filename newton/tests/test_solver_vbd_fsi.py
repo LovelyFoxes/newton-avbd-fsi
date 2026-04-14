@@ -91,7 +91,7 @@ def test_vbd_fsi_force_relaxation_scales_body_response(test, device):
 
 
 def test_vbd_reset_restores_rigid_history(test, device):
-    initial_q, state_1, solver, _, body, _ = run_vbd_fsi_body_force_step(device)
+    initial_q, _state_1, solver, _, body, _ = run_vbd_fsi_body_force_step(device)
 
     moved_history = solver.body_q_prev.numpy()[body]
     test.assertGreater(float(moved_history[0] - initial_q[0]), 0.0)
