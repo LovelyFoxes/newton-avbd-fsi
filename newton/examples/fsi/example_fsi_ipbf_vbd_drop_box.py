@@ -62,6 +62,18 @@ class Example:
             help="Number of IPBF/AVBD iteration pairs used in the drop-box pool scene.",
         )
         parser.add_argument(
+            "--ipbf-iterations",
+            type=int,
+            default=None,
+            help="Override the number of IPBF density iterations used in the pool scene.",
+        )
+        parser.add_argument(
+            "--sim-substeps",
+            type=int,
+            default=None,
+            help="Override the number of simulation substeps per rendered frame.",
+        )
+        parser.add_argument(
             "--projection-reaction-relaxation",
             type=float,
             default=None,
@@ -78,6 +90,12 @@ class Example:
             type=float,
             default=None,
             help="Scale applied to pressure-gradient reaction forces.",
+        )
+        parser.add_argument(
+            "--box-bottom-gap",
+            type=float,
+            default=None,
+            help="Override the initial gap between the water surface and the box bottom [m].",
         )
         parser.add_argument(
             "--enable-runtime-diagnostics",
@@ -100,9 +118,12 @@ class Example:
         projection_relaxation = getattr(self.args, "projection_reaction_relaxation", None)
         velocity_reaction_relaxation = getattr(self.args, "velocity_reaction_relaxation", None)
         pressure_relaxation = getattr(self.args, "pressure_reaction_relaxation", None)
+        ipbf_iterations_override = getattr(self.args, "ipbf_iterations", None)
+        sim_substeps_override = getattr(self.args, "sim_substeps", None)
+        box_bottom_gap_override = getattr(self.args, "box_bottom_gap", None)
 
         if bool(getattr(self.args, "test", False)):
-            return {
+            config = {
                 "container_half_width": 0.44,
                 "container_half_depth": 0.44,
                 "wall_half_height": 0.72,
@@ -139,42 +160,53 @@ class Example:
                 "expected_min_body_force_norm": 0.1,
                 "expected_min_sample_force_norm": 0.01,
             }
+        else:
+            config = {
+                "container_half_width": 0.60,
+                "container_half_depth": 0.60,
+                "wall_half_height": 0.92,
+                "pool_dim_x": 72,
+                "pool_dim_y": 10,
+                "pool_dim_z": 72,
+                "cell": 0.014,
+                "mass": 0.002744,
+                "radius_mean": 0.006,
+                "smoothing_radius": 0.025,
+                "pool_bottom_clearance": 0.03,
+                "box_half_extent": wp.vec3(0.09, 0.06, 0.09),
+                "box_bottom_gap": 0.12,
+                "box_density": 1600.0,
+                "rest_density": 1000.0,
+                "ipbf_iterations": 2,
+                "ipbf_relaxation": 0.5,
+                "compliance": 1.0e-5,
+                "sim_substeps": 6,
+                "velocity_damping": 0.999,
+                "viscosity": 0.0025,
+                "xsph": 0.005,
+                "rigid_iterations": 2,
+                "boundary_spacing": 0.014,
+                "projection_reaction_relaxation": (
+                    0.15 if projection_relaxation is None else float(projection_relaxation)
+                ),
+                "velocity_reaction_relaxation": (
+                    0.16 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
+                ),
+                "pressure_reaction_relaxation": (0.6 if pressure_relaxation is None else float(pressure_relaxation)),
+                "expected_min_box_drop": 0.0,
+                "expected_min_surface_rise": 0.0,
+                "expected_min_body_force_norm": 0.0,
+                "expected_min_sample_force_norm": 0.0,
+            }
 
-        return {
-            "container_half_width": 0.60,
-            "container_half_depth": 0.60,
-            "wall_half_height": 0.92,
-            "pool_dim_x": 72,
-            "pool_dim_y": 10,
-            "pool_dim_z": 72,
-            "cell": 0.014,
-            "mass": 0.002744,
-            "radius_mean": 0.006,
-            "smoothing_radius": 0.025,
-            "pool_bottom_clearance": 0.03,
-            "box_half_extent": wp.vec3(0.09, 0.06, 0.09),
-            "box_bottom_gap": 0.18,
-            "box_density": 1600.0,
-            "rest_density": 1000.0,
-            "ipbf_iterations": 2,
-            "ipbf_relaxation": 0.5,
-            "compliance": 1.0e-5,
-            "sim_substeps": 4,
-            "velocity_damping": 0.999,
-            "viscosity": 0.0025,
-            "xsph": 0.005,
-            "rigid_iterations": 2,
-            "boundary_spacing": 0.014,
-            "projection_reaction_relaxation": (0.15 if projection_relaxation is None else float(projection_relaxation)),
-            "velocity_reaction_relaxation": (
-                0.08 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
-            ),
-            "pressure_reaction_relaxation": (0.8 if pressure_relaxation is None else float(pressure_relaxation)),
-            "expected_min_box_drop": 0.0,
-            "expected_min_surface_rise": 0.0,
-            "expected_min_body_force_norm": 0.0,
-            "expected_min_sample_force_norm": 0.0,
-        }
+        if ipbf_iterations_override is not None:
+            config["ipbf_iterations"] = int(ipbf_iterations_override)
+        if sim_substeps_override is not None:
+            config["sim_substeps"] = int(sim_substeps_override)
+        if box_bottom_gap_override is not None:
+            config["box_bottom_gap"] = float(box_bottom_gap_override)
+
+        return config
 
     def __init__(self, viewer, args=None):
         self.fps = 60
@@ -388,7 +420,7 @@ class Example:
             + float(self.config["radius_mean"])
         )
         box_center_y = pool_top_surface_y + float(self.config["box_bottom_gap"]) + float(self.box_half_extent[1])
-        box_center = wp.vec3(0.0, box_center_y, 0.0)
+        box_center = wp.vec3(0.5, box_center_y, 0.3)
 
         box_body = builder.add_body(
             xform=wp.transform(box_center, wp.quat_identity()),
