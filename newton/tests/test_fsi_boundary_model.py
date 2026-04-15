@@ -75,6 +75,32 @@ def _expected_box_surface_quadrature_volumes(points: np.ndarray, hx: float, hy: 
     return expected
 
 
+def _expected_box_surface_patch_areas(points: np.ndarray, hx: float, hy: float, hz: float) -> np.ndarray:
+    xs = np.unique(points[:, 0])
+    ys = np.unique(points[:, 1])
+    zs = np.unique(points[:, 2])
+    x_widths = _axis_patch_widths(xs)
+    y_widths = _axis_patch_widths(ys)
+    z_widths = _axis_patch_widths(zs)
+    x_index = {float(value): index for index, value in enumerate(xs)}
+    y_index = {float(value): index for index, value in enumerate(ys)}
+    z_index = {float(value): index for index, value in enumerate(zs)}
+
+    expected = np.zeros(len(points), dtype=np.float32)
+    for sample_index, point in enumerate(points):
+        ix = x_index[float(point[0])]
+        iy = y_index[float(point[1])]
+        iz = z_index[float(point[2])]
+        if np.isclose(abs(point[0]), hx, atol=1.0e-6):
+            expected[sample_index] += y_widths[iy] * z_widths[iz]
+        if np.isclose(abs(point[1]), hy, atol=1.0e-6):
+            expected[sample_index] += x_widths[ix] * z_widths[iz]
+        if np.isclose(abs(point[2]), hz, atol=1.0e-6):
+            expected[sample_index] += x_widths[ix] * y_widths[iy]
+
+    return expected
+
+
 def test_dynamic_box_samples_follow_body(test: unittest.TestCase, device):
     builder = newton.ModelBuilder(gravity=0.0)
     body = builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()))
@@ -222,28 +248,91 @@ def test_dynamic_box_surface_quadrature_matches_expected_patch_weights(test: uni
     sample_body = boundary.sample_body.numpy()
     sample_x_local = boundary.sample_x_local.numpy()
     raw_volume = boundary.sample_volume.numpy()
+    patch_area = boundary.sample_area_box_patch.numpy()
     quadrature_volume = boundary.sample_volume_box_quadrature.numpy()
     hydrostatic_volume = boundary.sample_volume_hydrostatic.numpy()
     hydrostatic_scale = boundary.sample_volume_hydrostatic_scale.numpy()
     expected_volume = 8.0 * 0.5 * 0.25 * 0.25
+    expected_surface_area = 2.0 * (
+        (2.0 * 0.5) * (2.0 * 0.25) + (2.0 * 0.5) * (2.0 * 0.25) + (2.0 * 0.25) * (2.0 * 0.25)
+    )
 
     dynamic_mask = sample_body == dynamic_body
     kinematic_mask = sample_body == kinematic_body
     dynamic_points = sample_x_local[dynamic_mask]
+    expected_patch_area = _expected_box_surface_patch_areas(dynamic_points, hx=0.5, hy=0.25, hz=0.25)
     expected_quadrature = _expected_box_surface_quadrature_volumes(dynamic_points, hx=0.5, hy=0.25, hz=0.25)
 
+    np.testing.assert_allclose(patch_area[dynamic_mask], expected_patch_area, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(quadrature_volume[dynamic_mask], expected_quadrature, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(hydrostatic_volume[dynamic_mask], expected_quadrature, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(np.sum(hydrostatic_volume[dynamic_mask]), expected_volume, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(np.sum(patch_area[dynamic_mask]), expected_surface_area, rtol=1.0e-6, atol=1.0e-6)
     test.assertGreater(np.std(hydrostatic_scale[dynamic_mask]), 1.0e-3)
     kinematic_points = sample_x_local[kinematic_mask]
+    expected_kinematic_patch_area = _expected_box_surface_patch_areas(kinematic_points, hx=0.5, hy=0.25, hz=0.25)
     expected_kinematic_quadrature = _expected_box_surface_quadrature_volumes(kinematic_points, hx=0.5, hy=0.25, hz=0.25)
+    np.testing.assert_allclose(patch_area[kinematic_mask], expected_kinematic_patch_area, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(
         quadrature_volume[kinematic_mask],
         expected_kinematic_quadrature,
         rtol=1.0e-6,
         atol=1.0e-6,
     )
+    np.testing.assert_allclose(hydrostatic_volume[kinematic_mask], raw_volume[kinematic_mask], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(hydrostatic_scale[kinematic_mask], np.ones_like(hydrostatic_scale[kinematic_mask]))
+
+
+def test_dynamic_box_surface_thickness_matches_raw_total_with_patch_distribution(test: unittest.TestCase, device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    dynamic_body = builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()))
+    kinematic_body = builder.add_body(
+        xform=wp.transform(wp.vec3(2.0, 0.0, 0.0), wp.quat_identity()),
+        is_kinematic=True,
+    )
+    builder.add_shape_box(dynamic_body, hx=0.5, hy=0.25, hz=0.25)
+    builder.add_shape_box(kinematic_body, hx=0.5, hy=0.25, hz=0.25)
+    model = builder.finalize(device=device)
+
+    boundary = FSIBoundaryModel(
+        model,
+        spacing=0.25,
+        support_radius=0.5,
+        hydrostatic_volume_mode=FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_THICKNESS,
+        device=device,
+    )
+
+    sample_body = boundary.sample_body.numpy()
+    sample_x_local = boundary.sample_x_local.numpy()
+    raw_volume = boundary.sample_volume.numpy()
+    patch_area = boundary.sample_area_box_patch.numpy()
+    hydrostatic_volume = boundary.sample_volume_hydrostatic.numpy()
+    hydrostatic_scale = boundary.sample_volume_hydrostatic_scale.numpy()
+
+    dynamic_mask = sample_body == dynamic_body
+    kinematic_mask = sample_body == kinematic_body
+    dynamic_points = sample_x_local[dynamic_mask]
+    expected_patch_area = _expected_box_surface_patch_areas(dynamic_points, hx=0.5, hy=0.25, hz=0.25)
+    raw_total = float(np.sum(raw_volume[dynamic_mask]))
+    patch_area_total = float(np.sum(expected_patch_area))
+    expected_thickness = raw_total / patch_area_total
+    expected_volume = expected_patch_area * expected_thickness
+
+    np.testing.assert_allclose(patch_area[dynamic_mask], expected_patch_area, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(hydrostatic_volume[dynamic_mask], expected_volume, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(np.sum(hydrostatic_volume[dynamic_mask]), raw_total, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(
+        hydrostatic_scale[dynamic_mask],
+        np.divide(
+            expected_volume,
+            raw_volume[dynamic_mask],
+            out=np.ones_like(expected_volume),
+            where=raw_volume[dynamic_mask] > 0.0,
+        ),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    test.assertGreater(np.std(hydrostatic_scale[dynamic_mask]), 1.0e-3)
     np.testing.assert_allclose(hydrostatic_volume[kinematic_mask], raw_volume[kinematic_mask], rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(hydrostatic_scale[kinematic_mask], np.ones_like(hydrostatic_scale[kinematic_mask]))
 
@@ -280,6 +369,13 @@ add_function_test(
     TestFSIBoundaryModel,
     "test_dynamic_box_surface_quadrature_matches_expected_patch_weights",
     test_dynamic_box_surface_quadrature_matches_expected_patch_weights,
+    devices=devices,
+)
+
+add_function_test(
+    TestFSIBoundaryModel,
+    "test_dynamic_box_surface_thickness_matches_raw_total_with_patch_distribution",
+    test_dynamic_box_surface_thickness_matches_raw_total_with_patch_distribution,
     devices=devices,
 )
 

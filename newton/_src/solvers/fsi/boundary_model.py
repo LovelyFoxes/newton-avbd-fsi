@@ -81,6 +81,7 @@ class FSIBoundaryModel:
         NONE = 0
         DYNAMIC_BOX_VOLUME = 1
         DYNAMIC_BOX_SURFACE_QUADRATURE = 2
+        DYNAMIC_BOX_SURFACE_THICKNESS = 3
 
     def __init__(
         self,
@@ -113,6 +114,7 @@ class FSIBoundaryModel:
             sample_shape,
             sample_x_local,
             sample_normal_local,
+            sample_area_box_patch,
             sample_volume_box_quadrature,
         ) = self._sample_model_boxes(
             model,
@@ -131,6 +133,7 @@ class FSIBoundaryModel:
             model,
             sample_shape,
             sample_volume,
+            sample_area_box_patch,
             sample_volume_box_quadrature,
             self.hydrostatic_volume_mode,
         )
@@ -155,6 +158,7 @@ class FSIBoundaryModel:
         self.sample_x_local = wp.array(sample_x_local, dtype=wp.vec3, device=self.device)
         self.sample_normal_local = wp.array(sample_normal_local, dtype=wp.vec3, device=self.device)
         self.sample_volume = wp.array(sample_volume, dtype=float, device=self.device)
+        self.sample_area_box_patch = wp.array(sample_area_box_patch, dtype=float, device=self.device)
         self.sample_volume_box_quadrature = wp.array(sample_volume_box_quadrature, dtype=float, device=self.device)
         self.sample_volume_hydrostatic = wp.array(sample_volume_hydrostatic, dtype=float, device=self.device)
         self.sample_volume_hydrostatic_scale = wp.array(
@@ -232,9 +236,10 @@ class FSIBoundaryModel:
         list[tuple[float, float, float]],
         list[tuple[float, float, float]],
         list[float],
+        list[float],
     ]:
         if model.shape_count == 0:
-            return [], [], [], [], []
+            return [], [], [], [], [], []
 
         shape_type = model.shape_type.numpy()
         shape_body = model.shape_body.numpy()
@@ -250,6 +255,7 @@ class FSIBoundaryModel:
         sample_shape: list[int] = []
         sample_x_local: list[tuple[float, float, float]] = []
         sample_normal_local: list[tuple[float, float, float]] = []
+        sample_area_box_patch: list[float] = []
         sample_volume_box_quadrature: list[float] = []
 
         for shape_idx in indices:
@@ -276,7 +282,7 @@ class FSIBoundaryModel:
             y_widths = cls._axis_patch_widths(ys)
             z_widths = cls._axis_patch_widths(zs)
 
-            for point_shape, normal_shape, quadrature_volume in cls._sample_box_surface(
+            for point_shape, normal_shape, patch_area, quadrature_volume in cls._sample_box_surface(
                 hx,
                 hy,
                 hz,
@@ -295,9 +301,17 @@ class FSIBoundaryModel:
                 sample_shape.append(int(shape_idx))
                 sample_x_local.append(cls._vec3_to_tuple(point_parent))
                 sample_normal_local.append(cls._vec3_to_tuple(normal_parent))
+                sample_area_box_patch.append(float(patch_area))
                 sample_volume_box_quadrature.append(float(quadrature_volume))
 
-        return sample_body, sample_shape, sample_x_local, sample_normal_local, sample_volume_box_quadrature
+        return (
+            sample_body,
+            sample_shape,
+            sample_x_local,
+            sample_normal_local,
+            sample_area_box_patch,
+            sample_volume_box_quadrature,
+        )
 
     @classmethod
     def _calibrate_sample_volumes(
@@ -374,6 +388,7 @@ class FSIBoundaryModel:
         model: Model,
         sample_shape: Sequence[int],
         sample_volume: Sequence[float],
+        sample_area_box_patch: Sequence[float],
         sample_volume_box_quadrature: Sequence[float],
         hydrostatic_volume_mode: int,
     ) -> tuple[list[float], list[float]]:
@@ -381,6 +396,7 @@ class FSIBoundaryModel:
             return [], []
 
         raw_volume = np.asarray(sample_volume, dtype=np.float32)
+        area_box_patch = np.asarray(sample_area_box_patch, dtype=np.float32)
         volume_hydrostatic = raw_volume.copy()
         hydrostatic_scale = np.ones(len(sample_volume), dtype=np.float32)
 
@@ -407,12 +423,31 @@ class FSIBoundaryModel:
             if hydrostatic_volume_mode in (
                 int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_VOLUME),
                 int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_QUADRATURE),
+                int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_THICKNESS),
             ):
                 if body_flags is None or (int(body_flags[body]) & int(BodyFlags.KINEMATIC)) != 0:
                     continue
 
             if hydrostatic_volume_mode == int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_QUADRATURE):
                 target_volume = np.asarray(sample_volume_box_quadrature, dtype=np.float32)[indices]
+                volume_hydrostatic[indices] = target_volume
+                hydrostatic_scale[indices] = np.divide(
+                    target_volume,
+                    raw_volume[indices],
+                    out=np.ones_like(target_volume),
+                    where=raw_volume[indices] > 0.0,
+                )
+                continue
+
+            if hydrostatic_volume_mode == int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_THICKNESS):
+                patch_area = area_box_patch[indices]
+                patch_area_sum = float(np.sum(patch_area))
+                raw_sum = float(np.sum(raw_volume[indices]))
+                if patch_area_sum <= 0.0 or raw_sum <= 0.0:
+                    continue
+
+                effective_thickness = raw_sum / patch_area_sum
+                target_volume = patch_area * effective_thickness
                 volume_hydrostatic[indices] = target_volume
                 hydrostatic_scale[indices] = np.divide(
                     target_volume,
@@ -498,7 +533,7 @@ class FSIBoundaryModel:
         y_widths = FSIBoundaryModel._axis_patch_widths(ys) if y_widths is None else y_widths
         z_widths = FSIBoundaryModel._axis_patch_widths(zs) if z_widths is None else z_widths
 
-        samples: list[tuple[tuple[float, float, float], tuple[float, float, float], float]] = []
+        samples: list[tuple[tuple[float, float, float], tuple[float, float, float], float, float]] = []
         for ix, x in enumerate(xs):
             nx = FSIBoundaryModel._surface_axis_normal(ix, len(xs))
             for iy, y in enumerate(ys):
@@ -510,6 +545,17 @@ class FSIBoundaryModel:
 
                     normal = np.array([nx, ny, nz], dtype=np.float32)
                     normal /= np.linalg.norm(normal)
+                    patch_area = FSIBoundaryModel._box_surface_patch_area(
+                        ix,
+                        iy,
+                        iz,
+                        len(xs),
+                        len(ys),
+                        len(zs),
+                        x_widths,
+                        y_widths,
+                        z_widths,
+                    )
                     quadrature_volume = FSIBoundaryModel._box_surface_quadrature_volume(
                         ix,
                         iy,
@@ -528,6 +574,7 @@ class FSIBoundaryModel:
                         (
                             (float(x), float(y), float(z)),
                             tuple(float(v) for v in normal),
+                            patch_area,
                             quadrature_volume,
                         )
                     )
@@ -578,6 +625,27 @@ class FSIBoundaryModel:
         if FSIBoundaryModel._surface_axis_normal(iz, z_count) != 0.0:
             volume += (hz / 3.0) * float(x_widths[ix]) * float(y_widths[iy])
         return volume
+
+    @staticmethod
+    def _box_surface_patch_area(
+        ix: int,
+        iy: int,
+        iz: int,
+        x_count: int,
+        y_count: int,
+        z_count: int,
+        x_widths: np.ndarray,
+        y_widths: np.ndarray,
+        z_widths: np.ndarray,
+    ) -> float:
+        area = 0.0
+        if FSIBoundaryModel._surface_axis_normal(ix, x_count) != 0.0:
+            area += float(y_widths[iy]) * float(z_widths[iz])
+        if FSIBoundaryModel._surface_axis_normal(iy, y_count) != 0.0:
+            area += float(x_widths[ix]) * float(z_widths[iz])
+        if FSIBoundaryModel._surface_axis_normal(iz, z_count) != 0.0:
+            area += float(x_widths[ix]) * float(y_widths[iy])
+        return area
 
     @staticmethod
     def _surface_axis_normal(index: int, count: int) -> float:
