@@ -25,7 +25,7 @@ import numpy as np
 import warp as wp
 
 from ...geometry import GeoType
-from ...sim import Model, State
+from ...sim import BodyFlags, Model, State
 from .boundary_kernels import update_boundary_sample_world_kinematics
 
 __all__ = [
@@ -57,6 +57,9 @@ class FSIBoundaryModel:
         kernel_family: SPH kernel used to calibrate Akinci-style sample
             volumes. Defaults to cubic spline and should usually match the
             fluid solver kernel family.
+        hydrostatic_volume_mode: Optional hydrostatic normalization applied to
+            boundary sample volumes before they are consumed by density and
+            pressure-coupling paths.
         shape_indices: Optional subset of shape indices to sample.
         include_static: Whether static shapes with ``shape_body == -1`` are sampled.
         include_dynamic: Whether body-attached shapes are sampled.
@@ -72,6 +75,12 @@ class FSIBoundaryModel:
         CUBIC_SPLINE = 0
         POLY6 = 1
 
+    class HydrostaticVolumeMode(IntEnum):
+        """Selectable hydrostatic-normalization modes for boundary shells."""
+
+        NONE = 0
+        DYNAMIC_BOX_VOLUME = 1
+
     def __init__(
         self,
         model: Model,
@@ -79,6 +88,7 @@ class FSIBoundaryModel:
         *,
         support_radius: float | None = None,
         kernel_family: KernelFamily = KernelFamily.CUBIC_SPLINE,
+        hydrostatic_volume_mode: HydrostaticVolumeMode = HydrostaticVolumeMode.NONE,
         shape_indices: Sequence[int] | None = None,
         include_static: bool = True,
         include_dynamic: bool = True,
@@ -94,6 +104,7 @@ class FSIBoundaryModel:
             raise ValueError("Boundary sample support radius must be positive.")
 
         self.kernel_family = int(self.KernelFamily(kernel_family))
+        self.hydrostatic_volume_mode = int(self.HydrostaticVolumeMode(hydrostatic_volume_mode))
         self.device = wp.get_device(device if device is not None else model.device)
 
         sample_body, sample_shape, sample_x_local, sample_normal_local = self._sample_model_boxes(
@@ -108,6 +119,12 @@ class FSIBoundaryModel:
             sample_x_local,
             self.support_radius,
             self.kernel_family,
+        )
+        sample_volume_hydrostatic, sample_volume_hydrostatic_scale = self._compute_hydrostatic_sample_volumes(
+            model,
+            sample_shape,
+            sample_volume,
+            self.hydrostatic_volume_mode,
         )
 
         self.sample_count = len(sample_body)
@@ -130,6 +147,12 @@ class FSIBoundaryModel:
         self.sample_x_local = wp.array(sample_x_local, dtype=wp.vec3, device=self.device)
         self.sample_normal_local = wp.array(sample_normal_local, dtype=wp.vec3, device=self.device)
         self.sample_volume = wp.array(sample_volume, dtype=float, device=self.device)
+        self.sample_volume_hydrostatic = wp.array(sample_volume_hydrostatic, dtype=float, device=self.device)
+        self.sample_volume_hydrostatic_scale = wp.array(
+            sample_volume_hydrostatic_scale,
+            dtype=float,
+            device=self.device,
+        )
         self.sample_mass_equiv = wp.zeros(self.sample_count, dtype=float, device=self.device)
 
         self.sample_x_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
@@ -310,6 +333,61 @@ class FSIBoundaryModel:
                 )
 
         return delta.astype(np.float32)
+
+    @classmethod
+    def _compute_hydrostatic_sample_volumes(
+        cls,
+        model: Model,
+        sample_shape: Sequence[int],
+        sample_volume: Sequence[float],
+        hydrostatic_volume_mode: int,
+    ) -> tuple[list[float], list[float]]:
+        if len(sample_volume) == 0:
+            return [], []
+
+        volume_hydrostatic = np.asarray(sample_volume, dtype=np.float32).copy()
+        hydrostatic_scale = np.ones(len(sample_volume), dtype=np.float32)
+
+        if hydrostatic_volume_mode == int(cls.HydrostaticVolumeMode.NONE):
+            return volume_hydrostatic.tolist(), hydrostatic_scale.tolist()
+
+        shape_body = model.shape_body.numpy()
+        shape_type = model.shape_type.numpy()
+        shape_scale = model.shape_scale.numpy()
+        body_flags = model.body_flags.numpy() if model.body_flags is not None else None
+
+        sample_indices_by_shape: dict[int, list[int]] = {}
+        for sample_index, shape_index in enumerate(sample_shape):
+            sample_indices_by_shape.setdefault(int(shape_index), []).append(sample_index)
+
+        for shape_index, indices in sample_indices_by_shape.items():
+            if int(shape_type[shape_index]) != int(GeoType.BOX):
+                continue
+
+            body = int(shape_body[shape_index])
+            if body < 0:
+                continue
+
+            if hydrostatic_volume_mode == int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_VOLUME):
+                if body_flags is None or (int(body_flags[body]) & int(BodyFlags.KINEMATIC)) != 0:
+                    continue
+
+            hx = float(shape_scale[shape_index][0])
+            hy = float(shape_scale[shape_index][1])
+            hz = float(shape_scale[shape_index][2])
+            target_volume = 8.0 * hx * hy * hz
+            if target_volume <= 0.0:
+                continue
+
+            raw_sum = float(np.sum(volume_hydrostatic[indices]))
+            if raw_sum <= 0.0:
+                continue
+
+            scale = target_volume / raw_sum
+            volume_hydrostatic[indices] *= scale
+            hydrostatic_scale[indices] = scale
+
+        return volume_hydrostatic.tolist(), hydrostatic_scale.tolist()
 
     @classmethod
     def _kernel_value_numpy(

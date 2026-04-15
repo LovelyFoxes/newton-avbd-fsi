@@ -349,6 +349,7 @@ def run_boundary_density_step(
     boundary_spacing: float = 0.25,
     boundary_body: str = "static",
     static_boundary_weight: float = 1.0,
+    hydrostatic_volume_mode: FSIBoundaryModel.HydrostaticVolumeMode = FSIBoundaryModel.HydrostaticVolumeMode.NONE,
 ):
     """Run a zero-iteration IPBF step near a sampled box boundary."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -392,6 +393,7 @@ def run_boundary_density_step(
             model,
             spacing=boundary_spacing,
             support_radius=0.6,
+            hydrostatic_volume_mode=hydrostatic_volume_mode,
             include_static=boundary_body == "static",
             include_dynamic=boundary_body == "dynamic",
             device=device,
@@ -880,6 +882,37 @@ def test_ipbf_static_boundary_weight_does_not_change_dynamic_density_contributio
         full_solver._boundary_density.numpy(),
         rtol=1.0e-6,
         atol=1.0e-6,
+    )
+
+
+def test_ipbf_dynamic_boundary_hydrostatic_volume_mode_scales_density_contributions(test, device):
+    _, raw_solver = run_boundary_density_step(
+        device,
+        use_boundary_model=True,
+        boundary_body="dynamic",
+        hydrostatic_volume_mode=FSIBoundaryModel.HydrostaticVolumeMode.NONE,
+    )
+    _, normalized_solver = run_boundary_density_step(
+        device,
+        use_boundary_model=True,
+        boundary_body="dynamic",
+        hydrostatic_volume_mode=FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_BOX_VOLUME,
+    )
+
+    raw_boundary_density = raw_solver._boundary_density.numpy()
+    normalized_boundary_density = normalized_solver._boundary_density.numpy()
+    raw_sample_volume_sum = float(np.sum(raw_solver.boundary_model.sample_volume.numpy()))
+    normalized_sample_volume_sum = float(np.sum(normalized_solver.boundary_model.sample_volume_hydrostatic.numpy()))
+    expected_scale = normalized_sample_volume_sum / raw_sample_volume_sum
+
+    test.assertTrue(np.all(raw_boundary_density > 0.0))
+    test.assertTrue(np.all(normalized_boundary_density > 0.0))
+    test.assertLess(expected_scale, 1.0)
+    np.testing.assert_allclose(
+        normalized_boundary_density,
+        expected_scale * raw_boundary_density,
+        rtol=1.0e-5,
+        atol=1.0e-5,
     )
 
 
@@ -1628,6 +1661,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_static_boundary_weight_does_not_change_dynamic_density_contributions",
     test_ipbf_static_boundary_weight_does_not_change_dynamic_density_contributions,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_dynamic_boundary_hydrostatic_volume_mode_scales_density_contributions",
+    test_ipbf_dynamic_boundary_hydrostatic_volume_mode_scales_density_contributions,
     devices=devices,
     check_output=False,
 )

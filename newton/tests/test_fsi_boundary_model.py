@@ -125,6 +125,42 @@ def test_static_box_samples_do_not_require_bodies(test: unittest.TestCase, devic
     np.testing.assert_allclose(np.mean(x_world, axis=0), [1.0, 2.0, 3.0], atol=1.0e-6)
 
 
+def test_dynamic_box_hydrostatic_volume_matches_geometric_volume(test: unittest.TestCase, device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    dynamic_body = builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()))
+    kinematic_body = builder.add_body(
+        xform=wp.transform(wp.vec3(2.0, 0.0, 0.0), wp.quat_identity()),
+        is_kinematic=True,
+    )
+    builder.add_shape_box(dynamic_body, hx=0.5, hy=0.25, hz=0.25)
+    builder.add_shape_box(kinematic_body, hx=0.5, hy=0.25, hz=0.25)
+    model = builder.finalize(device=device)
+
+    boundary = FSIBoundaryModel(
+        model,
+        spacing=0.25,
+        support_radius=0.5,
+        hydrostatic_volume_mode=FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_BOX_VOLUME,
+        device=device,
+    )
+
+    sample_body = boundary.sample_body.numpy()
+    raw_volume = boundary.sample_volume.numpy()
+    hydrostatic_volume = boundary.sample_volume_hydrostatic.numpy()
+    hydrostatic_scale = boundary.sample_volume_hydrostatic_scale.numpy()
+    expected_volume = 8.0 * 0.5 * 0.25 * 0.25
+
+    dynamic_mask = sample_body == dynamic_body
+    kinematic_mask = sample_body == kinematic_body
+
+    test.assertTrue(np.all(dynamic_mask | kinematic_mask))
+    test.assertNotAlmostEqual(float(np.sum(raw_volume[dynamic_mask])), expected_volume, places=3)
+    np.testing.assert_allclose(np.sum(hydrostatic_volume[dynamic_mask]), expected_volume, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(hydrostatic_volume[kinematic_mask], raw_volume[kinematic_mask], rtol=1.0e-6, atol=1.0e-6)
+    test.assertTrue(np.all(hydrostatic_scale[dynamic_mask] > 0.0))
+    np.testing.assert_allclose(hydrostatic_scale[kinematic_mask], np.ones_like(hydrostatic_scale[kinematic_mask]))
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -143,6 +179,13 @@ add_function_test(
     TestFSIBoundaryModel,
     "test_static_box_samples_do_not_require_bodies",
     test_static_box_samples_do_not_require_bodies,
+    devices=devices,
+)
+
+add_function_test(
+    TestFSIBoundaryModel,
+    "test_dynamic_box_hydrostatic_volume_matches_geometric_volume",
+    test_dynamic_box_hydrostatic_volume_matches_geometric_volume,
     devices=devices,
 )
 
