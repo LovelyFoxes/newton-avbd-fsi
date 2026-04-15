@@ -24,6 +24,7 @@ from ...geometry import ParticleFlags
 KERNEL_FAMILY_CUBIC_SPLINE = 0
 KERNEL_FAMILY_POLY6 = 1
 _BOUNDARY_SAMPLE_ACTIVE = wp.constant(1)
+_BOUNDARY_SAMPLE_STATIC = wp.constant(1 << 1)
 
 
 @wp.func
@@ -244,6 +245,15 @@ def body_reaction_torque_from_world_point(
     return wp.cross(world_point - com_world, reaction_force)
 
 
+@wp.func
+def boundary_density_pressure_weight(boundary_flag: int, static_boundary_weight: float) -> float:
+    """Return the diagnostic density/pressure weight for a boundary sample."""
+    if (boundary_flag & _BOUNDARY_SAMPLE_STATIC) != 0:
+        return static_boundary_weight
+
+    return 1.0
+
+
 @wp.kernel
 def predict_inertial_positions(
     particle_q: wp.array(dtype=wp.vec3),
@@ -327,6 +337,7 @@ def initialize_density_and_neighbor_count_with_boundary(
     boundary_x: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    static_boundary_weight: float,
     rest_density: float,
     support_radius: float,
     kernel_family: int,
@@ -354,7 +365,11 @@ def initialize_density_and_neighbor_count_with_boundary(
     index = int(0)
 
     while wp.hash_grid_query_next(query, index):
-        if (boundary_flags[index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        boundary_flag = boundary_flags[index]
+        if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+        weight = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+        if weight == 0.0:
             continue
 
         dist = xi - boundary_x[index]
@@ -363,7 +378,7 @@ def initialize_density_and_neighbor_count_with_boundary(
         if kernel <= 0.0:
             continue
 
-        rho_boundary += rest_density * boundary_volume[index] * kernel
+        rho_boundary += weight * rest_density * boundary_volume[index] * kernel
         boundary_count += 1
 
     density[tid] = rho + rho_boundary
@@ -405,6 +420,7 @@ def initialize_constraint_and_gradient_with_boundary(
     boundary_x: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    static_boundary_weight: float,
     density: wp.array(dtype=float),
     rest_density: float,
     support_radius: float,
@@ -434,11 +450,20 @@ def initialize_constraint_and_gradient_with_boundary(
     index = int(0)
 
     while wp.hash_grid_query_next(query, index):
-        if (boundary_flags[index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        boundary_flag = boundary_flags[index]
+        if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+        weight = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+        if weight == 0.0:
             continue
 
         displacement = xi - boundary_x[index]
-        grad += rest_density * boundary_volume[index] * kernel_gradient(displacement, support_radius, kernel_family)
+        grad += (
+            weight
+            * rest_density
+            * boundary_volume[index]
+            * kernel_gradient(displacement, support_radius, kernel_family)
+        )
 
     constraint[tid] = c
     constraint_gradient[tid] = grad / rest_density
@@ -505,6 +530,7 @@ def compute_density_and_neighbor_count_with_boundary(
     boundary_x: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    static_boundary_weight: float,
     rest_density: float,
     support_radius: float,
     kernel_family: int,
@@ -555,7 +581,11 @@ def compute_density_and_neighbor_count_with_boundary(
     boundary_index = int(0)
 
     while wp.hash_grid_query_next(boundary_query, boundary_index):
-        if (boundary_flags[boundary_index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        boundary_flag = boundary_flags[boundary_index]
+        if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+        weight = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+        if weight == 0.0:
             continue
 
         dist = xi - boundary_x[boundary_index]
@@ -564,7 +594,7 @@ def compute_density_and_neighbor_count_with_boundary(
         if kernel <= 0.0:
             continue
 
-        rho_boundary += rest_density * boundary_volume[boundary_index] * kernel
+        rho_boundary += weight * rest_density * boundary_volume[boundary_index] * kernel
         boundary_count += 1
 
     density[tid] = rho + rho_boundary
@@ -635,6 +665,7 @@ def compute_constraint_and_gradient_with_boundary(
     boundary_x: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    static_boundary_weight: float,
     density: wp.array(dtype=float),
     rest_density: float,
     support_radius: float,
@@ -679,12 +710,17 @@ def compute_constraint_and_gradient_with_boundary(
     boundary_index = int(0)
 
     while wp.hash_grid_query_next(boundary_query, boundary_index):
-        if (boundary_flags[boundary_index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        boundary_flag = boundary_flags[boundary_index]
+        if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+        weight = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+        if weight == 0.0:
             continue
 
         displacement = xi - boundary_x[boundary_index]
         grad += (
-            rest_density
+            weight
+            * rest_density
             * boundary_volume[boundary_index]
             * kernel_gradient(displacement, support_radius, kernel_family)
         )
@@ -912,6 +948,7 @@ def accumulate_boundary_pressure_reaction(
     body_com: wp.array(dtype=wp.vec3),
     support_radius: float,
     kernel_family: int,
+    static_boundary_weight: float,
     dt: float,
     solve_relaxation: float,
     reaction_relaxation: float,
@@ -937,11 +974,17 @@ def accumulate_boundary_pressure_reaction(
     boundary_index = int(0)
 
     while wp.hash_grid_query_next(query, boundary_index):
-        if (boundary_flags[boundary_index] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        boundary_flag = boundary_flags[boundary_index]
+        if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+        weight = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+        if weight == 0.0:
             continue
 
         displacement = xi - boundary_x[boundary_index]
-        boundary_grad = boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
+        boundary_grad = (
+            weight * boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
+        )
         if wp.dot(boundary_grad, boundary_grad) == 0.0:
             continue
 

@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import argparse
 import math
 
 import numpy as np
@@ -111,6 +112,12 @@ class Example:
             help="Override the delay before the moving wall starts oscillating [s].",
         )
         parser.add_argument(
+            "--wall-motion",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Enable or disable kinematic moving-wall motion.",
+        )
+        parser.add_argument(
             "--box-offset-x",
             type=float,
             default=None,
@@ -133,6 +140,18 @@ class Example:
             action="store_true",
             help="Enable per-frame host-side diagnostics in interactive runs.",
         )
+        parser.add_argument(
+            "--include-static-boundary-samples",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Include static container walls in the FSI boundary-sample density/pressure path.",
+        )
+        parser.add_argument(
+            "--static-boundary-weight",
+            type=float,
+            default=None,
+            help="Diagnostic weight applied only to static boundary-sample density/pressure contributions.",
+        )
         return parser
 
     def _get_scene_config(self) -> dict[str, object]:
@@ -147,6 +166,7 @@ class Example:
         box_offset_x_override = getattr(self.args, "box_offset_x", None)
         box_bottom_gap_override = getattr(self.args, "box_bottom_gap", None)
         box_density_override = getattr(self.args, "box_density", None)
+        static_boundary_weight_override = getattr(self.args, "static_boundary_weight", None)
 
         if bool(getattr(self.args, "test", False)):
             config = {
@@ -185,6 +205,7 @@ class Example:
                     0.12 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
                 ),
                 "pressure_reaction_relaxation": (0.50 if pressure_relaxation is None else float(pressure_relaxation)),
+                "static_boundary_weight": 1.0,
                 "expected_min_box_shift": 0.01,
                 "expected_min_box_force_norm": 0.50,
                 "expected_min_sample_force_norm": 0.02,
@@ -226,6 +247,7 @@ class Example:
                     0.16 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
                 ),
                 "pressure_reaction_relaxation": (0.50 if pressure_relaxation is None else float(pressure_relaxation)),
+                "static_boundary_weight": 1.0,
                 "expected_min_box_shift": 0.0,
                 "expected_min_box_force_norm": 0.0,
                 "expected_min_sample_force_norm": 0.0,
@@ -247,6 +269,8 @@ class Example:
             config["box_bottom_gap"] = float(box_bottom_gap_override)
         if box_density_override is not None:
             config["box_density"] = float(box_density_override)
+        if static_boundary_weight_override is not None:
+            config["static_boundary_weight"] = float(static_boundary_weight_override)
 
         return config
 
@@ -259,6 +283,8 @@ class Example:
         self.viewer._paused = True
         self.args = args
         self._reset_key_prev = False
+        self.wall_motion_enabled = bool(getattr(self.args, "wall_motion", True))
+        self.include_static_boundary_samples = bool(getattr(self.args, "include_static_boundary_samples", False))
         self.config = self._get_scene_config()
         self.sim_substeps = int(self.config["sim_substeps"])
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -291,7 +317,7 @@ class Example:
             self.model,
             spacing=float(self.config["boundary_spacing"]),
             support_radius=float(self.config["smoothing_radius"]),
-            include_static=False,
+            include_static=self.include_static_boundary_samples,
             include_dynamic=True,
             device=self.model.device,
         )
@@ -308,6 +334,7 @@ class Example:
                 fsi_projection_reaction_relaxation=float(self.config["projection_reaction_relaxation"]),
                 fsi_velocity_projection_reaction_relaxation=float(self.config["velocity_reaction_relaxation"]),
                 fsi_pressure_reaction_relaxation=float(self.config["pressure_reaction_relaxation"]),
+                fsi_static_boundary_weight=float(self.config["static_boundary_weight"]),
             ),
             boundary_model=self.boundary_model,
         )
@@ -524,6 +551,8 @@ class Example:
 
     def _moving_wall_state(self, time_s: float) -> tuple[float, float]:
         start_x = self.container_half_width + self.wall_thickness
+        if not self.wall_motion_enabled or self.wall_travel == 0.0 or self.wall_frequency == 0.0:
+            return start_x, 0.0
         if time_s <= self.wall_start_delay:
             return start_x, 0.0
         omega = 2.0 * math.pi * self.wall_frequency
@@ -571,6 +600,9 @@ class Example:
     def gui(self, ui):
         if ui.button("Reset"):
             self.reset()
+        ui.text(f"Wall motion: {'on' if self.wall_motion_enabled else 'off'}")
+        ui.text(f"Static boundary samples: {'on' if self.include_static_boundary_samples else 'off'}")
+        ui.text(f"Static boundary weight: {float(self.config['static_boundary_weight']):.2f}")
         ui.text(f"Wall travel: {self.wall_travel:.3f} m")
         ui.text(f"Wall frequency: {self.wall_frequency:.2f} Hz")
         ui.text(f"Wall start delay: {self.wall_start_delay:.2f} s")
@@ -665,6 +697,92 @@ class Example:
                     float(np.linalg.norm(float_box_sample_force, axis=1).max()),
                 )
 
+    def estimate_free_surface_level(
+        self,
+        *,
+        surface_quantile: float = 0.98,
+        exclusion_scale: float = 1.5,
+        wall_margin_scale: float = 2.0,
+    ) -> float:
+        """Estimate the free-surface height away from the floating box."""
+        particle_q = self.state_0.particle_q.numpy()
+        particle_radius = self.model.particle_radius.numpy()
+        particle_top = particle_q[:, 1] + particle_radius
+        body_q = self.state_0.body_q.numpy()
+
+        box_x = float(body_q[self.float_box_body, 0])
+        box_z = float(body_q[self.float_box_body, 2])
+        exclusion_x = float(self.box_half_extent[0]) * exclusion_scale
+        exclusion_z = float(self.box_half_extent[2]) * exclusion_scale
+        right_interior_x = self.current_right_wall_center_x - self.wall_thickness
+        wall_margin = max(float(self.config["cell"]) * wall_margin_scale, float(self.wall_thickness))
+
+        mask = ~((np.abs(particle_q[:, 0] - box_x) <= exclusion_x) & (np.abs(particle_q[:, 2] - box_z) <= exclusion_z))
+        mask &= particle_q[:, 0] >= -self.container_half_width + wall_margin
+        mask &= particle_q[:, 0] <= right_interior_x - wall_margin
+        mask &= np.abs(particle_q[:, 2]) <= self.container_half_depth - wall_margin
+
+        candidates = particle_top[mask]
+        if candidates.size < max(16, self.model.particle_count // 40):
+            candidates = particle_top
+        return float(np.quantile(candidates, surface_quantile))
+
+    def estimate_submerged_fraction(
+        self,
+        *,
+        surface_quantile: float = 0.98,
+        exclusion_scale: float = 1.5,
+    ) -> float:
+        """Estimate the current submerged volume fraction of the floating box."""
+        body_q = self.state_0.body_q.numpy()
+        box_center_y = float(body_q[self.float_box_body, 1])
+        box_bottom = box_center_y - float(self.box_half_extent[1])
+        box_height = 2.0 * float(self.box_half_extent[1])
+        free_surface_y = self.estimate_free_surface_level(
+            surface_quantile=surface_quantile,
+            exclusion_scale=exclusion_scale,
+        )
+        return float(np.clip((free_surface_y - box_bottom) / max(box_height, 1.0e-8), 0.0, 1.0))
+
+    def theoretical_submerged_fraction(self) -> float:
+        """Return the buoyancy-theory submerged fraction rho_box / rho_fluid."""
+        return float(
+            np.clip(
+                float(self.config["box_density"]) / max(float(self.config["rest_density"]), 1.0e-8),
+                0.0,
+                1.0,
+            )
+        )
+
+    def get_buoyancy_metrics(
+        self,
+        *,
+        surface_quantile: float = 0.98,
+        exclusion_scale: float = 1.5,
+    ) -> dict[str, float]:
+        """Return buoyancy-related diagnostics for the floating box."""
+        body_q = self.state_0.body_q.numpy()
+        box_center_y = float(body_q[self.float_box_body, 1])
+        box_bottom = box_center_y - float(self.box_half_extent[1])
+        box_top = box_center_y + float(self.box_half_extent[1])
+        free_surface_y = self.estimate_free_surface_level(
+            surface_quantile=surface_quantile,
+            exclusion_scale=exclusion_scale,
+        )
+        measured_submerged_fraction = self.estimate_submerged_fraction(
+            surface_quantile=surface_quantile,
+            exclusion_scale=exclusion_scale,
+        )
+        theoretical_submerged_fraction = self.theoretical_submerged_fraction()
+        return {
+            "free_surface_y": free_surface_y,
+            "box_bottom_y": box_bottom,
+            "box_top_y": box_top,
+            "measured_submerged_fraction": measured_submerged_fraction,
+            "theoretical_submerged_fraction": theoretical_submerged_fraction,
+            "submerged_fraction_error": measured_submerged_fraction - theoretical_submerged_fraction,
+        }
+
     def simulate(self):
         for substep in range(self.sim_substeps):
             self.state_0.clear_forces()
@@ -697,6 +815,28 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
+        if not self.wall_motion_enabled:
+            buoyancy = self.get_buoyancy_metrics(surface_quantile=0.95)
+            free_surface_y = float(buoyancy["free_surface_y"])
+            box_bottom_y = float(buoyancy["box_bottom_y"])
+            measured_submerged_fraction = float(buoyancy["measured_submerged_fraction"])
+            assert self.states_remain_finite, "simulation produced non-finite particle/body state"
+            assert self.max_density > 0.0, "IPBF density diagnostics were not updated"
+            assert self.max_density_ratio < 2.0, (
+                f"static buoyancy density ratio is too large: rho/rho0={self.max_density_ratio:.3f}"
+            )
+            assert self.max_particle_speed < 8.0, f"particle speed stayed too high: vmax={self.max_particle_speed:.3f}"
+            assert self.max_box_linear_speed < 4.0, f"box did not settle enough: vmax={self.max_box_linear_speed:.3f}"
+            assert 0.0 < measured_submerged_fraction <= 1.0, (
+                "static buoyancy measurement did not produce a valid submerged fraction: "
+                f"fraction={measured_submerged_fraction:.3f}"
+            )
+            assert box_bottom_y < free_surface_y, (
+                "floating box never entered the fluid during no-wall-motion validation mode: "
+                f"box_bottom={box_bottom_y:.4f}, free_surface={free_surface_y:.4f}"
+            )
+            return
+
         particle_q = self.state_0.particle_q.numpy()
         particle_radius = self.model.particle_radius.numpy()
         particle_top = particle_q[:, 1] + particle_radius

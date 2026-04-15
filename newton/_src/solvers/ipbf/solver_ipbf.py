@@ -126,6 +126,9 @@ class SolverIPBF(SolverBase):
             fsi_pressure_reaction_relaxation: Unitless multiplier applied when
                 converting boundary pressure-gradient position increments into
                 FSI body reaction forces and torques.
+            fsi_static_boundary_weight: Unitless diagnostic multiplier applied
+                only to static boundary-sample contributions in the density,
+                constraint-gradient, and pressure-reaction path.
         """
 
         class KernelFamily(IntEnum):
@@ -151,6 +154,7 @@ class SolverIPBF(SolverBase):
         fsi_projection_reaction_relaxation: float | None = None
         fsi_velocity_projection_reaction_relaxation: float | None = None
         fsi_pressure_reaction_relaxation: float = 1.0
+        fsi_static_boundary_weight: float = 1.0
 
     @override
     @classmethod
@@ -339,6 +343,9 @@ class SolverIPBF(SolverBase):
             else (legacy_reaction_relaxation if legacy_reaction_relaxation is not None else 1.0)
         )
         self.fsi_pressure_reaction_relaxation = float(self.config.fsi_pressure_reaction_relaxation)
+        self.fsi_static_boundary_weight = float(self.config.fsi_static_boundary_weight)
+        if self.fsi_static_boundary_weight < 0.0:
+            raise ValueError("IPBF static boundary weight must be non-negative.")
         self.boundary_model = None
         self.set_boundary_model(boundary_model)
 
@@ -761,6 +768,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume,
                         boundary_model.sample_flags,
+                        self.fsi_static_boundary_weight,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
@@ -787,6 +795,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume,
                         boundary_model.sample_flags,
+                        self.fsi_static_boundary_weight,
                         state.ipbf.density,
                         self.rest_density,
                         self.smoothing_radius,
@@ -844,6 +853,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume,
                         boundary_model.sample_flags,
+                        self.fsi_static_boundary_weight,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
@@ -867,6 +877,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume,
                         boundary_model.sample_flags,
+                        self.fsi_static_boundary_weight,
                         state.ipbf.density,
                         self.rest_density,
                         self.smoothing_radius,
@@ -1218,6 +1229,7 @@ class SolverIPBF(SolverBase):
                 model.body_com if model.body_com is not None else boundary_model._empty_body_com,
                 self.smoothing_radius,
                 self.kernel_family,
+                self.fsi_static_boundary_weight,
                 dt,
                 self.relaxation,
                 self.fsi_pressure_reaction_relaxation,

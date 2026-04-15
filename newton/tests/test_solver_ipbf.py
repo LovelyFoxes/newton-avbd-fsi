@@ -342,8 +342,15 @@ def run_single_particle_ground_step(device, *, use_contacts: bool):
     return state_1, contacts
 
 
-def run_boundary_density_step(device, *, use_boundary_model: bool, boundary_spacing: float = 0.25):
-    """Run a zero-iteration IPBF step near a static box boundary."""
+def run_boundary_density_step(
+    device,
+    *,
+    use_boundary_model: bool,
+    boundary_spacing: float = 0.25,
+    boundary_body: str = "static",
+    static_boundary_weight: float = 1.0,
+):
+    """Run a zero-iteration IPBF step near a sampled box boundary."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
     SolverIPBF.register_custom_attributes(builder)
 
@@ -359,8 +366,17 @@ def run_boundary_density_step(device, *, use_boundary_model: bool, boundary_spac
         mass=[1.0, 1.0],
         radius=[0.05, 0.05],
     )
+    box_body = -1
+    if boundary_body == "dynamic":
+        box_body = builder.add_body(
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            mass=1.0,
+        )
+    elif boundary_body != "static":
+        raise ValueError(f"Unsupported boundary_body: {boundary_body}")
+
     builder.add_shape_box(
-        body=-1,
+        body=box_body,
         xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
         hx=0.25,
         hy=0.25,
@@ -372,7 +388,14 @@ def run_boundary_density_step(device, *, use_boundary_model: bool, boundary_spac
 
     boundary_model = None
     if use_boundary_model:
-        boundary_model = FSIBoundaryModel(model, spacing=boundary_spacing, support_radius=0.6, device=device)
+        boundary_model = FSIBoundaryModel(
+            model,
+            spacing=boundary_spacing,
+            support_radius=0.6,
+            include_static=boundary_body == "static",
+            include_dynamic=boundary_body == "dynamic",
+            device=device,
+        )
 
     solver = SolverIPBF(
         model,
@@ -382,6 +405,7 @@ def run_boundary_density_step(device, *, use_boundary_model: bool, boundary_spac
             hessian_regularization=1.0e-6,
             iterations=0,
             use_constraint_clamp=False,
+            fsi_static_boundary_weight=static_boundary_weight,
         ),
         boundary_model=boundary_model,
     )
@@ -806,6 +830,57 @@ def test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing(test
     test.assertTrue(np.all(coarse_boundary_density > 0.0))
     test.assertTrue(np.all(fine_boundary_density > 0.0))
     np.testing.assert_allclose(coarse_boundary_density, fine_boundary_density, rtol=0.15, atol=1.0e-3)
+
+
+def test_ipbf_static_boundary_weight_scales_static_density_contributions(test, device):
+    _, full_solver = run_boundary_density_step(
+        device,
+        use_boundary_model=True,
+        boundary_body="static",
+        static_boundary_weight=1.0,
+    )
+    _, half_solver = run_boundary_density_step(
+        device,
+        use_boundary_model=True,
+        boundary_body="static",
+        static_boundary_weight=0.5,
+    )
+    _, zero_solver = run_boundary_density_step(
+        device,
+        use_boundary_model=True,
+        boundary_body="static",
+        static_boundary_weight=0.0,
+    )
+
+    full_density = full_solver._boundary_density.numpy()
+    half_density = half_solver._boundary_density.numpy()
+    zero_density = zero_solver._boundary_density.numpy()
+
+    test.assertTrue(np.all(full_density > 0.0))
+    np.testing.assert_allclose(half_density, 0.5 * full_density, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_allclose(zero_density, np.zeros_like(full_density), rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_ipbf_static_boundary_weight_does_not_change_dynamic_density_contributions(test, device):
+    _, full_solver = run_boundary_density_step(
+        device,
+        use_boundary_model=True,
+        boundary_body="dynamic",
+        static_boundary_weight=1.0,
+    )
+    _, zero_solver = run_boundary_density_step(
+        device,
+        use_boundary_model=True,
+        boundary_body="dynamic",
+        static_boundary_weight=0.0,
+    )
+
+    np.testing.assert_allclose(
+        zero_solver._boundary_density.numpy(),
+        full_solver._boundary_density.numpy(),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
 
 
 def test_ipbf_boundary_pressure_reaction_accumulates_body_wrench(test, device):
@@ -1521,6 +1596,38 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_static_shape_boundary_projects_particles_out_of_ground",
     test_ipbf_static_shape_boundary_projects_particles_out_of_ground,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_model_contributes_density_and_gradient",
+    test_ipbf_boundary_model_contributes_density_and_gradient,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing",
+    test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_static_boundary_weight_scales_static_density_contributions",
+    test_ipbf_static_boundary_weight_scales_static_density_contributions,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_static_boundary_weight_does_not_change_dynamic_density_contributions",
+    test_ipbf_static_boundary_weight_does_not_change_dynamic_density_contributions,
     devices=devices,
     check_output=False,
 )
