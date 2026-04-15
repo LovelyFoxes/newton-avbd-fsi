@@ -18,8 +18,9 @@
 #
 # Open-top AVBD/IPBF fluid-solid interaction scene with a kinematic moving
 # wall that pushes a water block toward a floating AVBD box. The right wall
-# performs a smooth inward piston stroke while the light box begins in an
-# approximately buoyant pose with part of its volume above the free surface.
+# performs a continuous smooth oscillation after a short startup delay while the
+# light box begins slightly above the free surface so it can settle into a
+# buoyant state without starting in penetration.
 #
 # Command: python -m newton.examples fsi_ipbf_vbd_moving_wall_float_box
 #
@@ -95,19 +96,31 @@ class Example:
             "--wall-travel",
             type=float,
             default=None,
-            help="Override the inward piston travel of the moving wall [m].",
+            help="Override the oscillation travel of the moving wall [m].",
         )
         parser.add_argument(
-            "--wall-duration",
+            "--wall-frequency",
             type=float,
             default=None,
-            help="Override the duration of the inward piston stroke [s].",
+            help="Override the oscillation frequency of the moving wall [Hz].",
+        )
+        parser.add_argument(
+            "--wall-start-delay",
+            type=float,
+            default=None,
+            help="Override the delay before the moving wall starts oscillating [s].",
         )
         parser.add_argument(
             "--box-offset-x",
             type=float,
             default=None,
             help="Override the initial floating-box center offset along x [m].",
+        )
+        parser.add_argument(
+            "--box-bottom-gap",
+            type=float,
+            default=None,
+            help="Override the initial gap between the water surface and the box bottom [m].",
         )
         parser.add_argument(
             "--box-density",
@@ -129,8 +142,10 @@ class Example:
         ipbf_iterations_override = getattr(self.args, "ipbf_iterations", None)
         sim_substeps_override = getattr(self.args, "sim_substeps", None)
         wall_travel_override = getattr(self.args, "wall_travel", None)
-        wall_duration_override = getattr(self.args, "wall_duration", None)
+        wall_frequency_override = getattr(self.args, "wall_frequency", None)
+        wall_start_delay_override = getattr(self.args, "wall_start_delay", None)
         box_offset_x_override = getattr(self.args, "box_offset_x", None)
+        box_bottom_gap_override = getattr(self.args, "box_bottom_gap", None)
         box_density_override = getattr(self.args, "box_density", None)
 
         if bool(getattr(self.args, "test", False)):
@@ -139,7 +154,7 @@ class Example:
                 "container_half_depth": 0.34,
                 "wall_half_height": 0.66,
                 "pool_dim_x": 16,
-                "pool_dim_y": 5,
+                "pool_dim_y": 8,
                 "pool_dim_z": 12,
                 "cell": 0.04,
                 "mass": 0.064,
@@ -147,8 +162,9 @@ class Example:
                 "smoothing_radius": 0.075,
                 "pool_bottom_clearance": 0.03,
                 "box_half_extent": wp.vec3(0.07, 0.045, 0.07),
-                "box_offset_x": -0.04,
-                "box_density": 300.0,
+                "box_offset_x": -0.06,
+                "box_bottom_gap": 0.02,
+                "box_density": 180.0,
                 "rest_density": 1000.0,
                 "ipbf_iterations": 6,
                 "ipbf_relaxation": 0.5,
@@ -159,15 +175,16 @@ class Example:
                 "xsph": 0.004,
                 "rigid_iterations": 2,
                 "boundary_spacing": 0.04,
-                "wall_travel": 0.08,
-                "wall_duration": 0.40,
+                "wall_travel": 0.06,
+                "wall_frequency": 0.65,
+                "wall_start_delay": 0.45,
                 "projection_reaction_relaxation": (
                     0.15 if projection_relaxation is None else float(projection_relaxation)
                 ),
                 "velocity_reaction_relaxation": (
                     0.12 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
                 ),
-                "pressure_reaction_relaxation": (0.60 if pressure_relaxation is None else float(pressure_relaxation)),
+                "pressure_reaction_relaxation": (0.50 if pressure_relaxation is None else float(pressure_relaxation)),
                 "expected_min_box_shift": 0.01,
                 "expected_min_box_force_norm": 0.50,
                 "expected_min_sample_force_norm": 0.02,
@@ -178,7 +195,7 @@ class Example:
                 "container_half_depth": 0.42,
                 "wall_half_height": 0.92,
                 "pool_dim_x": 60,
-                "pool_dim_y": 10,
+                "pool_dim_y": 16,
                 "pool_dim_z": 48,
                 "cell": 0.014,
                 "mass": 0.002744,
@@ -186,8 +203,9 @@ class Example:
                 "smoothing_radius": 0.025,
                 "pool_bottom_clearance": 0.03,
                 "box_half_extent": wp.vec3(0.09, 0.06, 0.09),
-                "box_offset_x": -0.08,
-                "box_density": 600.0,
+                "box_offset_x": -0.10,
+                "box_bottom_gap": 0.03,
+                "box_density": 100.0,
                 "rest_density": 1000.0,
                 "ipbf_iterations": 2,
                 "ipbf_relaxation": 0.5,
@@ -198,15 +216,16 @@ class Example:
                 "xsph": 0.005,
                 "rigid_iterations": 2,
                 "boundary_spacing": 0.014,
-                "wall_travel": 0.18,
-                "wall_duration": 0.75,
+                "wall_travel": 0.12,
+                "wall_frequency": 0.55,
+                "wall_start_delay": 0.75,
                 "projection_reaction_relaxation": (
                     0.15 if projection_relaxation is None else float(projection_relaxation)
                 ),
                 "velocity_reaction_relaxation": (
                     0.16 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
                 ),
-                "pressure_reaction_relaxation": (0.60 if pressure_relaxation is None else float(pressure_relaxation)),
+                "pressure_reaction_relaxation": (0.50 if pressure_relaxation is None else float(pressure_relaxation)),
                 "expected_min_box_shift": 0.0,
                 "expected_min_box_force_norm": 0.0,
                 "expected_min_sample_force_norm": 0.0,
@@ -218,10 +237,14 @@ class Example:
             config["sim_substeps"] = int(sim_substeps_override)
         if wall_travel_override is not None:
             config["wall_travel"] = float(wall_travel_override)
-        if wall_duration_override is not None:
-            config["wall_duration"] = float(wall_duration_override)
+        if wall_frequency_override is not None:
+            config["wall_frequency"] = float(wall_frequency_override)
+        if wall_start_delay_override is not None:
+            config["wall_start_delay"] = float(wall_start_delay_override)
         if box_offset_x_override is not None:
             config["box_offset_x"] = float(box_offset_x_override)
+        if box_bottom_gap_override is not None:
+            config["box_bottom_gap"] = float(box_bottom_gap_override)
         if box_density_override is not None:
             config["box_density"] = float(box_density_override)
 
@@ -248,7 +271,8 @@ class Example:
         self.velocity_damping = float(self.config["velocity_damping"])
         self.box_half_extent = self.config["box_half_extent"]
         self.wall_travel = float(self.config["wall_travel"])
-        self.wall_duration = float(self.config["wall_duration"])
+        self.wall_frequency = float(self.config["wall_frequency"])
+        self.wall_start_delay = float(self.config["wall_start_delay"])
         self.current_right_wall_center_x = self.container_half_width + self.wall_thickness
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -441,11 +465,7 @@ class Example:
     def _add_float_box(self, builder: newton.ModelBuilder) -> int:
         water_surface_y = self._compute_pool_surface_y()
         hy = float(self.box_half_extent[1])
-        submerged_fraction = min(
-            max(float(self.config["box_density"]) / max(float(self.config["rest_density"]), 1.0e-8), 0.05),
-            0.95,
-        )
-        box_center_y = water_surface_y + hy * (1.0 - 2.0 * submerged_fraction)
+        box_center_y = water_surface_y + float(self.config["box_bottom_gap"]) + hy
         box_center = wp.vec3(float(self.config["box_offset_x"]), box_center_y, 0.0)
 
         box_body = builder.add_body(
@@ -504,14 +524,12 @@ class Example:
 
     def _moving_wall_state(self, time_s: float) -> tuple[float, float]:
         start_x = self.container_half_width + self.wall_thickness
-        if self.wall_duration <= 0.0 or time_s <= 0.0:
+        if time_s <= self.wall_start_delay:
             return start_x, 0.0
-        if time_s >= self.wall_duration:
-            return start_x - self.wall_travel, 0.0
-
-        phase = math.pi * time_s / self.wall_duration
-        center_x = start_x - 0.5 * self.wall_travel * (1.0 - math.cos(phase))
-        velocity_x = -0.5 * self.wall_travel * (math.pi / self.wall_duration) * math.sin(phase)
+        omega = 2.0 * math.pi * self.wall_frequency
+        shifted_time = time_s - self.wall_start_delay
+        center_x = start_x - 0.5 * self.wall_travel * (1.0 - math.cos(omega * shifted_time))
+        velocity_x = -0.5 * self.wall_travel * omega * math.sin(omega * shifted_time)
         return center_x, velocity_x
 
     def _set_moving_wall_state(self, state: newton.State, time_s: float) -> None:
@@ -554,7 +572,8 @@ class Example:
         if ui.button("Reset"):
             self.reset()
         ui.text(f"Wall travel: {self.wall_travel:.3f} m")
-        ui.text(f"Wall duration: {self.wall_duration:.2f} s")
+        ui.text(f"Wall frequency: {self.wall_frequency:.2f} Hz")
+        ui.text(f"Wall start delay: {self.wall_start_delay:.2f} s")
         ui.text(f"Box density: {float(self.config['box_density']):.1f} kg/m^3")
 
     def reset(self):
@@ -685,7 +704,7 @@ class Example:
         box_center_y = float(body_q[self.float_box_body, 1])
         box_bottom = box_center_y - float(self.box_half_extent[1])
         box_top = box_center_y + float(self.box_half_extent[1])
-        upper_bulk_level = float(np.quantile(particle_top, 0.50))
+        upper_bulk_level = float(np.quantile(particle_top, 0.25))
         crest_level = float(np.quantile(particle_top, 0.90))
         right_interior_x = self.current_right_wall_center_x - self.wall_thickness
         max_x = float(np.max(particle_q[:, 0] + particle_radius))
