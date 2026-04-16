@@ -152,7 +152,28 @@ class Example:
             default=None,
             help="Diagnostic weight applied only to static boundary-sample density/pressure contributions.",
         )
+        parser.add_argument(
+            "--hydrostatic-volume-mode",
+            choices=[
+                "raw",
+                "dynamic-box-volume",
+                "dynamic-box-surface-quadrature",
+                "dynamic-box-surface-thickness",
+            ],
+            default="raw",
+            help="Hydrostatic boundary-volume model used for dynamic box boundary samples.",
+        )
         return parser
+
+    @staticmethod
+    def _parse_hydrostatic_volume_mode(mode: str) -> FSIBoundaryModel.HydrostaticVolumeMode:
+        mode_map = {
+            "raw": FSIBoundaryModel.HydrostaticVolumeMode.NONE,
+            "dynamic-box-volume": FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_BOX_VOLUME,
+            "dynamic-box-surface-quadrature": FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_QUADRATURE,
+            "dynamic-box-surface-thickness": FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_THICKNESS,
+        }
+        return mode_map[str(mode)]
 
     def _get_scene_config(self) -> dict[str, object]:
         projection_relaxation = getattr(self.args, "projection_reaction_relaxation", None)
@@ -285,6 +306,9 @@ class Example:
         self._reset_key_prev = False
         self.wall_motion_enabled = bool(getattr(self.args, "wall_motion", True))
         self.include_static_boundary_samples = bool(getattr(self.args, "include_static_boundary_samples", False))
+        self.hydrostatic_volume_mode = self._parse_hydrostatic_volume_mode(
+            getattr(self.args, "hydrostatic_volume_mode", "raw")
+        )
         self.config = self._get_scene_config()
         self.sim_substeps = int(self.config["sim_substeps"])
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -317,6 +341,7 @@ class Example:
             self.model,
             spacing=float(self.config["boundary_spacing"]),
             support_radius=float(self.config["smoothing_radius"]),
+            hydrostatic_volume_mode=self.hydrostatic_volume_mode,
             include_static=self.include_static_boundary_samples,
             include_dynamic=True,
             device=self.model.device,
@@ -603,6 +628,7 @@ class Example:
         ui.text(f"Wall motion: {'on' if self.wall_motion_enabled else 'off'}")
         ui.text(f"Static boundary samples: {'on' if self.include_static_boundary_samples else 'off'}")
         ui.text(f"Static boundary weight: {float(self.config['static_boundary_weight']):.2f}")
+        ui.text(f"Hydrostatic mode: {self.args.hydrostatic_volume_mode!s}")
         ui.text(f"Wall travel: {self.wall_travel:.3f} m")
         ui.text(f"Wall frequency: {self.wall_frequency:.2f} Hz")
         ui.text(f"Wall start delay: {self.wall_start_delay:.2f} s")
