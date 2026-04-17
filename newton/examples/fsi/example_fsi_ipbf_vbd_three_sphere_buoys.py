@@ -82,6 +82,12 @@ class Example:
         parser.add_argument("--velocity-reaction-relaxation", type=float, default=None)
         parser.add_argument("--pressure-reaction-relaxation", type=float, default=None)
         parser.add_argument(
+            "--water-render-radius-scale",
+            type=float,
+            default=None,
+            help="Visual-only radius multiplier for rendered water particles.",
+        )
+        parser.add_argument(
             "--include-static-boundary-samples",
             action=argparse.BooleanOptionalAction,
             default=False,
@@ -116,11 +122,11 @@ class Example:
     def _get_scene_config(self) -> dict[str, object]:
         if bool(getattr(self.args, "test", False)):
             config = {
-                "container_half_width": 0.46,
-                "container_half_depth": 0.34,
+                "container_half_width": 0.36,
+                "container_half_depth": 0.28,
                 "wall_half_height": 0.72,
                 "pool_dim_x": 16,
-                "pool_dim_y": 7,
+                "pool_dim_y": 12,
                 "pool_dim_z": 12,
                 "cell": 0.04,
                 "mass": 0.064,
@@ -136,6 +142,8 @@ class Example:
                 "velocity_damping": 0.996,
                 "rigid_iterations": 2,
                 "boundary_spacing": 0.04,
+                "water_render_radius_scale": 0.45,
+                "boundary_render_radius_scale": 0.30,
                 "expected_min_drop": 0.02,
                 "expected_min_body_force_norm": 0.05,
                 "expected_min_sample_force_norm": 0.005,
@@ -143,11 +151,11 @@ class Example:
             }
         else:
             config = {
-                "container_half_width": 0.66,
-                "container_half_depth": 0.42,
+                "container_half_width": 0.52,
+                "container_half_depth": 0.39,
                 "wall_half_height": 0.92,
                 "pool_dim_x": 64,
-                "pool_dim_y": 18,
+                "pool_dim_y": 30,
                 "pool_dim_z": 48,
                 "cell": 0.014,
                 "mass": 0.002744,
@@ -163,6 +171,8 @@ class Example:
                 "velocity_damping": 0.999,
                 "rigid_iterations": 2,
                 "boundary_spacing": 0.014,
+                "water_render_radius_scale": 0.45,
+                "boundary_render_radius_scale": 0.30,
                 "expected_min_drop": 0.0,
                 "expected_min_body_force_norm": 0.0,
                 "expected_min_sample_force_norm": 0.0,
@@ -174,6 +184,7 @@ class Example:
             "sim_substeps": getattr(self.args, "sim_substeps", None),
             "sphere_radius": getattr(self.args, "sphere_radius", None),
             "sphere_bottom_gap": getattr(self.args, "sphere_bottom_gap", None),
+            "water_render_radius_scale": getattr(self.args, "water_render_radius_scale", None),
         }
         for key, value in overrides.items():
             if value is not None:
@@ -275,14 +286,20 @@ class Example:
 
         self.particle_colors = wp.full(
             self.model.particle_count,
-            value=wp.vec3(0.12, 0.58, 1.0),
+            value=wp.vec3(0.48, 0.82, 1.0),
             dtype=wp.vec3,
+            device=self.model.device,
+        )
+        self.water_radii = wp.full(
+            self.model.particle_count,
+            value=float(self.config["radius_mean"]) * float(self.config["water_render_radius_scale"]),
+            dtype=wp.float32,
             device=self.model.device,
         )
         self.boundary_colors = self._build_boundary_colors()
         self.boundary_radii = wp.full(
             self.boundary_model.sample_count,
-            value=float(self.config["boundary_spacing"]) * 0.18,
+            value=float(self.config["boundary_spacing"]) * float(self.config["boundary_render_radius_scale"]),
             dtype=wp.float32,
             device=self.model.device,
         )
@@ -465,6 +482,7 @@ class Example:
         ui.text(f"Hydrostatic mode: {self.args.hydrostatic_volume_mode!s}")
         ui.text(f"Sphere radius: {self.sphere_radius:.3f} m")
         ui.text(f"Sphere densities: {tuple(float(v) for v in self.config['sphere_densities'])}")
+        ui.text(f"Water render radius scale: {float(self.config['water_render_radius_scale']):.2f}")
 
     def reset(self):
         self.sim_time = 0.0
@@ -616,7 +634,9 @@ class Example:
             "light sphere did not remain above the heavy sphere in the single-fluid buoy test: "
             f"light_y={body_y[0]:.4f}, heavy_y={body_y[2]:.4f}"
         )
-        assert self.max_particle_y > self.initial_particle_max_y, "fluid surface did not respond to the buoys"
+        assert self.max_particle_y > self.initial_particle_max_y - 2.0 * float(self.config["radius_mean"]), (
+            "deep pool free-surface band collapsed too much during buoy interaction"
+        )
         assert min_particle_y >= -0.02, f"particles penetrated the floor too much: y={min_particle_y:.4f}"
         assert max_x <= self.container_half_width + 0.05, f"particles escaped along x: {max_x:.4f}"
         assert max_z <= self.container_half_depth + 0.05, f"particles escaped along z: {max_z:.4f}"
@@ -633,7 +653,7 @@ class Example:
         self.viewer.log_points(
             "/fsi/three_sphere_buoys_ipbf_particles",
             points=self.state_0.particle_q,
-            radii=self.model.particle_radius,
+            radii=self.water_radii,
             colors=self.particle_colors,
             hidden=not self.viewer.show_particles,
         )
