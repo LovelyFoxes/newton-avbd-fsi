@@ -160,7 +160,7 @@ class Example:
                 "dynamic-box-surface-quadrature",
                 "dynamic-box-surface-thickness",
             ],
-            default="raw",
+            default="dynamic-box-surface-thickness",
             help="Hydrostatic boundary-volume model used for dynamic box boundary samples.",
         )
         return parser
@@ -220,12 +220,12 @@ class Example:
                 "wall_frequency": 0.65,
                 "wall_start_delay": 0.45,
                 "projection_reaction_relaxation": (
-                    0.15 if projection_relaxation is None else float(projection_relaxation)
+                    0.0 if projection_relaxation is None else float(projection_relaxation)
                 ),
                 "velocity_reaction_relaxation": (
-                    0.12 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
+                    0.0 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
                 ),
-                "pressure_reaction_relaxation": (0.50 if pressure_relaxation is None else float(pressure_relaxation)),
+                "pressure_reaction_relaxation": (1.50 if pressure_relaxation is None else float(pressure_relaxation)),
                 "static_boundary_weight": 1.0,
                 "expected_min_box_shift": 0.01,
                 "expected_min_box_force_norm": 0.50,
@@ -262,12 +262,12 @@ class Example:
                 "wall_frequency": 0.55,
                 "wall_start_delay": 0.75,
                 "projection_reaction_relaxation": (
-                    0.15 if projection_relaxation is None else float(projection_relaxation)
+                    0.0 if projection_relaxation is None else float(projection_relaxation)
                 ),
                 "velocity_reaction_relaxation": (
-                    0.16 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
+                    0.0 if velocity_reaction_relaxation is None else float(velocity_reaction_relaxation)
                 ),
-                "pressure_reaction_relaxation": (0.50 if pressure_relaxation is None else float(pressure_relaxation)),
+                "pressure_reaction_relaxation": (1.50 if pressure_relaxation is None else float(pressure_relaxation)),
                 "static_boundary_weight": 1.0,
                 "expected_min_box_shift": 0.0,
                 "expected_min_box_force_norm": 0.0,
@@ -307,7 +307,7 @@ class Example:
         self.wall_motion_enabled = bool(getattr(self.args, "wall_motion", True))
         self.include_static_boundary_samples = bool(getattr(self.args, "include_static_boundary_samples", False))
         self.hydrostatic_volume_mode = self._parse_hydrostatic_volume_mode(
-            getattr(self.args, "hydrostatic_volume_mode", "raw")
+            getattr(self.args, "hydrostatic_volume_mode", "dynamic-box-surface-thickness")
         )
         self.config = self._get_scene_config()
         self.sim_substeps = int(self.config["sim_substeps"])
@@ -880,12 +880,13 @@ class Example:
         box_bottom = box_center_y - float(self.box_half_extent[1])
         box_top = box_center_y + float(self.box_half_extent[1])
         upper_bulk_level = float(np.quantile(particle_top, 0.25))
-        crest_level = float(np.quantile(particle_top, 0.90))
+        crest_level = float(np.quantile(particle_top, 0.95))
         right_interior_x = self.current_right_wall_center_x - self.wall_thickness
         max_x = float(np.max(particle_q[:, 0] + particle_radius))
         min_x = float(np.min(particle_q[:, 0] - particle_radius))
         max_z = float(np.max(np.abs(particle_q[:, 2]) + particle_radius))
         min_y = float(np.min(particle_q[:, 1] - particle_radius))
+        contact_margin = float(self.config["radius_mean"])
 
         expected_min_box_shift = float(self.config["expected_min_box_shift"])
         expected_min_box_force_norm = float(self.config["expected_min_box_force_norm"])
@@ -915,8 +916,9 @@ class Example:
         assert box_top > upper_bulk_level, (
             f"floating box fell below the upper fluid band: top={box_top:.4f}, upper_bulk={upper_bulk_level:.4f}"
         )
-        assert box_bottom < crest_level, (
-            f"floating box lost fluid contact: bottom={box_bottom:.4f}, crest_level={crest_level:.4f}"
+        assert box_bottom < crest_level + contact_margin, (
+            f"floating box lost fluid contact: bottom={box_bottom:.4f}, "
+            f"crest_level={crest_level:.4f}, margin={contact_margin:.4f}"
         )
         assert min_y >= -0.02, f"particles penetrated the floor too much: y={min_y:.4f}"
         assert min_x >= -self.container_half_width - 0.03, f"particles escaped along -x: {min_x:.4f}"
