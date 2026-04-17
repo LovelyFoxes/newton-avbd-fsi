@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import argparse
+
 import numpy as np
 import warp as wp
 
@@ -38,11 +40,58 @@ from newton.examples.ipbf.common import (
     get_particle_grid_origin_from_center,
     scale_velocities,
 )
-from newton.solvers import SolverIPBF
+from newton.solvers import FSIBoundaryModel, SolverIPBF
 
 
 class Example:
     """Closed-box stacked slab flop test for the IPBF solver."""
+
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument(
+            "--include-static-boundary-samples",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Include sampled static walls in the IPBF boundary density and local dissipation paths.",
+        )
+        parser.add_argument(
+            "--boundary-sample-spacing",
+            type=float,
+            default=None,
+            help="Static boundary sample spacing [m]. Defaults to the particle spacing.",
+        )
+        parser.add_argument(
+            "--static-boundary-weight",
+            type=float,
+            default=None,
+            help="Diagnostic weight applied to static boundary samples.",
+        )
+        parser.add_argument(
+            "--viscosity-boundary-coefficient",
+            type=float,
+            default=None,
+            help="Boundary-sample viscosity coefficient used for local wall dissipation.",
+        )
+        parser.add_argument(
+            "--xsph-boundary-coefficient",
+            type=float,
+            default=None,
+            help="Boundary-sample XSPH coefficient used for local wall velocity smoothing.",
+        )
+        parser.add_argument(
+            "--boundary-velocity-damping",
+            type=float,
+            default=None,
+            help="Tangential velocity damping applied at final particle-shape contacts.",
+        )
+        parser.add_argument(
+            "--velocity-damping",
+            type=float,
+            default=None,
+            help="Example-level global velocity damping multiplier.",
+        )
+        return parser
 
     def _get_scene_config(self) -> dict[str, object]:
         if bool(getattr(self.args, "test", False)):
@@ -66,7 +115,11 @@ class Example:
                 "sim_substeps": 6,
                 "velocity_damping": 0.992,
                 "viscosity": 0.002,
+                "viscosity_boundary_coefficient": 0.0,
                 "xsph": 0.004,
+                "xsph_boundary_coefficient": 0.0,
+                "boundary_velocity_damping": 1.0,
+                "static_boundary_weight": 1.0,
                 "compliance": 1.0e-5,
             }
 
@@ -90,9 +143,19 @@ class Example:
             "sim_substeps": 4,
             "velocity_damping": 0.999,
             "viscosity": 0.0025,
+            "viscosity_boundary_coefficient": 0.0,
             "xsph": 0.005,
+            "xsph_boundary_coefficient": 0.0,
+            "boundary_velocity_damping": 1.0,
+            "static_boundary_weight": 1.0,
             "compliance": 1.0e-5,
         }
+
+    def _get_arg_or_scene_value(self, name: str, scene: dict[str, object]) -> object:
+        value = getattr(self.args, name, None)
+        if value is not None:
+            return value
+        return scene[name]
 
     def __init__(self, viewer, args=None):
         self.fps = 60
@@ -113,7 +176,7 @@ class Example:
         self.wall_thickness = 0.05
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
-        self.velocity_damping = float(scene["velocity_damping"])
+        self.velocity_damping = float(self._get_arg_or_scene_value("velocity_damping", scene))
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
@@ -179,6 +242,20 @@ class Example:
         self.model = builder.finalize()
         self.model.set_gravity((0.0, -9.81, 0.0))
 
+        self.boundary_model = None
+        if bool(getattr(self.args, "include_static_boundary_samples", False)):
+            boundary_spacing = getattr(self.args, "boundary_sample_spacing", None)
+            if boundary_spacing is None:
+                boundary_spacing = scene["cell"]
+            self.boundary_model = FSIBoundaryModel(
+                self.model,
+                spacing=float(boundary_spacing),
+                support_radius=float(scene["smoothing_radius"]),
+                include_static=True,
+                include_dynamic=False,
+                device=self.model.device,
+            )
+
         self.solver = SolverIPBF(
             self.model,
             SolverIPBF.Config(
@@ -188,8 +265,15 @@ class Example:
                 iterations=scene["iterations"],
                 relaxation=0.5,
                 viscosity_coefficient=scene["viscosity"],
+                viscosity_boundary_coefficient=float(
+                    self._get_arg_or_scene_value("viscosity_boundary_coefficient", scene)
+                ),
                 xsph_coefficient=scene["xsph"],
+                xsph_boundary_coefficient=float(self._get_arg_or_scene_value("xsph_boundary_coefficient", scene)),
+                boundary_velocity_damping=float(self._get_arg_or_scene_value("boundary_velocity_damping", scene)),
+                fsi_static_boundary_weight=float(self._get_arg_or_scene_value("static_boundary_weight", scene)),
             ),
+            boundary_model=self.boundary_model,
         )
 
         self.collision_pipeline = newton.examples.create_collision_pipeline(
@@ -374,6 +458,6 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    viewer, args = newton.examples.init(Example.create_parser())
     example = Example(viewer, args)
     newton.examples.run(example, args)

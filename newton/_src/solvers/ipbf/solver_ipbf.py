@@ -40,8 +40,11 @@ from .ipbf_kernels import (
     apply_artificial_damping,
     apply_relaxed_jacobi_update,
     apply_viscosity_velocity_diffusion,
+    apply_viscosity_velocity_diffusion_with_boundary,
     apply_viscosity_velocity_diffusion_without_grid,
+    apply_viscosity_velocity_diffusion_without_grid_with_boundary,
     apply_xsph_velocity_smoothing,
+    apply_xsph_velocity_smoothing_with_boundary,
     apply_xsph_velocity_smoothing_without_grid,
     compute_constraint_and_gradient,
     compute_constraint_and_gradient_with_boundary,
@@ -110,8 +113,14 @@ class SolverIPBF(SolverBase):
             damping_beta: Distance threshold factor used by the damping model.
             viscosity_coefficient: Kinematic viscosity coefficient [m^2/s]
                 applied as a post-solve SPH velocity diffusion step.
+            viscosity_boundary_coefficient: Boundary-sample viscosity diffusion
+                coefficient applied using boundary sample velocities when a
+                boundary model is active.
             xsph_coefficient: XSPH velocity smoothing coefficient applied after
                 the position solve.
+            xsph_boundary_coefficient: Boundary-sample XSPH smoothing
+                coefficient applied using boundary sample velocities when a
+                boundary model is active.
             boundary_velocity_damping: Tangential damping multiplier applied to
                 particle velocities at final particle-shape contacts.
             fsi_reaction_relaxation: Legacy compatibility multiplier applied to
@@ -127,8 +136,9 @@ class SolverIPBF(SolverBase):
                 converting boundary pressure-gradient position increments into
                 FSI body reaction forces and torques.
             fsi_static_boundary_weight: Unitless diagnostic multiplier applied
-                only to static boundary-sample contributions in the density,
-                constraint-gradient, and pressure-reaction path.
+                to static boundary-sample contributions in the density,
+                constraint-gradient, pressure-reaction, and boundary-aware
+                velocity-smoothing / viscosity paths.
         """
 
         class KernelFamily(IntEnum):
@@ -148,7 +158,9 @@ class SolverIPBF(SolverBase):
         damping_compliance: float = 1.0 / 1000.0
         damping_beta: float = 60.0
         viscosity_coefficient: float = 0.0
+        viscosity_boundary_coefficient: float = 0.0
         xsph_coefficient: float = 0.0
+        xsph_boundary_coefficient: float = 0.0
         boundary_velocity_damping: float = 1.0
         fsi_reaction_relaxation: float | None = None
         fsi_projection_reaction_relaxation: float | None = None
@@ -327,7 +339,9 @@ class SolverIPBF(SolverBase):
         self.damping_compliance = float(self.config.damping_compliance)
         self.damping_beta = float(self.config.damping_beta)
         self.viscosity_coefficient = float(self.config.viscosity_coefficient)
+        self.viscosity_boundary_coefficient = float(self.config.viscosity_boundary_coefficient)
         self.xsph_coefficient = float(self.config.xsph_coefficient)
+        self.xsph_boundary_coefficient = float(self.config.xsph_boundary_coefficient)
         self.boundary_velocity_damping = float(self.config.boundary_velocity_damping)
         legacy_reaction_relaxation = self.config.fsi_reaction_relaxation
         projection_reaction_relaxation = self.config.fsi_projection_reaction_relaxation
@@ -622,30 +636,65 @@ class SolverIPBF(SolverBase):
 
     def _apply_xsph_velocity_smoothing(self, state: State) -> None:
         """Apply an optional XSPH-style velocity smoothing pass."""
-        if self.xsph_coefficient <= 0.0 or self.model.particle_count == 0:
+        if (self.xsph_coefficient <= 0.0 and self.xsph_boundary_coefficient <= 0.0) or self.model.particle_count == 0:
             return
 
         model = self.model
+        boundary_model = self.boundary_model
+        has_boundary = (
+            boundary_model is not None
+            and self.xsph_boundary_coefficient > 0.0
+            and getattr(boundary_model, "sample_count", 0) > 0
+            and getattr(boundary_model, "boundary_grid", None) is not None
+        )
 
         if model.particle_count > 1 and model.particle_grid is not None:
-            wp.launch(
-                apply_xsph_velocity_smoothing,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_grid.id,
-                    state.particle_q,
-                    state.particle_qd,
-                    state.ipbf.density,
-                    model.particle_mass,
-                    model.particle_flags,
-                    model.particle_world,
-                    self.smoothing_radius,
-                    self.kernel_family,
-                    self.xsph_coefficient,
-                ],
-                outputs=[self._xsph_particle_qd],
-                device=model.device,
-            )
+            if has_boundary:
+                wp.launch(
+                    apply_xsph_velocity_smoothing_with_boundary,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        boundary_model.boundary_grid.id,
+                        state.particle_q,
+                        state.particle_qd,
+                        state.ipbf.density,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_v_world,
+                        boundary_model.sample_volume_hydrostatic,
+                        boundary_model.sample_flags,
+                        self.fsi_static_boundary_weight,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        self.xsph_coefficient,
+                        self.xsph_boundary_coefficient,
+                    ],
+                    outputs=[self._xsph_particle_qd],
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    apply_xsph_velocity_smoothing,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        state.particle_q,
+                        state.particle_qd,
+                        state.ipbf.density,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        self.xsph_coefficient,
+                    ],
+                    outputs=[self._xsph_particle_qd],
+                    device=model.device,
+                )
         else:
             wp.launch(
                 apply_xsph_velocity_smoothing_without_grid,
@@ -665,45 +714,110 @@ class SolverIPBF(SolverBase):
 
     def _apply_viscosity_velocity_diffusion(self, state: State, dt: float) -> None:
         """Apply an optional SPH viscosity diffusion pass to the final velocities."""
-        if self.viscosity_coefficient <= 0.0 or self.model.particle_count == 0 or dt <= 0.0:
+        if (
+            (self.viscosity_coefficient <= 0.0 and self.viscosity_boundary_coefficient <= 0.0)
+            or self.model.particle_count == 0
+            or dt <= 0.0
+        ):
             return
 
         model = self.model
+        boundary_model = self.boundary_model
+        has_boundary = (
+            boundary_model is not None
+            and self.viscosity_boundary_coefficient > 0.0
+            and getattr(boundary_model, "sample_count", 0) > 0
+            and getattr(boundary_model, "boundary_grid", None) is not None
+        )
 
         if model.particle_count > 1 and model.particle_grid is not None:
-            wp.launch(
-                apply_viscosity_velocity_diffusion,
-                dim=model.particle_count,
-                inputs=[
-                    model.particle_grid.id,
-                    state.particle_q,
-                    state.particle_qd,
-                    state.ipbf.density,
-                    model.particle_mass,
-                    model.particle_flags,
-                    model.particle_world,
-                    self.smoothing_radius,
-                    self.kernel_family,
-                    self.viscosity_coefficient,
-                    dt,
-                ],
-                outputs=[self._viscosity_particle_qd],
-                device=model.device,
-            )
+            if has_boundary:
+                wp.launch(
+                    apply_viscosity_velocity_diffusion_with_boundary,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        boundary_model.boundary_grid.id,
+                        state.particle_q,
+                        state.particle_qd,
+                        state.ipbf.density,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_v_world,
+                        boundary_model.sample_volume_hydrostatic,
+                        boundary_model.sample_flags,
+                        self.fsi_static_boundary_weight,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        self.viscosity_coefficient,
+                        self.viscosity_boundary_coefficient,
+                        dt,
+                    ],
+                    outputs=[self._viscosity_particle_qd],
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    apply_viscosity_velocity_diffusion,
+                    dim=model.particle_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        state.particle_q,
+                        state.particle_qd,
+                        state.ipbf.density,
+                        model.particle_mass,
+                        model.particle_flags,
+                        model.particle_world,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        self.viscosity_coefficient,
+                        dt,
+                    ],
+                    outputs=[self._viscosity_particle_qd],
+                    device=model.device,
+                )
         else:
-            wp.launch(
-                apply_viscosity_velocity_diffusion_without_grid,
-                dim=model.particle_count,
-                inputs=[
-                    state.particle_q,
-                    state.particle_qd,
-                    model.particle_flags,
-                    self.viscosity_coefficient,
-                    dt,
-                ],
-                outputs=[self._viscosity_particle_qd],
-                device=model.device,
-            )
+            if has_boundary:
+                wp.launch(
+                    apply_viscosity_velocity_diffusion_without_grid_with_boundary,
+                    dim=model.particle_count,
+                    inputs=[
+                        boundary_model.boundary_grid.id,
+                        state.particle_q,
+                        state.particle_qd,
+                        state.ipbf.density,
+                        model.particle_flags,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_v_world,
+                        boundary_model.sample_volume_hydrostatic,
+                        boundary_model.sample_flags,
+                        self.fsi_static_boundary_weight,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        self.viscosity_boundary_coefficient,
+                        dt,
+                    ],
+                    outputs=[self._viscosity_particle_qd],
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    apply_viscosity_velocity_diffusion_without_grid,
+                    dim=model.particle_count,
+                    inputs=[
+                        state.particle_q,
+                        state.particle_qd,
+                        model.particle_flags,
+                        self.viscosity_coefficient,
+                        dt,
+                    ],
+                    outputs=[self._viscosity_particle_qd],
+                    device=model.device,
+                )
 
         state.particle_qd.assign(self._viscosity_particle_qd)
 

@@ -420,6 +420,70 @@ def run_boundary_density_step(
     return state_1, solver
 
 
+def run_static_boundary_viscosity_step(
+    device,
+    *,
+    viscosity_boundary_coefficient: float,
+    static_boundary_weight: float = 1.0,
+):
+    """Run one step with particles moving tangentially near a sampled static boundary."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(-0.05, 0.5, 0.0),
+            wp.vec3(0.05, 0.5, 0.0),
+        ],
+        vel=[
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0],
+        radius=[0.05, 0.05],
+    )
+    builder.add_shape_box(
+        body=-1,
+        xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+        hx=0.25,
+        hy=0.25,
+        hz=0.25,
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=0.25,
+        support_radius=0.6,
+        include_static=True,
+        include_dynamic=False,
+        device=device,
+    )
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.6,
+            hessian_regularization=1.0e-6,
+            iterations=0,
+            use_constraint_clamp=False,
+            viscosity_coefficient=0.0,
+            viscosity_boundary_coefficient=viscosity_boundary_coefficient,
+            fsi_static_boundary_weight=static_boundary_weight,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.01)
+
+    return state_1
+
+
 def run_dynamic_box_pressure_reaction_step(device, *, reaction_relaxation: float):
     """Run one IPBF pressure iteration near a sampled dynamic box boundary."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -1521,6 +1585,29 @@ def test_ipbf_viscosity_reduces_two_particle_relative_speed(test, device):
     )
 
 
+def test_ipbf_boundary_viscosity_reduces_speed_near_static_samples(test, device):
+    without_boundary_viscosity = run_static_boundary_viscosity_step(
+        device,
+        viscosity_boundary_coefficient=0.0,
+    )
+    with_boundary_viscosity = run_static_boundary_viscosity_step(
+        device,
+        viscosity_boundary_coefficient=0.02,
+    )
+    disabled_static_weight = run_static_boundary_viscosity_step(
+        device,
+        viscosity_boundary_coefficient=0.02,
+        static_boundary_weight=0.0,
+    )
+
+    speed_without = np.linalg.norm(without_boundary_viscosity.particle_qd.numpy(), axis=1)
+    speed_with = np.linalg.norm(with_boundary_viscosity.particle_qd.numpy(), axis=1)
+    speed_disabled = np.linalg.norm(disabled_static_weight.particle_qd.numpy(), axis=1)
+
+    test.assertTrue(np.all(speed_with < speed_without))
+    np.testing.assert_allclose(speed_disabled, speed_without, rtol=1.0e-6, atol=1.0e-6)
+
+
 def test_ipbf_ground_contact_tangential_damping_reduces_speed(test, device):
     _, contacts, _, velocities = run_single_particle_ground_rollout(
         device,
@@ -1741,6 +1828,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_viscosity_reduces_two_particle_relative_speed",
     test_ipbf_viscosity_reduces_two_particle_relative_speed,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_boundary_viscosity_reduces_speed_near_static_samples",
+    test_ipbf_boundary_viscosity_reduces_speed_near_static_samples,
     devices=devices,
     check_output=False,
 )

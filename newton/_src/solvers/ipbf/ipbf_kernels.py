@@ -1384,6 +1384,98 @@ def apply_xsph_velocity_smoothing(
 
 
 @wp.kernel
+def apply_xsph_velocity_smoothing_with_boundary(
+    grid: wp.uint64,
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    density: wp.array(dtype=float),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_v: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    static_boundary_weight: float,
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    xsph_coefficient: float,
+    xsph_boundary_coefficient: float,
+    smoothed_particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply XSPH smoothing with both fluid and boundary sample neighbors."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        smoothed_particle_qd[tid] = particle_qd[tid]
+        return
+
+    if xsph_coefficient <= 0.0 and xsph_boundary_coefficient <= 0.0:
+        smoothed_particle_qd[tid] = particle_qd[tid]
+        return
+
+    xi = particle_q[tid]
+    vi = particle_qd[tid]
+    rho_i = density[tid]
+    world_i = particle_world[tid]
+    fluid_correction = wp.vec3(0.0)
+    boundary_correction = wp.vec3(0.0)
+
+    if xsph_coefficient > 0.0:
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        index = int(0)
+
+        while wp.hash_grid_query_next(query, index):
+            if index == tid or (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+                continue
+
+            world_j = particle_world[index]
+            if world_i >= 0 and world_j >= 0 and world_i != world_j:
+                continue
+
+            rho_j = density[index]
+            if rho_j <= 0.0:
+                continue
+
+            displacement = xi - particle_q[index]
+            weight = kernel_value(wp.dot(displacement, displacement), support_radius, kernel_family)
+            if weight <= 0.0:
+                continue
+
+            fluid_correction += (particle_mass[index] / rho_j) * (particle_qd[index] - vi) * weight
+
+    if xsph_boundary_coefficient > 0.0 and rho_i > 0.0 and rest_density > 0.0:
+        boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+        boundary_index = int(0)
+
+        while wp.hash_grid_query_next(boundary_query, boundary_index):
+            boundary_flag = boundary_flags[boundary_index]
+            if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+                continue
+            weight_scale = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+            if weight_scale == 0.0:
+                continue
+
+            displacement = xi - boundary_x[boundary_index]
+            weight = kernel_value(wp.dot(displacement, displacement), support_radius, kernel_family)
+            if weight <= 0.0:
+                continue
+
+            boundary_correction += (
+                weight_scale
+                * (rest_density * boundary_volume[boundary_index] / rho_i)
+                * (boundary_v[boundary_index] - vi)
+                * weight
+            )
+
+    smoothed_particle_qd[tid] = (
+        vi + xsph_coefficient * fluid_correction + xsph_boundary_coefficient * boundary_correction
+    )
+
+
+@wp.kernel
 def apply_xsph_velocity_smoothing_without_grid(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
@@ -1463,6 +1555,113 @@ def apply_viscosity_velocity_diffusion(
 
 
 @wp.kernel
+def apply_viscosity_velocity_diffusion_with_boundary(
+    grid: wp.uint64,
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    density: wp.array(dtype=float),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_v: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    static_boundary_weight: float,
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    viscosity_coefficient: float,
+    viscosity_boundary_coefficient: float,
+    dt: float,
+    diffused_particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply viscosity diffusion using both fluid and boundary sample neighbors."""
+    tid = wp.tid()
+
+    if (
+        (particle_flags[tid] & ParticleFlags.ACTIVE) == 0
+        or dt <= 0.0
+        or (viscosity_coefficient <= 0.0 and viscosity_boundary_coefficient <= 0.0)
+    ):
+        diffused_particle_qd[tid] = particle_qd[tid]
+        return
+
+    xi = particle_q[tid]
+    vi = particle_qd[tid]
+    rho_i = density[tid]
+    world_i = particle_world[tid]
+    h2 = support_radius * support_radius
+    eps2 = 1.0e-2 * h2
+    fluid_diffusion = wp.vec3(0.0)
+    boundary_diffusion = wp.vec3(0.0)
+
+    if viscosity_coefficient > 0.0:
+        query = wp.hash_grid_query(grid, xi, support_radius)
+        index = int(0)
+
+        while wp.hash_grid_query_next(query, index):
+            if index == tid or (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+                continue
+
+            world_j = particle_world[index]
+            if world_i >= 0 and world_j >= 0 and world_i != world_j:
+                continue
+
+            rho_j = density[index]
+            if rho_j <= 0.0:
+                continue
+
+            displacement = xi - particle_q[index]
+            dist2 = wp.dot(displacement, displacement)
+            if dist2 <= 0.0 or dist2 >= h2:
+                continue
+
+            grad = kernel_gradient(displacement, support_radius, kernel_family)
+            laplace_weight = -wp.dot(displacement, grad) / (dist2 + eps2)
+            if laplace_weight <= 0.0:
+                continue
+
+            fluid_diffusion += (particle_mass[index] / rho_j) * (particle_qd[index] - vi) * laplace_weight
+
+    if viscosity_boundary_coefficient > 0.0 and rho_i > 0.0 and rest_density > 0.0:
+        boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+        boundary_index = int(0)
+
+        while wp.hash_grid_query_next(boundary_query, boundary_index):
+            boundary_flag = boundary_flags[boundary_index]
+            if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+                continue
+            weight_scale = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+            if weight_scale == 0.0:
+                continue
+
+            displacement = xi - boundary_x[boundary_index]
+            dist2 = wp.dot(displacement, displacement)
+            if dist2 <= 0.0 or dist2 >= h2:
+                continue
+
+            grad = kernel_gradient(displacement, support_radius, kernel_family)
+            laplace_weight = -wp.dot(displacement, grad) / (dist2 + eps2)
+            if laplace_weight <= 0.0:
+                continue
+
+            boundary_diffusion += (
+                weight_scale
+                * (rest_density * boundary_volume[boundary_index] / rho_i)
+                * (boundary_v[boundary_index] - vi)
+                * laplace_weight
+            )
+
+    diffused_particle_qd[tid] = (
+        vi
+        + 10.0 * viscosity_coefficient * dt * fluid_diffusion
+        + 10.0 * viscosity_boundary_coefficient * dt * boundary_diffusion
+    )
+
+
+@wp.kernel
 def apply_viscosity_velocity_diffusion_without_grid(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
@@ -1480,6 +1679,71 @@ def apply_viscosity_velocity_diffusion_without_grid(
 
     vi = particle_qd[tid]
     diffused_particle_qd[tid] = vi
+
+
+@wp.kernel
+def apply_viscosity_velocity_diffusion_without_grid_with_boundary(
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    density: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_v: wp.array(dtype=wp.vec3),
+    boundary_volume: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    static_boundary_weight: float,
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    viscosity_boundary_coefficient: float,
+    dt: float,
+    diffused_particle_qd: wp.array(dtype=wp.vec3),
+):
+    """Apply boundary-only viscosity diffusion for cases without a particle grid."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or dt <= 0.0 or viscosity_boundary_coefficient <= 0.0:
+        diffused_particle_qd[tid] = particle_qd[tid]
+        return
+
+    xi = particle_q[tid]
+    vi = particle_qd[tid]
+    rho_i = density[tid]
+    h2 = support_radius * support_radius
+    eps2 = 1.0e-2 * h2
+    boundary_diffusion = wp.vec3(0.0)
+
+    if rho_i > 0.0 and rest_density > 0.0:
+        boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+        boundary_index = int(0)
+
+        while wp.hash_grid_query_next(boundary_query, boundary_index):
+            boundary_flag = boundary_flags[boundary_index]
+            if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+                continue
+            weight_scale = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+            if weight_scale == 0.0:
+                continue
+
+            displacement = xi - boundary_x[boundary_index]
+            dist2 = wp.dot(displacement, displacement)
+            if dist2 <= 0.0 or dist2 >= h2:
+                continue
+
+            grad = kernel_gradient(displacement, support_radius, kernel_family)
+            laplace_weight = -wp.dot(displacement, grad) / (dist2 + eps2)
+            if laplace_weight <= 0.0:
+                continue
+
+            boundary_diffusion += (
+                weight_scale
+                * (rest_density * boundary_volume[boundary_index] / rho_i)
+                * (boundary_v[boundary_index] - vi)
+                * laplace_weight
+            )
+
+    diffused_particle_qd[tid] = vi + 10.0 * viscosity_boundary_coefficient * dt * boundary_diffusion
 
 
 @wp.kernel
