@@ -190,6 +190,99 @@ def test_static_box_samples_do_not_require_bodies(test: unittest.TestCase, devic
     np.testing.assert_allclose(np.mean(x_world, axis=0), [1.0, 2.0, 3.0], atol=1.0e-6)
 
 
+def test_dynamic_sphere_samples_follow_body(test: unittest.TestCase, device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()))
+    builder.add_shape_sphere(body, radius=0.3)
+    model = builder.finalize(device=device)
+    state = model.state()
+
+    boundary = FSIBoundaryModel(model, spacing=0.1, support_radius=0.25, device=device)
+    test.assertGreater(boundary.sample_count, 12)
+
+    boundary.update_world_kinematics(state)
+
+    x_local = boundary.sample_x_local.numpy()
+    x_world = boundary.sample_x_world.numpy()
+    n_local = boundary.sample_normal_local.numpy()
+    n_world = boundary.sample_normal_world.numpy()
+    sample_volume = boundary.sample_volume.numpy()
+    sample_area = boundary.sample_area_patch.numpy()
+    quadrature_volume = boundary.sample_volume_quadrature.numpy()
+    flags = boundary.sample_flags.numpy()
+
+    np.testing.assert_allclose(x_world, x_local, atol=1.0e-6)
+    np.testing.assert_allclose(n_world, n_local, atol=1.0e-6)
+    np.testing.assert_allclose(np.linalg.norm(x_local, axis=1), 0.3, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(np.linalg.norm(n_local, axis=1), 1.0, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(n_local, x_local / 0.3, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(np.sum(sample_area), 4.0 * math.pi * 0.3 * 0.3, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(
+        np.sum(quadrature_volume),
+        (4.0 / 3.0) * math.pi * 0.3 * 0.3 * 0.3,
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    test.assertTrue(np.all(np.isfinite(sample_volume)))
+    test.assertTrue(np.all(sample_volume > 0.0))
+    test.assertTrue(np.all((flags & int(BoundarySampleFlags.DYNAMIC)) != 0))
+
+    angle = math.pi * 0.5
+    translation = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    state.body_q.assign(
+        wp.array(
+            [wp.transform(wp.vec3(*translation), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle))],
+            dtype=wp.transform,
+            device=device,
+        )
+    )
+
+    boundary.update_world_kinematics(state)
+
+    np.testing.assert_allclose(boundary.sample_x_world.numpy(), _rotate_z(x_local, angle) + translation, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_normal_world.numpy(), _rotate_z(n_local, angle), atol=1.0e-6)
+
+
+def test_dynamic_sphere_hydrostatic_modes_match_surface_weights(test: unittest.TestCase, device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    dynamic_body = builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()))
+    kinematic_body = builder.add_body(
+        xform=wp.transform(wp.vec3(1.0, 0.0, 0.0), wp.quat_identity()),
+        is_kinematic=True,
+    )
+    builder.add_shape_sphere(dynamic_body, radius=0.3)
+    builder.add_shape_sphere(kinematic_body, radius=0.3)
+    model = builder.finalize(device=device)
+
+    boundary = FSIBoundaryModel(
+        model,
+        spacing=0.1,
+        support_radius=0.25,
+        hydrostatic_volume_mode=FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_QUADRATURE,
+        device=device,
+    )
+
+    sample_body = boundary.sample_body.numpy()
+    raw_volume = boundary.sample_volume.numpy()
+    patch_area = boundary.sample_area_patch.numpy()
+    quadrature_volume = boundary.sample_volume_quadrature.numpy()
+    hydrostatic_volume = boundary.sample_volume_hydrostatic.numpy()
+    hydrostatic_scale = boundary.sample_volume_hydrostatic_scale.numpy()
+    expected_surface_area = 4.0 * math.pi * 0.3 * 0.3
+    expected_volume = (4.0 / 3.0) * math.pi * 0.3 * 0.3 * 0.3
+
+    dynamic_mask = sample_body == dynamic_body
+    kinematic_mask = sample_body == kinematic_body
+
+    np.testing.assert_allclose(np.sum(patch_area[dynamic_mask]), expected_surface_area, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(np.sum(quadrature_volume[dynamic_mask]), expected_volume, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(hydrostatic_volume[dynamic_mask], quadrature_volume[dynamic_mask], rtol=1.0e-6)
+    np.testing.assert_allclose(np.sum(hydrostatic_volume[dynamic_mask]), expected_volume, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(hydrostatic_volume[kinematic_mask], raw_volume[kinematic_mask], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(hydrostatic_scale[kinematic_mask], np.ones_like(hydrostatic_scale[kinematic_mask]))
+    test.assertTrue(np.all(hydrostatic_scale[dynamic_mask] > 0.0))
+
+
 def test_dynamic_box_hydrostatic_volume_matches_geometric_volume(test: unittest.TestCase, device):
     builder = newton.ModelBuilder(gravity=0.0)
     dynamic_body = builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()))
@@ -416,6 +509,20 @@ add_function_test(
     TestFSIBoundaryModel,
     "test_static_box_samples_do_not_require_bodies",
     test_static_box_samples_do_not_require_bodies,
+    devices=devices,
+)
+
+add_function_test(
+    TestFSIBoundaryModel,
+    "test_dynamic_sphere_samples_follow_body",
+    test_dynamic_sphere_samples_follow_body,
+    devices=devices,
+)
+
+add_function_test(
+    TestFSIBoundaryModel,
+    "test_dynamic_sphere_hydrostatic_modes_match_surface_weights",
+    test_dynamic_sphere_hydrostatic_modes_match_surface_weights,
     devices=devices,
 )
 

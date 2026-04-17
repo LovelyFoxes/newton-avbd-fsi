@@ -49,8 +49,8 @@ class BoundarySampleFlags(IntEnum):
 class FSIBoundaryModel:
     """Boundary samples used by the AVBD/IPBF fluid-solid coupling path.
 
-    The first implementation follows an Akinci-style boundary particle model
-    and only samples Newton box shapes. Samples are stored in the parent frame:
+    The implementation follows an Akinci-style boundary particle model and
+    samples Newton box and sphere shapes. Samples are stored in the parent frame:
     body-local for dynamic shapes and world-space for static shapes.
 
     Args:
@@ -87,6 +87,9 @@ class FSIBoundaryModel:
         """Selectable hydrostatic-normalization modes for boundary shells."""
 
         NONE = 0
+        DYNAMIC_SHAPE_VOLUME = 1
+        DYNAMIC_SHAPE_SURFACE_QUADRATURE = 2
+        DYNAMIC_SHAPE_SURFACE_THICKNESS = 3
         DYNAMIC_BOX_VOLUME = 1
         DYNAMIC_BOX_SURFACE_QUADRATURE = 2
         DYNAMIC_BOX_SURFACE_THICKNESS = 3
@@ -122,9 +125,9 @@ class FSIBoundaryModel:
             sample_shape,
             sample_x_local,
             sample_normal_local,
-            sample_area_box_patch,
-            sample_volume_box_quadrature,
-        ) = self._sample_model_boxes(
+            sample_area_patch,
+            sample_volume_quadrature,
+        ) = self._sample_model_shapes(
             model,
             self.spacing,
             shape_indices=shape_indices,
@@ -141,8 +144,8 @@ class FSIBoundaryModel:
             model,
             sample_shape,
             sample_volume,
-            sample_area_box_patch,
-            sample_volume_box_quadrature,
+            sample_area_patch,
+            sample_volume_quadrature,
             self.hydrostatic_volume_mode,
         )
 
@@ -166,8 +169,10 @@ class FSIBoundaryModel:
         self.sample_x_local = wp.array(sample_x_local, dtype=wp.vec3, device=self.device)
         self.sample_normal_local = wp.array(sample_normal_local, dtype=wp.vec3, device=self.device)
         self.sample_volume = wp.array(sample_volume, dtype=float, device=self.device)
-        self.sample_area_box_patch = wp.array(sample_area_box_patch, dtype=float, device=self.device)
-        self.sample_volume_box_quadrature = wp.array(sample_volume_box_quadrature, dtype=float, device=self.device)
+        self.sample_area_patch = wp.array(sample_area_patch, dtype=float, device=self.device)
+        self.sample_volume_quadrature = wp.array(sample_volume_quadrature, dtype=float, device=self.device)
+        self.sample_area_box_patch = self.sample_area_patch
+        self.sample_volume_box_quadrature = self.sample_volume_quadrature
         self.sample_volume_hydrostatic = wp.array(sample_volume_hydrostatic, dtype=float, device=self.device)
         self.sample_volume_hydrostatic_scale = wp.array(
             sample_volume_hydrostatic_scale,
@@ -283,7 +288,7 @@ class FSIBoundaryModel:
         )
 
     @classmethod
-    def _sample_model_boxes(
+    def _sample_model_shapes(
         cls,
         model: Model,
         spacing: float,
@@ -316,14 +321,15 @@ class FSIBoundaryModel:
         sample_shape: list[int] = []
         sample_x_local: list[tuple[float, float, float]] = []
         sample_normal_local: list[tuple[float, float, float]] = []
-        sample_area_box_patch: list[float] = []
-        sample_volume_box_quadrature: list[float] = []
+        sample_area_patch: list[float] = []
+        sample_volume_quadrature: list[float] = []
 
         for shape_idx in indices:
             if shape_idx < 0 or shape_idx >= model.shape_count:
                 raise ValueError(f"Shape index {shape_idx} is out of bounds for {model.shape_count} shapes.")
 
-            if int(shape_type[shape_idx]) != int(GeoType.BOX):
+            geo_type = int(shape_type[shape_idx])
+            if geo_type not in (int(GeoType.BOX), int(GeoType.SPHERE)):
                 continue
 
             body = int(shape_body[shape_idx])
@@ -333,28 +339,32 @@ class FSIBoundaryModel:
                 continue
 
             X_parent_shape = wp.transform(*shape_transform[shape_idx])
-            hx = float(shape_scale[shape_idx][0])
-            hy = float(shape_scale[shape_idx][1])
-            hz = float(shape_scale[shape_idx][2])
-            xs = cls._axis_samples(hx, spacing)
-            ys = cls._axis_samples(hy, spacing)
-            zs = cls._axis_samples(hz, spacing)
-            x_widths = cls._axis_patch_widths(xs)
-            y_widths = cls._axis_patch_widths(ys)
-            z_widths = cls._axis_patch_widths(zs)
+            if geo_type == int(GeoType.BOX):
+                hx = float(shape_scale[shape_idx][0])
+                hy = float(shape_scale[shape_idx][1])
+                hz = float(shape_scale[shape_idx][2])
+                xs = cls._axis_samples(hx, spacing)
+                ys = cls._axis_samples(hy, spacing)
+                zs = cls._axis_samples(hz, spacing)
+                x_widths = cls._axis_patch_widths(xs)
+                y_widths = cls._axis_patch_widths(ys)
+                z_widths = cls._axis_patch_widths(zs)
+                shape_samples = cls._sample_box_surface(
+                    hx,
+                    hy,
+                    hz,
+                    spacing,
+                    xs=xs,
+                    ys=ys,
+                    zs=zs,
+                    x_widths=x_widths,
+                    y_widths=y_widths,
+                    z_widths=z_widths,
+                )
+            else:
+                shape_samples = cls._sample_sphere_surface(float(shape_scale[shape_idx][0]), spacing)
 
-            for point_shape, normal_shape, patch_area, quadrature_volume in cls._sample_box_surface(
-                hx,
-                hy,
-                hz,
-                spacing,
-                xs=xs,
-                ys=ys,
-                zs=zs,
-                x_widths=x_widths,
-                y_widths=y_widths,
-                z_widths=z_widths,
-            ):
+            for point_shape, normal_shape, patch_area, quadrature_volume in shape_samples:
                 point_parent = wp.transform_point(X_parent_shape, wp.vec3(*point_shape))
                 normal_parent = wp.normalize(wp.transform_vector(X_parent_shape, wp.vec3(*normal_shape)))
 
@@ -362,16 +372,16 @@ class FSIBoundaryModel:
                 sample_shape.append(int(shape_idx))
                 sample_x_local.append(cls._vec3_to_tuple(point_parent))
                 sample_normal_local.append(cls._vec3_to_tuple(normal_parent))
-                sample_area_box_patch.append(float(patch_area))
-                sample_volume_box_quadrature.append(float(quadrature_volume))
+                sample_area_patch.append(float(patch_area))
+                sample_volume_quadrature.append(float(quadrature_volume))
 
         return (
             sample_body,
             sample_shape,
             sample_x_local,
             sample_normal_local,
-            sample_area_box_patch,
-            sample_volume_box_quadrature,
+            sample_area_patch,
+            sample_volume_quadrature,
         )
 
     @classmethod
@@ -449,15 +459,16 @@ class FSIBoundaryModel:
         model: Model,
         sample_shape: Sequence[int],
         sample_volume: Sequence[float],
-        sample_area_box_patch: Sequence[float],
-        sample_volume_box_quadrature: Sequence[float],
+        sample_area_patch: Sequence[float],
+        sample_volume_quadrature: Sequence[float],
         hydrostatic_volume_mode: int,
     ) -> tuple[list[float], list[float]]:
         if len(sample_volume) == 0:
             return [], []
 
         raw_volume = np.asarray(sample_volume, dtype=np.float32)
-        area_box_patch = np.asarray(sample_area_box_patch, dtype=np.float32)
+        area_patch = np.asarray(sample_area_patch, dtype=np.float32)
+        volume_quadrature = np.asarray(sample_volume_quadrature, dtype=np.float32)
         volume_hydrostatic = raw_volume.copy()
         hydrostatic_scale = np.ones(len(sample_volume), dtype=np.float32)
 
@@ -474,7 +485,8 @@ class FSIBoundaryModel:
             sample_indices_by_shape.setdefault(int(shape_index), []).append(sample_index)
 
         for shape_index, indices in sample_indices_by_shape.items():
-            if int(shape_type[shape_index]) != int(GeoType.BOX):
+            geo_type = int(shape_type[shape_index])
+            if geo_type not in (int(GeoType.BOX), int(GeoType.SPHERE)):
                 continue
 
             body = int(shape_body[shape_index])
@@ -482,6 +494,9 @@ class FSIBoundaryModel:
                 continue
 
             if hydrostatic_volume_mode in (
+                int(cls.HydrostaticVolumeMode.DYNAMIC_SHAPE_VOLUME),
+                int(cls.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_QUADRATURE),
+                int(cls.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_THICKNESS),
                 int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_VOLUME),
                 int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_QUADRATURE),
                 int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_THICKNESS),
@@ -489,8 +504,11 @@ class FSIBoundaryModel:
                 if body_flags is None or (int(body_flags[body]) & int(BodyFlags.KINEMATIC)) != 0:
                     continue
 
-            if hydrostatic_volume_mode == int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_QUADRATURE):
-                target_volume = np.asarray(sample_volume_box_quadrature, dtype=np.float32)[indices]
+            if hydrostatic_volume_mode in (
+                int(cls.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_QUADRATURE),
+                int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_QUADRATURE),
+            ):
+                target_volume = volume_quadrature[indices]
                 volume_hydrostatic[indices] = target_volume
                 hydrostatic_scale[indices] = np.divide(
                     target_volume,
@@ -500,8 +518,11 @@ class FSIBoundaryModel:
                 )
                 continue
 
-            if hydrostatic_volume_mode == int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_THICKNESS):
-                patch_area = area_box_patch[indices]
+            if hydrostatic_volume_mode in (
+                int(cls.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_THICKNESS),
+                int(cls.HydrostaticVolumeMode.DYNAMIC_BOX_SURFACE_THICKNESS),
+            ):
+                patch_area = area_patch[indices]
                 patch_area_sum = float(np.sum(patch_area))
                 raw_sum = float(np.sum(raw_volume[indices]))
                 if patch_area_sum <= 0.0 or raw_sum <= 0.0:
@@ -518,10 +539,7 @@ class FSIBoundaryModel:
                 )
                 continue
 
-            hx = float(shape_scale[shape_index][0])
-            hy = float(shape_scale[shape_index][1])
-            hz = float(shape_scale[shape_index][2])
-            target_volume = 8.0 * hx * hy * hz
+            target_volume = cls._shape_geometric_volume(geo_type, shape_scale[shape_index])
             if target_volume <= 0.0:
                 continue
 
@@ -574,6 +592,50 @@ class FSIBoundaryModel:
         return values
 
     @staticmethod
+    def _shape_geometric_volume(geo_type: int, scale: wp.vec3) -> float:
+        if geo_type == int(GeoType.BOX):
+            return 8.0 * float(scale[0]) * float(scale[1]) * float(scale[2])
+        if geo_type == int(GeoType.SPHERE):
+            radius = float(scale[0])
+            return (4.0 / 3.0) * math.pi * radius * radius * radius
+        return 0.0
+
+    @staticmethod
+    def _sample_sphere_surface(
+        radius: float,
+        spacing: float,
+    ) -> list[tuple[tuple[float, float, float], tuple[float, float, float], float, float]]:
+        if radius <= 0.0:
+            return []
+
+        sample_count = max(12, int(math.ceil((4.0 * math.pi * radius * radius) / (spacing * spacing))))
+        patch_area = 4.0 * math.pi * radius * radius / sample_count
+        quadrature_volume = patch_area * radius / 3.0
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+
+        samples: list[tuple[tuple[float, float, float], tuple[float, float, float], float, float]] = []
+        for sample_index in range(sample_count):
+            y = 1.0 - 2.0 * (sample_index + 0.5) / sample_count
+            r_xy = math.sqrt(max(0.0, 1.0 - y * y))
+            theta = golden_angle * sample_index
+            normal = (
+                math.cos(theta) * r_xy,
+                y,
+                math.sin(theta) * r_xy,
+            )
+            point = tuple(radius * component for component in normal)
+            samples.append(
+                (
+                    tuple(float(component) for component in point),
+                    tuple(float(component) for component in normal),
+                    float(patch_area),
+                    float(quadrature_volume),
+                )
+            )
+
+        return samples
+
+    @staticmethod
     def _sample_box_surface(
         hx: float,
         hy: float,
@@ -586,7 +648,7 @@ class FSIBoundaryModel:
         x_widths: np.ndarray | None = None,
         y_widths: np.ndarray | None = None,
         z_widths: np.ndarray | None = None,
-    ) -> list[tuple[tuple[float, float, float], tuple[float, float, float], float]]:
+    ) -> list[tuple[tuple[float, float, float], tuple[float, float, float], float, float]]:
         xs = FSIBoundaryModel._axis_samples(hx, spacing) if xs is None else xs
         ys = FSIBoundaryModel._axis_samples(hy, spacing) if ys is None else ys
         zs = FSIBoundaryModel._axis_samples(hz, spacing) if zs is None else zs

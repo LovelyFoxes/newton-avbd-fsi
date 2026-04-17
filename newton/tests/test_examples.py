@@ -630,6 +630,14 @@ add_example_test(
     use_viewer=True,
 )
 
+add_example_test(
+    TestFSIExamples,
+    name="fsi.example_fsi_ipbf_vbd_three_sphere_buoys",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+
 
 class TestSensorExamples(unittest.TestCase):
     pass
