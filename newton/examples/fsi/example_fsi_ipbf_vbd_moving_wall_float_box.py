@@ -424,6 +424,7 @@ class Example:
         self.max_box_linear_speed = 0.0
         self.max_box_angular_speed = 0.0
         self.max_box_force_norm = 0.0
+        self.max_box_step_avg_force_norm = 0.0
         self.max_sample_force_norm = 0.0
         self.states_remain_finite = True
 
@@ -661,6 +662,7 @@ class Example:
         self.max_box_linear_speed = 0.0
         self.max_box_angular_speed = 0.0
         self.max_box_force_norm = 0.0
+        self.max_box_step_avg_force_norm = 0.0
         self.max_sample_force_norm = 0.0
         self.states_remain_finite = True
         self.viewer._paused = True
@@ -677,6 +679,7 @@ class Example:
         body_q = self.state_0.body_q.numpy()
         body_qd = self.state_0.body_qd.numpy()
         body_force = self.boundary_model.body_force.numpy()
+        body_force_step_avg = self.boundary_model.body_force_step_avg.numpy()
         sample_force = self.boundary_model.sample_force.numpy()
         sample_body = self.boundary_model.sample_body.numpy()
 
@@ -690,6 +693,7 @@ class Example:
             and np.isfinite(body_q).all()
             and np.isfinite(body_qd).all()
             and np.isfinite(body_force).all()
+            and np.isfinite(body_force_step_avg).all()
             and np.isfinite(sample_force).all()
         )
 
@@ -714,6 +718,11 @@ class Example:
             self.max_box_force_norm = max(
                 self.max_box_force_norm,
                 float(np.linalg.norm(body_force[self.float_box_body])),
+            )
+        if body_force_step_avg.size:
+            self.max_box_step_avg_force_norm = max(
+                self.max_box_step_avg_force_norm,
+                float(np.linalg.norm(body_force_step_avg[self.float_box_body])),
             )
         if sample_force.size:
             float_box_sample_force = sample_force[sample_body == self.float_box_body]
@@ -894,7 +903,8 @@ class Example:
         assert self.max_box_angular_speed < 30.0, (
             f"float box angular speed blew up: wmax={self.max_box_angular_speed:.3f}"
         )
-        assert self.max_box_force_norm > expected_min_box_force_norm, "floating box never received body reaction"
+        max_box_reaction_norm = max(self.max_box_force_norm, self.max_box_step_avg_force_norm)
+        assert max_box_reaction_norm > expected_min_box_force_norm, "floating box never received body reaction"
         assert self.max_sample_force_norm > expected_min_sample_force_norm, (
             "floating-box boundary samples never received reaction forces"
         )

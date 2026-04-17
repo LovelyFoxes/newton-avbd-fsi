@@ -337,6 +337,67 @@ def test_dynamic_box_surface_thickness_matches_raw_total_with_patch_distribution
     np.testing.assert_allclose(hydrostatic_scale[kinematic_mask], np.ones_like(hydrostatic_scale[kinematic_mask]))
 
 
+def test_step_reaction_diagnostics_accumulate_body_wrenches(test: unittest.TestCase, device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    body_a = builder.add_body(xform=wp.transform(wp.vec3(0.0), wp.quat_identity()))
+    body_b = builder.add_body(xform=wp.transform(wp.vec3(1.0, 0.0, 0.0), wp.quat_identity()))
+    builder.add_shape_box(body_a, hx=0.25, hy=0.25, hz=0.25)
+    builder.add_shape_box(body_b, hx=0.25, hy=0.25, hz=0.25)
+    model = builder.finalize(device=device)
+    boundary = FSIBoundaryModel(model, spacing=0.25, support_radius=0.5, device=device)
+
+    force_a = np.array([[1.0, 2.0, 2.0], [-3.0, 0.0, 4.0]], dtype=np.float32)
+    torque_a = np.array([[0.0, 3.0, 4.0], [2.0, 1.0, 2.0]], dtype=np.float32)
+    force_b = np.array([[0.5, -1.0, 0.0], [0.0, 5.0, 0.0]], dtype=np.float32)
+    torque_b = np.array([[1.0, 0.0, 0.0], [0.0, -4.0, 3.0]], dtype=np.float32)
+
+    boundary.body_force.assign(force_a)
+    boundary.body_torque.assign(torque_a)
+    boundary.accumulate_step_diagnostics()
+
+    np.testing.assert_array_equal(boundary.body_force_step_count.numpy(), np.array([1], dtype=np.int32))
+    np.testing.assert_allclose(boundary.body_force_step_sum.numpy(), force_a, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_torque_step_sum.numpy(), torque_a, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_force_step_avg.numpy(), force_a, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_torque_step_avg.numpy(), torque_a, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(
+        boundary.body_force_step_max_norm.numpy(),
+        np.linalg.norm(force_a, axis=1),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+    boundary.clear_forces()
+    np.testing.assert_allclose(boundary.body_force.numpy(), np.zeros_like(force_a), atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_force_step_sum.numpy(), force_a, rtol=1.0e-6, atol=1.0e-6)
+
+    boundary.body_force.assign(force_b)
+    boundary.body_torque.assign(torque_b)
+    boundary.accumulate_step_diagnostics()
+
+    expected_force_sum = force_a + force_b
+    expected_torque_sum = torque_a + torque_b
+    np.testing.assert_array_equal(boundary.body_force_step_count.numpy(), np.array([2], dtype=np.int32))
+    np.testing.assert_allclose(boundary.body_force_step_sum.numpy(), expected_force_sum, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_torque_step_sum.numpy(), expected_torque_sum, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_force_step_avg.numpy(), 0.5 * expected_force_sum, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(
+        boundary.body_torque_step_avg.numpy(), 0.5 * expected_torque_sum, rtol=1.0e-6, atol=1.0e-6
+    )
+    np.testing.assert_allclose(
+        boundary.body_force_step_max_norm.numpy(),
+        np.maximum(np.linalg.norm(force_a, axis=1), np.linalg.norm(force_b, axis=1)),
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+
+    boundary.clear_step_diagnostics()
+    np.testing.assert_array_equal(boundary.body_force_step_count.numpy(), np.array([0], dtype=np.int32))
+    np.testing.assert_allclose(boundary.body_force_step_sum.numpy(), np.zeros_like(force_a), atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_force_step_avg.numpy(), np.zeros_like(force_a), atol=1.0e-6)
+    np.testing.assert_allclose(boundary.body_force_step_max_norm.numpy(), np.zeros(model.body_count), atol=1.0e-6)
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -376,6 +437,13 @@ add_function_test(
     TestFSIBoundaryModel,
     "test_dynamic_box_surface_thickness_matches_raw_total_with_patch_distribution",
     test_dynamic_box_surface_thickness_matches_raw_total_with_patch_distribution,
+    devices=devices,
+)
+
+add_function_test(
+    TestFSIBoundaryModel,
+    "test_step_reaction_diagnostics_accumulate_body_wrenches",
+    test_step_reaction_diagnostics_accumulate_body_wrenches,
     devices=devices,
 )
 

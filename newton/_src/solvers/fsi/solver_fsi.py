@@ -140,6 +140,8 @@ class SolverFSI(SolverBase):
                 to the solid solver depending on :attr:`Config.pass_contacts_to_solid`.
             dt: Time step size [s].
         """
+        self.boundary_model.clear_step_diagnostics()
+
         if self.config.mode == self.Config.CouplingMode.LOOSE:
             self._step_loose(state_in, state_out, control, contacts, dt)
         elif self.config.mode == self.Config.CouplingMode.INTERLINKED:
@@ -157,6 +159,7 @@ class SolverFSI(SolverBase):
     ) -> None:
         """Advance one loose-coupled FSI timestep."""
         self.fluid_solver.step(state_in, self._fluid_state, control, contacts, dt)
+        self.boundary_model.accumulate_step_diagnostics()
 
         solid_contacts = contacts if self.config.pass_contacts_to_solid else None
         self.solid_solver.step(self._fluid_state, state_out, control, solid_contacts, dt)
@@ -205,6 +208,7 @@ class SolverFSI(SolverBase):
                     iteration,
                     coupling_iterations,
                 )
+            self.boundary_model.accumulate_step_diagnostics()
             self.solid_solver._solve_iteration(
                 self._fluid_state,
                 state_out,

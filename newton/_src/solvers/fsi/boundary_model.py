@@ -26,7 +26,11 @@ import warp as wp
 
 from ...geometry import GeoType
 from ...sim import BodyFlags, Model, State
-from .boundary_kernels import update_boundary_sample_world_kinematics
+from .boundary_kernels import (
+    accumulate_step_reaction_diagnostics,
+    update_boundary_sample_world_kinematics,
+    update_step_reaction_averages,
+)
 
 __all__ = [
     "BoundarySampleFlags",
@@ -60,6 +64,10 @@ class FSIBoundaryModel:
         hydrostatic_volume_mode: Optional hydrostatic normalization applied to
             boundary sample volumes before they are consumed by density and
             pressure-coupling paths.
+        Step-level reaction diagnostics are accumulated separately from the
+            transient ``body_force`` and ``body_torque`` buffers so interlinked
+            solver schedules can report the average wrench consumed over a
+            timestep.
         shape_indices: Optional subset of shape indices to sample.
         include_static: Whether static shapes with ``shape_body == -1`` are sampled.
         include_dynamic: Whether body-attached shapes are sampled.
@@ -176,6 +184,13 @@ class FSIBoundaryModel:
         body_count = int(getattr(model, "body_count", 0))
         self.body_force = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
         self.body_torque = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
+        self.body_force_step_sum = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
+        self.body_torque_step_sum = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
+        self.body_force_step_avg = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
+        self.body_torque_step_avg = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
+        self.body_force_step_max_norm = wp.zeros(body_count, dtype=float, device=self.device)
+        self.body_torque_step_max_norm = wp.zeros(body_count, dtype=float, device=self.device)
+        self.body_force_step_count = wp.zeros(1, dtype=wp.int32, device=self.device)
 
         self.boundary_grid = wp.HashGrid(128, 128, 128, device=self.device) if self.sample_count > 0 else None
 
@@ -220,6 +235,52 @@ class FSIBoundaryModel:
         self.sample_force.zero_()
         self.body_force.zero_()
         self.body_torque.zero_()
+
+    def clear_step_diagnostics(self) -> None:
+        """Clear step-level FSI reaction diagnostics."""
+        self.body_force_step_sum.zero_()
+        self.body_torque_step_sum.zero_()
+        self.body_force_step_avg.zero_()
+        self.body_torque_step_avg.zero_()
+        self.body_force_step_max_norm.zero_()
+        self.body_torque_step_max_norm.zero_()
+        self.body_force_step_count.zero_()
+
+    def accumulate_step_diagnostics(self) -> None:
+        """Accumulate the current body wrench into step-level diagnostics."""
+        if self.body_force.shape[0] == 0:
+            return
+
+        wp.launch(
+            accumulate_step_reaction_diagnostics,
+            dim=self.body_force.shape[0],
+            inputs=[
+                self.body_force,
+                self.body_torque,
+            ],
+            outputs=[
+                self.body_force_step_sum,
+                self.body_torque_step_sum,
+                self.body_force_step_max_norm,
+                self.body_torque_step_max_norm,
+                self.body_force_step_count,
+            ],
+            device=self.device,
+        )
+        wp.launch(
+            update_step_reaction_averages,
+            dim=self.body_force.shape[0],
+            inputs=[
+                self.body_force_step_sum,
+                self.body_torque_step_sum,
+                self.body_force_step_count,
+            ],
+            outputs=[
+                self.body_force_step_avg,
+                self.body_torque_step_avg,
+            ],
+            device=self.device,
+        )
 
     @classmethod
     def _sample_model_boxes(

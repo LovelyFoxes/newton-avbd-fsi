@@ -19,6 +19,52 @@ import warp as wp
 
 
 @wp.kernel
+def accumulate_step_reaction_diagnostics(
+    body_force: wp.array(dtype=wp.vec3),
+    body_torque: wp.array(dtype=wp.vec3),
+    body_force_step_sum: wp.array(dtype=wp.vec3),
+    body_torque_step_sum: wp.array(dtype=wp.vec3),
+    body_force_step_max_norm: wp.array(dtype=float),
+    body_torque_step_max_norm: wp.array(dtype=float),
+    body_force_step_count: wp.array(dtype=wp.int32),
+):
+    """Accumulate the current FSI body wrench into step-level diagnostics."""
+    tid = wp.tid()
+
+    force = body_force[tid]
+    torque = body_torque[tid]
+    body_force_step_sum[tid] = body_force_step_sum[tid] + force
+    body_torque_step_sum[tid] = body_torque_step_sum[tid] + torque
+    body_force_step_max_norm[tid] = wp.max(body_force_step_max_norm[tid], wp.length(force))
+    body_torque_step_max_norm[tid] = wp.max(body_torque_step_max_norm[tid], wp.length(torque))
+
+    if tid == 0:
+        body_force_step_count[0] = body_force_step_count[0] + 1
+
+
+@wp.kernel
+def update_step_reaction_averages(
+    body_force_step_sum: wp.array(dtype=wp.vec3),
+    body_torque_step_sum: wp.array(dtype=wp.vec3),
+    body_force_step_count: wp.array(dtype=wp.int32),
+    body_force_step_avg: wp.array(dtype=wp.vec3),
+    body_torque_step_avg: wp.array(dtype=wp.vec3),
+):
+    """Update step-average FSI body wrenches from accumulated sums."""
+    tid = wp.tid()
+
+    count = body_force_step_count[0]
+    if count <= 0:
+        body_force_step_avg[tid] = wp.vec3(0.0)
+        body_torque_step_avg[tid] = wp.vec3(0.0)
+        return
+
+    inv_count = 1.0 / float(count)
+    body_force_step_avg[tid] = body_force_step_sum[tid] * inv_count
+    body_torque_step_avg[tid] = body_torque_step_sum[tid] * inv_count
+
+
+@wp.kernel
 def update_boundary_sample_world_kinematics(
     sample_body: wp.array(dtype=wp.int32),
     sample_x_local: wp.array(dtype=wp.vec3),
