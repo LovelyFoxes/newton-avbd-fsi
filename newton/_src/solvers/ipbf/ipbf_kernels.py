@@ -1570,6 +1570,68 @@ def accumulate_particle_triangle_contact_corrections(
 
 
 @wp.kernel
+def accumulate_particle_triangle_contact_corrections_from_bvh(
+    triangle_contact_bvh: wp.uint64,
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    particle_q_prev: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    contact_margin: float,
+    relaxation: float,
+    continuous_enabled: int,
+    dt: float,
+    particle_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta_total: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate particle-triangle contact corrections from a swept triangle BVH."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+    if relaxation == 0.0:
+        return
+
+    query_padding = particle_radius[tid] + contact_margin
+    if query_padding <= 0.0:
+        return
+
+    x_prev = particle_q_prev[tid]
+    x = particle_q[tid]
+    lower = wp.min(x_prev, x) - wp.vec3(query_padding)
+    upper = wp.max(x_prev, x) + wp.vec3(query_padding)
+
+    query = wp.bvh_query_aabb(triangle_contact_bvh, lower, upper)
+    triangle_leaf = wp.int32(-1)
+
+    while wp.bvh_query_next(query, triangle_leaf):
+        tri = contact_triangle_indices[triangle_leaf]
+        accumulate_particle_triangle_contact_correction(
+            tid,
+            tri,
+            particle_q_prev,
+            particle_q,
+            particle_mass,
+            particle_inv_mass,
+            particle_radius,
+            tri_indices,
+            contact_margin,
+            relaxation,
+            continuous_enabled,
+            dt,
+            particle_contact_delta,
+            vertex_contact_delta,
+            vertex_contact_delta_total,
+            vertex_force,
+        )
+
+
+@wp.kernel
 def accumulate_particle_triangle_contact_corrections_from_grid(
     triangle_contact_grid: wp.uint64,
     particle_q_prev: wp.array(dtype=wp.vec3),

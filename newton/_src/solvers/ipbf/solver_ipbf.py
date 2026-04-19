@@ -38,6 +38,7 @@ from .ipbf_kernels import (
     accumulate_particle_shape_boundary_velocity_projection,
     accumulate_particle_shape_boundary_velocity_projection_with_reaction,
     accumulate_particle_triangle_contact_corrections,
+    accumulate_particle_triangle_contact_corrections_from_bvh,
     accumulate_particle_triangle_contact_corrections_from_grid,
     apply_artificial_damping,
     apply_particle_triangle_contact_deltas,
@@ -146,13 +147,17 @@ class SolverIPBF(SolverBase):
                 velocity-smoothing / viscosity paths.
             fsi_triangle_contact_enabled: Whether active fluid particles are
                 projected against triangle-bound deformable FSI boundaries.
+            fsi_triangle_contact_use_bvh: Whether deformable triangle contact
+                should query a swept triangle BVH before falling back to the
+                legacy proxy-grid or brute-force scan paths.
             fsi_triangle_contact_use_grid: Whether deformable triangle contact
                 should use the boundary model's triangle proxy grid instead of
-                scanning every sampled triangle.
+                scanning every sampled triangle when BVH broadphase is
+                disabled or unavailable.
             fsi_triangle_contact_search_radius: Candidate triangle proxy query
-                radius [m]. If ``None``, a conservative radius based on the
-                triangle proxy radius, particle radius, and contact margin is
-                used.
+                radius [m] used by the proxy-grid fallback. If ``None``, a
+                conservative radius based on the triangle proxy radius,
+                particle radius, and contact margin is used.
             fsi_triangle_contact_continuous_enabled: Whether deformable
                 triangle contact should use a swept moving-triangle side-change
                 test between the previous and current particle/triangle
@@ -194,6 +199,7 @@ class SolverIPBF(SolverBase):
         fsi_pressure_reaction_relaxation: float = 1.0
         fsi_static_boundary_weight: float = 1.0
         fsi_triangle_contact_enabled: bool = True
+        fsi_triangle_contact_use_bvh: bool = True
         fsi_triangle_contact_use_grid: bool = True
         fsi_triangle_contact_search_radius: float | None = None
         fsi_triangle_contact_continuous_enabled: bool = True
@@ -395,6 +401,7 @@ class SolverIPBF(SolverBase):
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
         self.fsi_triangle_contact_enabled = bool(self.config.fsi_triangle_contact_enabled)
+        self.fsi_triangle_contact_use_bvh = bool(self.config.fsi_triangle_contact_use_bvh)
         self.fsi_triangle_contact_use_grid = bool(self.config.fsi_triangle_contact_use_grid)
         configured_triangle_contact_search_radius = self.config.fsi_triangle_contact_search_radius
         self.fsi_triangle_contact_search_radius = (
@@ -690,6 +697,36 @@ class SolverIPBF(SolverBase):
             self._triangle_contact_vertex_delta.zero_()
 
             if (
+                self.fsi_triangle_contact_use_bvh
+                and getattr(boundary_model, "triangle_contact_bvh", None) is not None
+            ):
+                wp.launch(
+                    accumulate_particle_triangle_contact_corrections_from_bvh,
+                    dim=model.particle_count,
+                    inputs=[
+                        boundary_model.triangle_contact_bvh.id,
+                        boundary_model.triangle_indices,
+                        boundary_model.triangle_contact_particle_q_prev,
+                        state.particle_q,
+                        model.particle_mass,
+                        model.particle_inv_mass,
+                        model.particle_radius,
+                        self._ipbf_particle_flags,
+                        model.tri_indices,
+                        self.fsi_triangle_contact_margin,
+                        self.fsi_triangle_contact_relaxation,
+                        int(self.fsi_triangle_contact_continuous_enabled),
+                        dt,
+                    ],
+                    outputs=[
+                        self._triangle_contact_particle_delta,
+                        self._triangle_contact_vertex_delta,
+                        boundary_model.vertex_contact_delta,
+                        boundary_model.vertex_force,
+                    ],
+                    device=model.device,
+                )
+            elif (
                 self.fsi_triangle_contact_use_grid
                 and getattr(boundary_model, "triangle_contact_grid", None) is not None
             ):

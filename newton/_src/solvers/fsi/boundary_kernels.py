@@ -159,6 +159,46 @@ def update_deformable_triangle_contact_proxy_world_kinematics(
 
 
 @wp.kernel
+def update_deformable_triangle_contact_swept_aabbs(
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    particle_q_prev: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    contact_triangle_aabb_lower: wp.array(dtype=wp.vec3),
+    contact_triangle_aabb_upper: wp.array(dtype=wp.vec3),
+):
+    """Update swept AABBs for sampled deformable triangle contacts."""
+    tid = wp.tid()
+
+    tri = contact_triangle_indices[tid]
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+
+    x0_prev = particle_q_prev[v0]
+    x1_prev = particle_q_prev[v1]
+    x2_prev = particle_q_prev[v2]
+    x0 = particle_q[v0]
+    x1 = particle_q[v1]
+    x2 = particle_q[v2]
+
+    lower = wp.min(x0_prev, x1_prev)
+    lower = wp.min(lower, x2_prev)
+    lower = wp.min(lower, x0)
+    lower = wp.min(lower, x1)
+    lower = wp.min(lower, x2)
+
+    upper = wp.max(x0_prev, x1_prev)
+    upper = wp.max(upper, x2_prev)
+    upper = wp.max(upper, x0)
+    upper = wp.max(upper, x1)
+    upper = wp.max(upper, x2)
+
+    contact_triangle_aabb_lower[tid] = lower
+    contact_triangle_aabb_upper[tid] = upper
+
+
+@wp.kernel
 def update_deformable_triangle_contact_proxy_query_kinematics(
     contact_triangle_x_prev: wp.array(dtype=wp.vec3),
     contact_triangle_x_world: wp.array(dtype=wp.vec3),

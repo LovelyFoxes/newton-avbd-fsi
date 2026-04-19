@@ -525,26 +525,32 @@ def test_triangle_samples_follow_deformable_particles(test: unittest.TestCase, d
     test.assertEqual(boundary.triangle_sample_count, 1)
     test.assertEqual(boundary.triangle_count, 1)
     test.assertIsNotNone(boundary.triangle_contact_grid)
+    test.assertIsNone(boundary.triangle_contact_bvh)
 
     boundary.update_world_kinematics(state)
     boundary.build_grid()
 
     barycentric = boundary.sample_barycentric.numpy()[0]
-    q = state.particle_q.numpy()
-    qd = state.particle_qd.numpy()
+    q = state.particle_q.numpy().copy()
+    qd = state.particle_qd.numpy().copy()
     expected_x = barycentric[0] * q[0] + barycentric[1] * q[1] + barycentric[2] * q[2]
     expected_v = barycentric[0] * qd[0] + barycentric[1] * qd[1] + barycentric[2] * qd[2]
     expected_contact_radius = float(np.linalg.norm(q - np.mean(q, axis=0), axis=1).max())
+    expected_lower = np.min(q, axis=0)
+    expected_upper = np.max(q, axis=0)
 
     np.testing.assert_allclose(barycentric, np.full(3, 1.0 / 3.0, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(boundary.sample_x_world.numpy()[0], expected_x, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(boundary.sample_v_world.numpy()[0], expected_v, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(boundary.sample_normal_world.numpy()[0], [0.0, 0.0, 1.0], rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(boundary.triangle_contact_x_world.numpy()[0], expected_x, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.triangle_contact_aabb_lower.numpy()[0], expected_lower, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.triangle_contact_aabb_upper.numpy()[0], expected_upper, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(
         boundary.triangle_contact_radius.numpy(), np.array([expected_contact_radius], dtype=np.float32), atol=1.0e-6
     )
     test.assertAlmostEqual(boundary.triangle_contact_radius_max, expected_contact_radius, places=6)
+    test.assertIsNotNone(boundary.triangle_contact_bvh)
     np.testing.assert_allclose(boundary.sample_area_patch.numpy(), np.array([0.5], dtype=np.float32), atol=1.0e-6)
     np.testing.assert_allclose(boundary.sample_volume.numpy(), np.array([0.1], dtype=np.float32), atol=1.0e-6)
     np.testing.assert_allclose(
@@ -576,12 +582,21 @@ def test_triangle_samples_follow_deformable_particles(test: unittest.TestCase, d
     state.particle_q.assign(moved_q)
     state.particle_qd.assign(moved_qd)
     boundary.update_world_kinematics(state)
+    boundary.build_grid()
 
     expected_moved_x = barycentric[0] * moved_q[0] + barycentric[1] * moved_q[1] + barycentric[2] * moved_q[2]
     expected_moved_v = barycentric[0] * moved_qd[0] + barycentric[1] * moved_qd[1] + barycentric[2] * moved_qd[2]
+    expected_swept_lower = np.min(np.vstack([q, moved_q]), axis=0)
+    expected_swept_upper = np.max(np.vstack([q, moved_q]), axis=0)
     np.testing.assert_allclose(boundary.sample_x_world.numpy()[0], expected_moved_x, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(boundary.sample_v_world.numpy()[0], expected_moved_v, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(boundary.triangle_contact_x_world.numpy()[0], expected_moved_x, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(
+        boundary.triangle_contact_aabb_lower.numpy()[0], expected_swept_lower, rtol=1.0e-6, atol=1.0e-6
+    )
+    np.testing.assert_allclose(
+        boundary.triangle_contact_aabb_upper.numpy()[0], expected_swept_upper, rtol=1.0e-6, atol=1.0e-6
+    )
     np.testing.assert_allclose(boundary.sample_normal_world.numpy()[0], [0.0, 0.0, 1.0], rtol=1.0e-6, atol=1.0e-6)
 
 
