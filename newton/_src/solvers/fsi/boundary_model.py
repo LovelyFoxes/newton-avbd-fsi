@@ -194,6 +194,8 @@ class FSIBoundaryModel:
         self.sample_count = len(sample_body)
         self.shape_sample_count_total = shape_sample_count_total
         self.triangle_sample_count = len(sample_triangle)
+        self.triangle_indices = wp.array(sorted(set(sample_triangle)), dtype=wp.int32, device=self.device)
+        self.triangle_count = self.triangle_indices.shape[0]
         shape_sample_count = [0 for _ in range(model.shape_count)]
         for shape in sample_shape:
             if shape >= 0:
@@ -261,6 +263,7 @@ class FSIBoundaryModel:
         self.sample_normal_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_force = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.vertex_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.vertex_contact_delta = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
 
         body_count = int(getattr(model, "body_count", 0))
         self.body_force = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
@@ -336,9 +339,10 @@ class FSIBoundaryModel:
             self.boundary_grid.build(self.sample_x_world, radius=self.support_radius)
 
     def clear_forces(self) -> None:
-        """Clear boundary sample and body wrench accumulators."""
+        """Clear boundary sample, body wrench, and deformable reaction accumulators."""
         self.sample_force.zero_()
         self.vertex_force.zero_()
+        self.vertex_contact_delta.zero_()
         self.body_force.zero_()
         self.body_torque.zero_()
 

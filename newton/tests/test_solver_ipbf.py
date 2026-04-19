@@ -1100,6 +1100,101 @@ def test_ipbf_triangle_boundary_pressure_reaction_scatters_to_vertices(test, dev
     )
 
 
+def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.02),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0, 1.0, 1.0],
+        radius=[0.05, 0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(1, 2, 3)
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=0,
+            use_constraint_clamp=False,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_triangle_contact_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    initial_q = state_0.particle_q.numpy().copy()
+
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    q = state_1.particle_q.numpy()
+    vertex_delta = boundary_model.vertex_contact_delta.numpy()
+    barycentric = np.full(3, 1.0 / 3.0, dtype=np.float32)
+    expected_fluid_delta = np.array([0.0, 0.0, 0.0225], dtype=np.float32)
+    expected_vertex_delta = np.array([0.0, 0.0, -0.0075], dtype=np.float32)
+
+    test.assertEqual(boundary_model.triangle_count, 1)
+    np.testing.assert_array_equal(boundary_model.triangle_indices.numpy(), np.array([0], dtype=np.int32))
+    np.testing.assert_allclose(q[0] - initial_q[0], expected_fluid_delta, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(q[1:], initial_q[1:], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_delta[0], np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_delta[1], expected_vertex_delta, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_delta[2], expected_vertex_delta, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_delta[3], expected_vertex_delta, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_delta[1] + vertex_delta[2] + vertex_delta[3], -expected_fluid_delta)
+
+    effective_triangle_point = (
+        barycentric[0] * (q[1] + vertex_delta[1])
+        + barycentric[1] * (q[2] + vertex_delta[2])
+        + barycentric[2] * (q[3] + vertex_delta[3])
+    )
+    test.assertAlmostEqual(float(q[0, 2] - effective_triangle_point[2]), 0.05, places=5)
+
+    boundary_model.clear_forces()
+    np.testing.assert_allclose(
+        boundary_model.vertex_contact_delta.numpy(), np.zeros_like(vertex_delta), rtol=1.0e-6, atol=1.0e-6
+    )
+
+    solver.fsi_triangle_contact_enabled = False
+    state_disabled = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_disabled, control=None, contacts=None, dt=0.05)
+
+    np.testing.assert_allclose(state_disabled.particle_q.numpy(), initial_q, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(
+        boundary_model.vertex_contact_delta.numpy(), np.zeros_like(vertex_delta), rtol=1.0e-6, atol=1.0e-6
+    )
+
+
 def test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing(test, device):
     _, coarse_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.25)
     _, fine_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.125)
@@ -1962,6 +2057,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_triangle_boundary_pressure_reaction_scatters_to_vertices",
     test_ipbf_triangle_boundary_pressure_reaction_scatters_to_vertices,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta",
+    test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta,
     devices=devices,
     check_output=False,
 )

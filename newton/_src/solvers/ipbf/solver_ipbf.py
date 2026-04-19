@@ -37,7 +37,9 @@ from .ipbf_kernels import (
     accumulate_boundary_pressure_reaction,
     accumulate_particle_shape_boundary_velocity_projection,
     accumulate_particle_shape_boundary_velocity_projection_with_reaction,
+    accumulate_particle_triangle_contact_corrections,
     apply_artificial_damping,
+    apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
     apply_viscosity_velocity_diffusion,
     apply_viscosity_velocity_diffusion_with_boundary,
@@ -141,6 +143,12 @@ class SolverIPBF(SolverBase):
                 to static boundary-sample contributions in the density,
                 constraint-gradient, pressure-reaction, and boundary-aware
                 velocity-smoothing / viscosity paths.
+            fsi_triangle_contact_enabled: Whether active fluid particles are
+                projected against triangle-bound deformable FSI boundaries.
+            fsi_triangle_contact_margin: Additional particle-triangle contact
+                margin [m] added to the fluid particle radius.
+            fsi_triangle_contact_relaxation: Unitless relaxation used when
+                applying symmetric particle-triangle contact corrections.
             fluid_particle_start: First particle index solved as IPBF fluid.
             fluid_particle_count: Number of consecutive particles solved as
                 IPBF fluid. If ``None``, all particles from
@@ -173,6 +181,9 @@ class SolverIPBF(SolverBase):
         fsi_velocity_projection_reaction_relaxation: float | None = None
         fsi_pressure_reaction_relaxation: float = 1.0
         fsi_static_boundary_weight: float = 1.0
+        fsi_triangle_contact_enabled: bool = True
+        fsi_triangle_contact_margin: float = 0.0
+        fsi_triangle_contact_relaxation: float = 1.0
         fluid_particle_start: int = 0
         fluid_particle_count: int | None = None
 
@@ -368,6 +379,13 @@ class SolverIPBF(SolverBase):
         self.fsi_static_boundary_weight = float(self.config.fsi_static_boundary_weight)
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
+        self.fsi_triangle_contact_enabled = bool(self.config.fsi_triangle_contact_enabled)
+        self.fsi_triangle_contact_margin = float(self.config.fsi_triangle_contact_margin)
+        if self.fsi_triangle_contact_margin < 0.0:
+            raise ValueError("IPBF triangle contact margin must be non-negative.")
+        self.fsi_triangle_contact_relaxation = float(self.config.fsi_triangle_contact_relaxation)
+        if self.fsi_triangle_contact_relaxation < 0.0:
+            raise ValueError("IPBF triangle contact relaxation must be non-negative.")
         self.fluid_particle_start, self.fluid_particle_count = self._validate_fluid_particle_range()
         self._uses_particle_subset = (
             self.fluid_particle_start != 0 or self.fluid_particle_count != self.model.particle_count
@@ -398,6 +416,8 @@ class SolverIPBF(SolverBase):
             self._boundary_projection_x_after = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta_total = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._triangle_contact_particle_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._triangle_contact_vertex_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -513,6 +533,8 @@ class SolverIPBF(SolverBase):
         self._boundary_projection_x_after.zero_()
         self._boundary_projection_delta.zero_()
         self._boundary_projection_delta_total.zero_()
+        self._triangle_contact_particle_delta.zero_()
+        self._triangle_contact_vertex_delta.zero_()
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
@@ -524,6 +546,17 @@ class SolverIPBF(SolverBase):
     def _has_shape_boundary_contacts(self, contacts: Contacts | None) -> bool:
         """Return whether shape boundary projection can be applied."""
         return contacts is not None and self.model.shape_count > 0 and contacts.soft_contact_max > 0
+
+    def _has_triangle_boundary_contacts(self) -> bool:
+        """Return whether deformable triangle boundary projection can be applied."""
+        boundary_model = self.boundary_model
+        return (
+            self.fsi_triangle_contact_enabled
+            and boundary_model is not None
+            and self.model.tri_count > 0
+            and self.model.tri_indices is not None
+            and getattr(boundary_model, "triangle_count", 0) > 0
+        )
 
     def _has_fsi_body_reaction_target(self, state: State) -> bool:
         """Return whether FSI body reaction accumulation is available."""
@@ -543,18 +576,22 @@ class SolverIPBF(SolverBase):
         contacts: Contacts | None,
         dt: float,
     ) -> None:
-        """Project the given particle positions out of shape contacts."""
-        if not self._has_shape_boundary_contacts(contacts):
+        """Project the given particle positions out of solid boundary contacts."""
+        has_shape_contacts = self._has_shape_boundary_contacts(contacts)
+        has_triangle_contacts = self._has_triangle_boundary_contacts()
+        if not has_shape_contacts and not has_triangle_contacts:
             return
 
         model = self.model
         state.particle_q.assign(particle_q)
-        model.collide(state, contacts)
 
         boundary_model = self.boundary_model
         has_reaction_target = self._has_fsi_body_reaction_target(state)
 
-        if has_reaction_target:
+        if has_shape_contacts:
+            model.collide(state, contacts)
+
+        if has_shape_contacts and has_reaction_target:
             self._boundary_projection_x_before.assign(state.particle_q)
             self._boundary_projection_delta.zero_()
 
@@ -590,7 +627,7 @@ class SolverIPBF(SolverBase):
             )
 
             self._boundary_projection_x_after.assign(state.particle_q)
-        else:
+        elif has_shape_contacts:
             wp.launch(
                 project_particle_shape_contacts,
                 dim=contacts.soft_contact_max,
@@ -607,6 +644,43 @@ class SolverIPBF(SolverBase):
                     contacts.soft_contact_normal,
                     contacts.soft_contact_max,
                     1.0,
+                ],
+                device=model.device,
+            )
+
+        if has_triangle_contacts:
+            self._triangle_contact_particle_delta.zero_()
+            self._triangle_contact_vertex_delta.zero_()
+
+            wp.launch(
+                accumulate_particle_triangle_contact_corrections,
+                dim=model.particle_count,
+                inputs=[
+                    state.particle_q,
+                    model.particle_inv_mass,
+                    model.particle_radius,
+                    self._ipbf_particle_flags,
+                    model.tri_indices,
+                    boundary_model.triangle_indices,
+                    boundary_model.triangle_count,
+                    self.fsi_triangle_contact_margin,
+                    self.fsi_triangle_contact_relaxation,
+                ],
+                outputs=[
+                    self._triangle_contact_particle_delta,
+                    self._triangle_contact_vertex_delta,
+                    boundary_model.vertex_contact_delta,
+                ],
+                device=model.device,
+            )
+
+            wp.launch(
+                apply_particle_triangle_contact_deltas,
+                dim=model.particle_count,
+                inputs=[
+                    self._triangle_contact_particle_delta,
+                    self._triangle_contact_vertex_delta,
+                    state.particle_q,
                 ],
                 device=model.device,
             )
@@ -1198,8 +1272,9 @@ class SolverIPBF(SolverBase):
         6. Repeat for ``iterations`` rounds.
         7. During the final iteration, optionally compute a single alternative
            soft-compliance update for artificial damping.
-        8. If particle-shape contacts are provided, project iterates back out
-           of penetrating static or kinematic boundaries after each update.
+        8. If particle-shape or triangle-boundary contacts are enabled,
+           project iterates back out of penetrating solid boundaries after
+           each update.
         9. Recompute the diagnostic fields on the final positions.
         10. Commit the converged positions and reconstruct velocities, applying
            the artificial damping correction when enabled.
@@ -1207,7 +1282,9 @@ class SolverIPBF(SolverBase):
         The current force and Hessian use a stable approximation that includes
         neighborhood Gauss-Newton terms and diagonalized second-order
         stabilization. Particle-shape contacts are handled by a minimal
-        normal-direction positional projection using Newton soft contacts.
+        normal-direction positional projection using Newton soft contacts;
+        triangle-boundary contacts use a symmetric PBD-style correction and
+        store cloth-side deltas on the boundary model.
         """
         if not self._begin_step(state_in, state_out, dt):
             return
@@ -1243,6 +1320,8 @@ class SolverIPBF(SolverBase):
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
             self._boundary_projection_delta_total.zero_()
+            self._triangle_contact_particle_delta.zero_()
+            self._triangle_contact_vertex_delta.zero_()
 
         state_out.particle_q.assign(state_in.particle_q)
         state_out.particle_qd.assign(state_in.particle_qd)

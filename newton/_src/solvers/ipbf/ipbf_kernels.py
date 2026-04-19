@@ -20,6 +20,7 @@ from __future__ import annotations
 import warp as wp
 
 from ...geometry import ParticleFlags
+from ...geometry.kernels import triangle_closest_point
 
 KERNEL_FAMILY_CUBIC_SPLINE = 0
 KERNEL_FAMILY_POLY6 = 1
@@ -1224,6 +1225,110 @@ def project_particle_shape_contacts_with_reaction(
 
     wp.atomic_add(body_force, body_index, body_reaction)
     wp.atomic_add(body_torque, body_index, torque)
+
+
+@wp.kernel
+def accumulate_particle_triangle_contact_corrections(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    contact_triangle_count: int,
+    contact_margin: float,
+    relaxation: float,
+    particle_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta_total: wp.array(dtype=wp.vec3),
+):
+    """Accumulate symmetric particle-triangle contact corrections."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+    if relaxation == 0.0:
+        return
+
+    wf = particle_inv_mass[tid]
+    if wf <= 0.0:
+        return
+
+    x = particle_q[tid]
+    contact_distance = particle_radius[tid] + contact_margin
+    if contact_distance <= 0.0:
+        return
+
+    for contact_triangle_index in range(contact_triangle_count):
+        tri = contact_triangle_indices[contact_triangle_index]
+        v0 = tri_indices[tri, 0]
+        v1 = tri_indices[tri, 1]
+        v2 = tri_indices[tri, 2]
+        if tid == v0 or tid == v1 or tid == v2:
+            continue
+
+        x0 = particle_q[v0]
+        x1 = particle_q[v1]
+        x2 = particle_q[v2]
+
+        normal = wp.cross(x1 - x0, x2 - x0)
+        normal_length = wp.length(normal)
+        if normal_length <= 0.0:
+            continue
+        normal = normal / normal_length
+
+        closest, barycentric, _feature_type = triangle_closest_point(x0, x1, x2, x)
+        separation = x - closest
+        distance = wp.length(separation)
+
+        direction = normal
+        if distance > 1.0e-8:
+            direction = separation / distance
+        else:
+            signed_plane_distance = wp.dot(normal, x - x0)
+            if signed_plane_distance < 0.0:
+                direction = -normal
+            distance = wp.abs(signed_plane_distance)
+
+        c = distance - contact_distance
+        if c >= 0.0:
+            continue
+
+        w0 = particle_inv_mass[v0]
+        w1 = particle_inv_mass[v1]
+        w2 = particle_inv_mass[v2]
+        b0 = barycentric[0]
+        b1 = barycentric[1]
+        b2 = barycentric[2]
+        denom = wf + b0 * b0 * w0 + b1 * b1 * w1 + b2 * b2 * w2
+        if denom <= 0.0:
+            continue
+
+        contact_lambda = -relaxation * c / denom
+        fluid_delta = wf * contact_lambda * direction
+        vertex_delta0 = -w0 * b0 * contact_lambda * direction
+        vertex_delta1 = -w1 * b1 * contact_lambda * direction
+        vertex_delta2 = -w2 * b2 * contact_lambda * direction
+
+        wp.atomic_add(particle_contact_delta, tid, fluid_delta)
+        wp.atomic_add(vertex_contact_delta, v0, vertex_delta0)
+        wp.atomic_add(vertex_contact_delta, v1, vertex_delta1)
+        wp.atomic_add(vertex_contact_delta, v2, vertex_delta2)
+        wp.atomic_add(vertex_contact_delta_total, v0, vertex_delta0)
+        wp.atomic_add(vertex_contact_delta_total, v1, vertex_delta1)
+        wp.atomic_add(vertex_contact_delta_total, v2, vertex_delta2)
+
+
+@wp.kernel
+def apply_particle_triangle_contact_deltas(
+    particle_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+):
+    """Apply accumulated particle-triangle contact deltas to positions."""
+    tid = wp.tid()
+
+    particle_q[tid] = particle_q[tid] + particle_contact_delta[tid] + vertex_contact_delta[tid]
 
 
 @wp.kernel
