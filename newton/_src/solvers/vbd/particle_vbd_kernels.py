@@ -1816,6 +1816,17 @@ def forward_step(
 
 
 @wp.kernel
+def add_fsi_vertex_forces_to_particle_accumulators(
+    fsi_vertex_force: wp.array(dtype=wp.vec3),
+    force_relaxation: float,
+    particle_forces: wp.array(dtype=wp.vec3),
+):
+    particle = wp.tid()
+
+    particle_forces[particle] = particle_forces[particle] + force_relaxation * fsi_vertex_force[particle]
+
+
+@wp.kernel
 def compute_particle_conservative_bound(
     # inputs
     conservative_bound_relaxation: float,

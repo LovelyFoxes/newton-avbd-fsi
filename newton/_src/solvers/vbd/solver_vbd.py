@@ -47,12 +47,13 @@ from .particle_vbd_kernels import (
     accumulate_particle_body_contact_force_and_hessian,
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
+    # Solver kernels (particle VBD)
+    add_fsi_vertex_forces_to_particle_accumulators,
     # Planar DAT (Divide and Truncate) kernels
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
     build_edge_n_ring_edge_collision_filter,
     build_vertex_n_ring_tris_collision_filter,
-    # Solver kernels (particle VBD)
     forward_step,
     set_to_csr,
     solve_elasticity,
@@ -267,9 +268,10 @@ class SolverVBD(SolverBase):
             rigid_enable_dahl_friction: Enable Dahl hysteresis friction model for cable bending (default: False).
                 Configure per-joint Dahl parameters via the solver-registered custom model attributes
                 ``model.vbd.dahl_eps_max`` and ``model.vbd.dahl_tau``.
-            fsi_boundary_model: Optional FSI boundary sample model whose body_force [N] and body_torque [N*m]
-                buffers are injected into AVBD rigid body iterations.
-            fsi_force_relaxation: Unitless multiplier applied to injected FSI body forces [N] and torques [N*m].
+            fsi_boundary_model: Optional FSI boundary sample model whose body_force [N], body_torque [N*m],
+                and vertex_force [N] buffers are injected into AVBD rigid body and VBD particle iterations.
+            fsi_force_relaxation: Unitless multiplier applied to injected FSI body forces [N], torques [N*m],
+                and vertex forces [N].
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -347,12 +349,13 @@ class SolverVBD(SolverBase):
         self._empty_body_q = wp.empty(0, dtype=wp.transform, device=self.device)
 
     def set_fsi_boundary_model(self, fsi_boundary_model: FSIBoundaryModel | None) -> None:
-        """Set the optional FSI boundary model used as a rigid body force source.
+        """Set the optional FSI boundary model used as a solid force source.
 
         Args:
             fsi_boundary_model: Boundary model whose body force [N] and body
                 torque [N*m] buffers are injected into AVBD rigid iterations,
-                or ``None`` to disable FSI wrench injection.
+                and whose vertex force [N] buffer is injected into VBD
+                particle iterations, or ``None`` to disable FSI force injection.
         """
         if fsi_boundary_model is not None:
             if getattr(fsi_boundary_model, "model", self.model) is not self.model:
@@ -364,6 +367,8 @@ class SolverVBD(SolverBase):
                 or getattr(fsi_boundary_model, "body_torque", None) is None
             ):
                 raise ValueError("SolverVBD FSI boundary model must provide body_force and body_torque buffers.")
+            if self.integrate_particles and getattr(fsi_boundary_model, "vertex_force", None) is None:
+                raise ValueError("SolverVBD FSI boundary model must provide a vertex_force buffer.")
 
         self.fsi_boundary_model = fsi_boundary_model
 
@@ -1652,6 +1657,20 @@ class SolverVBD(SolverBase):
         # Zero out forces and hessians
         self.particle_forces.zero_()
         self.particle_hessians.zero_()
+
+        if self.fsi_boundary_model is not None and self.fsi_force_relaxation != 0.0:
+            wp.launch(
+                kernel=add_fsi_vertex_forces_to_particle_accumulators,
+                dim=model.particle_count,
+                inputs=[
+                    self.fsi_boundary_model.vertex_force,
+                    self.fsi_force_relaxation,
+                ],
+                outputs=[
+                    self.particle_forces,
+                ],
+                device=self.device,
+            )
 
         # Iterate over color groups
         for color in range(len(self.model.particle_color_groups)):
