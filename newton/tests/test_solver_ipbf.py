@@ -1171,6 +1171,7 @@ def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, dev
     test.assertIsNotNone(boundary_model.triangle_contact_bvh)
     test.assertIsNotNone(boundary_model.triangle_contact_grid)
     test.assertGreaterEqual(int(solver._triangle_contact_pair_count.numpy()[0]), 1)
+    test.assertEqual(int(solver._triangle_contact_pair_overflow.numpy()[0]), 0)
     np.testing.assert_array_equal(boundary_model.triangle_indices.numpy(), np.array([0], dtype=np.int32))
     np.testing.assert_allclose(q[0] - initial_q[0], expected_fluid_delta, rtol=1.0e-5, atol=1.0e-6)
     np.testing.assert_allclose(q[1:], initial_q[1:], rtol=1.0e-6, atol=1.0e-6)
@@ -1431,18 +1432,21 @@ def test_ipbf_triangle_contact_bvh_pair_overflow_falls_back_to_scan(test, device
             boundary_model.vertex_contact_delta.numpy(),
             boundary_model.vertex_force.numpy(),
             int(solver._triangle_contact_pair_count.numpy()[0]),
+            int(solver._triangle_contact_pair_overflow.numpy()[0]),
         )
 
-    overflow_q, overflow_particle_delta, overflow_vertex_delta, overflow_vertex_force, overflow_pair_count = run_step(
+    overflow_q, overflow_particle_delta, overflow_vertex_delta, overflow_vertex_force, overflow_pair_count, overflow_flag = run_step(
         use_bvh=True,
         pair_capacity=1,
     )
-    scan_q, scan_particle_delta, scan_vertex_delta, scan_vertex_force, _scan_pair_count = run_step(
+    scan_q, scan_particle_delta, scan_vertex_delta, scan_vertex_force, _scan_pair_count, scan_overflow_flag = run_step(
         use_bvh=False,
         pair_capacity=None,
     )
 
     test.assertGreater(overflow_pair_count, 1)
+    test.assertEqual(overflow_flag, 1)
+    test.assertEqual(scan_overflow_flag, 0)
     np.testing.assert_allclose(overflow_q, scan_q, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(overflow_particle_delta, scan_particle_delta, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(overflow_vertex_delta, scan_vertex_delta, rtol=1.0e-6, atol=1.0e-6)

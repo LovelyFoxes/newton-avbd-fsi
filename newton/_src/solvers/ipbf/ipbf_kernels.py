@@ -1582,6 +1582,7 @@ def collect_particle_triangle_contact_pairs_from_bvh(
     pair_particle: wp.array(dtype=wp.int32),
     pair_triangle: wp.array(dtype=wp.int32),
     pair_count: wp.array(dtype=wp.int32),
+    pair_overflow: wp.array(dtype=wp.int32),
 ):
     """Collect compact particle-triangle candidate pairs from a swept triangle BVH."""
     tid = wp.tid()
@@ -1606,6 +1607,8 @@ def collect_particle_triangle_contact_pairs_from_bvh(
         if pair_index < pair_capacity:
             pair_particle[pair_index] = tid
             pair_triangle[pair_index] = contact_triangle_indices[triangle_leaf]
+        else:
+            pair_overflow[0] = 1
 
 
 @wp.kernel
@@ -1613,6 +1616,7 @@ def accumulate_particle_triangle_contact_corrections_from_pairs(
     pair_particle: wp.array(dtype=wp.int32),
     pair_triangle: wp.array(dtype=wp.int32),
     pair_count: wp.array(dtype=wp.int32),
+    pair_overflow: wp.array(dtype=wp.int32),
     pair_capacity: int,
     particle_q_prev: wp.array(dtype=wp.vec3),
     particle_q: wp.array(dtype=wp.vec3),
@@ -1633,6 +1637,8 @@ def accumulate_particle_triangle_contact_corrections_from_pairs(
     tid = wp.tid()
 
     if relaxation == 0.0:
+        return
+    if pair_overflow[0] != 0:
         return
 
     pair_total = wp.min(pair_count[0], pair_capacity)
@@ -1661,7 +1667,60 @@ def accumulate_particle_triangle_contact_corrections_from_pairs(
         vertex_contact_delta,
         vertex_contact_delta_total,
         vertex_force,
-    )
+        )
+
+
+@wp.kernel
+def accumulate_particle_triangle_contact_corrections_if_overflow(
+    particle_q_prev: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    contact_triangle_count: int,
+    pair_overflow: wp.array(dtype=wp.int32),
+    contact_margin: float,
+    relaxation: float,
+    continuous_enabled: int,
+    dt: float,
+    particle_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta_total: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate full-scan triangle contacts only when compact pair collection overflowed."""
+    tid = wp.tid()
+
+    if pair_overflow[0] == 0:
+        return
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+    if relaxation == 0.0:
+        return
+
+    for contact_triangle_index in range(contact_triangle_count):
+        tri = contact_triangle_indices[contact_triangle_index]
+        accumulate_particle_triangle_contact_correction(
+            tid,
+            tri,
+            particle_q_prev,
+            particle_q,
+            particle_mass,
+            particle_inv_mass,
+            particle_radius,
+            tri_indices,
+            contact_margin,
+            relaxation,
+            continuous_enabled,
+            dt,
+            particle_contact_delta,
+            vertex_contact_delta,
+            vertex_contact_delta_total,
+            vertex_force,
+        )
 
 
 @wp.kernel

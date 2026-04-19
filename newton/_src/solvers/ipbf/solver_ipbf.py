@@ -40,6 +40,7 @@ from .ipbf_kernels import (
     accumulate_particle_triangle_contact_corrections,
     accumulate_particle_triangle_contact_corrections_from_grid,
     accumulate_particle_triangle_contact_corrections_from_pairs,
+    accumulate_particle_triangle_contact_corrections_if_overflow,
     apply_artificial_damping,
     apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
@@ -469,6 +470,7 @@ class SolverIPBF(SolverBase):
                 dtype=wp.int32,
             )
             self._triangle_contact_pair_count = wp.zeros(1, dtype=wp.int32)
+            self._triangle_contact_pair_overflow = wp.zeros(1, dtype=wp.int32)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -604,6 +606,8 @@ class SolverIPBF(SolverBase):
         self._boundary_projection_delta_total.zero_()
         self._triangle_contact_particle_delta.zero_()
         self._triangle_contact_vertex_delta.zero_()
+        self._triangle_contact_pair_count.zero_()
+        self._triangle_contact_pair_overflow.zero_()
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
@@ -730,6 +734,7 @@ class SolverIPBF(SolverBase):
                 and getattr(boundary_model, "triangle_contact_bvh", None) is not None
             ):
                 self._triangle_contact_pair_count.zero_()
+                self._triangle_contact_pair_overflow.zero_()
                 wp.launch(
                     collect_particle_triangle_contact_pairs_from_bvh,
                     dim=model.particle_count,
@@ -747,64 +752,65 @@ class SolverIPBF(SolverBase):
                         self._triangle_contact_pair_particle,
                         self._triangle_contact_pair_triangle,
                         self._triangle_contact_pair_count,
+                        self._triangle_contact_pair_overflow,
                     ],
                     device=model.device,
                 )
-                if int(self._triangle_contact_pair_count.numpy()[0]) <= self.fsi_triangle_contact_pair_capacity:
-                    wp.launch(
-                        accumulate_particle_triangle_contact_corrections_from_pairs,
-                        dim=self.fsi_triangle_contact_pair_capacity,
-                        inputs=[
-                            self._triangle_contact_pair_particle,
-                            self._triangle_contact_pair_triangle,
-                            self._triangle_contact_pair_count,
-                            self.fsi_triangle_contact_pair_capacity,
-                            boundary_model.triangle_contact_particle_q_prev,
-                            state.particle_q,
-                            model.particle_mass,
-                            model.particle_inv_mass,
-                            model.particle_radius,
-                            model.tri_indices,
-                            self.fsi_triangle_contact_margin,
-                            self.fsi_triangle_contact_relaxation,
-                            int(self.fsi_triangle_contact_continuous_enabled),
-                            dt,
-                        ],
-                        outputs=[
-                            self._triangle_contact_particle_delta,
-                            self._triangle_contact_vertex_delta,
-                            boundary_model.vertex_contact_delta,
-                            boundary_model.vertex_force,
-                        ],
-                        device=model.device,
-                    )
-                else:
-                    wp.launch(
-                        accumulate_particle_triangle_contact_corrections,
-                        dim=model.particle_count,
-                        inputs=[
-                            boundary_model.triangle_contact_particle_q_prev,
-                            state.particle_q,
-                            model.particle_mass,
-                            model.particle_inv_mass,
-                            model.particle_radius,
-                            self._ipbf_particle_flags,
-                            model.tri_indices,
-                            boundary_model.triangle_indices,
-                            boundary_model.triangle_count,
-                            self.fsi_triangle_contact_margin,
-                            self.fsi_triangle_contact_relaxation,
-                            int(self.fsi_triangle_contact_continuous_enabled),
-                            dt,
-                        ],
-                        outputs=[
-                            self._triangle_contact_particle_delta,
-                            self._triangle_contact_vertex_delta,
-                            boundary_model.vertex_contact_delta,
-                            boundary_model.vertex_force,
-                        ],
-                        device=model.device,
-                    )
+                wp.launch(
+                    accumulate_particle_triangle_contact_corrections_from_pairs,
+                    dim=self.fsi_triangle_contact_pair_capacity,
+                    inputs=[
+                        self._triangle_contact_pair_particle,
+                        self._triangle_contact_pair_triangle,
+                        self._triangle_contact_pair_count,
+                        self._triangle_contact_pair_overflow,
+                        self.fsi_triangle_contact_pair_capacity,
+                        boundary_model.triangle_contact_particle_q_prev,
+                        state.particle_q,
+                        model.particle_mass,
+                        model.particle_inv_mass,
+                        model.particle_radius,
+                        model.tri_indices,
+                        self.fsi_triangle_contact_margin,
+                        self.fsi_triangle_contact_relaxation,
+                        int(self.fsi_triangle_contact_continuous_enabled),
+                        dt,
+                    ],
+                    outputs=[
+                        self._triangle_contact_particle_delta,
+                        self._triangle_contact_vertex_delta,
+                        boundary_model.vertex_contact_delta,
+                        boundary_model.vertex_force,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    accumulate_particle_triangle_contact_corrections_if_overflow,
+                    dim=model.particle_count,
+                    inputs=[
+                        boundary_model.triangle_contact_particle_q_prev,
+                        state.particle_q,
+                        model.particle_mass,
+                        model.particle_inv_mass,
+                        model.particle_radius,
+                        self._ipbf_particle_flags,
+                        model.tri_indices,
+                        boundary_model.triangle_indices,
+                        boundary_model.triangle_count,
+                        self._triangle_contact_pair_overflow,
+                        self.fsi_triangle_contact_margin,
+                        self.fsi_triangle_contact_relaxation,
+                        int(self.fsi_triangle_contact_continuous_enabled),
+                        dt,
+                    ],
+                    outputs=[
+                        self._triangle_contact_particle_delta,
+                        self._triangle_contact_vertex_delta,
+                        boundary_model.vertex_contact_delta,
+                        boundary_model.vertex_force,
+                    ],
+                    device=model.device,
+                )
             elif (
                 self.fsi_triangle_contact_use_grid
                 and getattr(boundary_model, "triangle_contact_grid", None) is not None
