@@ -1788,6 +1788,23 @@ def compute_friction(mu: float, normal_contact_force: float, T: mat32, u: wp.vec
 
 
 @wp.kernel
+def mask_vbd_particle_flags(
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_start: int,
+    particle_count: int,
+    vbd_particle_flags: wp.array(dtype=wp.int32),
+):
+    """Build solver-local particle flags for the active VBD particle range."""
+    particle = wp.tid()
+
+    if particle < particle_start or particle >= particle_start + particle_count:
+        vbd_particle_flags[particle] = 0
+        return
+
+    vbd_particle_flags[particle] = particle_flags[particle]
+
+
+@wp.kernel
 def forward_step(
     dt: float,
     gravity: wp.array(dtype=wp.vec3),
@@ -1819,9 +1836,13 @@ def forward_step(
 def add_fsi_vertex_forces_to_particle_accumulators(
     fsi_vertex_force: wp.array(dtype=wp.vec3),
     force_relaxation: float,
+    particle_flags: wp.array(dtype=wp.int32),
     particle_forces: wp.array(dtype=wp.vec3),
 ):
     particle = wp.tid()
+
+    if not particle_flags[particle] & ParticleFlags.ACTIVE:
+        return
 
     particle_forces[particle] = particle_forces[particle] + force_relaxation * fsi_vertex_force[particle]
 
@@ -1922,6 +1943,25 @@ def update_velocity(
 ):
     particle = wp.tid()
     vel[particle] = (pos[particle] - pos_prev[particle]) / dt
+
+
+@wp.kernel
+def restore_non_vbd_particle_state(
+    particle_q_prev: wp.array(dtype=wp.vec3),
+    particle_qd_in: wp.array(dtype=wp.vec3),
+    particle_start: int,
+    particle_count: int,
+    particle_q_out: wp.array(dtype=wp.vec3),
+    particle_qd_out: wp.array(dtype=wp.vec3),
+):
+    """Restore particle state outside the active VBD particle range."""
+    particle = wp.tid()
+
+    if particle >= particle_start and particle < particle_start + particle_count:
+        return
+
+    particle_q_out[particle] = particle_q_prev[particle]
+    particle_qd_out[particle] = particle_qd_in[particle]
 
 
 @wp.kernel

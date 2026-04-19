@@ -115,6 +115,64 @@ def run_vbd_fsi_vertex_force_step(device, *, fsi_force_relaxation: float = 1.0):
     return initial_q, state_1, solver, boundary_model, dt
 
 
+def run_vbd_particle_range_step(device):
+    """Run one VBD step where only a trailing triangle patch is solver-owned."""
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    builder.add_particles(
+        pos=[
+            wp.vec3(-1.0, 0.5, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(1.0, 2.0, 3.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[5.0, 2.0, 2.0, 2.0],
+        radius=[0.05, 0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(1, 2, 3, tri_ke=0.0, tri_ka=0.0, tri_kd=0.0)
+    builder.color()
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=0.25,
+        support_radius=0.3,
+        include_static=False,
+        include_dynamic=False,
+        device=device,
+    )
+    vertex_force = boundary_model.vertex_force.numpy()
+    vertex_force[0] = np.array([20.0, 0.0, 0.0], dtype=np.float32)
+    vertex_force[1] = np.array([10.0, 0.0, 0.0], dtype=np.float32)
+    boundary_model.vertex_force.assign(vertex_force)
+
+    solver = SolverVBD(
+        model,
+        iterations=1,
+        particle_start=1,
+        particle_count=3,
+        fsi_boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    initial_q = state_0.particle_q.numpy().copy()
+    initial_qd = state_0.particle_qd.numpy().copy()
+
+    dt = 0.1
+    solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+
+    return initial_q, initial_qd, state_1, solver, boundary_model, dt
+
+
 def test_vbd_fsi_body_force_moves_rigid_body(test, device):
     initial_q, state_1, solver, boundary_model, body, dt = run_vbd_fsi_body_force_step(device)
 
@@ -141,7 +199,9 @@ def test_vbd_fsi_vertex_force_moves_particle(test, device):
     expected_velocity = expected_delta / dt
 
     np.testing.assert_allclose(final_q[0] - initial_q[0], expected_delta, rtol=1.0e-5, atol=1.0e-6)
-    np.testing.assert_allclose(final_q[1:] - initial_q[1:], np.zeros((2, 3), dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(
+        final_q[1:] - initial_q[1:], np.zeros((2, 3), dtype=np.float32), rtol=1.0e-6, atol=1.0e-6
+    )
     np.testing.assert_allclose(final_qd[0], expected_velocity, rtol=1.0e-5, atol=1.0e-6)
     np.testing.assert_allclose(final_qd[1:], np.zeros((2, 3), dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(solver.particle_forces.numpy()[0], force, rtol=1.0e-6, atol=1.0e-6)
@@ -161,9 +221,7 @@ def test_vbd_fsi_force_relaxation_scales_body_response(test, device):
 
 
 def test_vbd_fsi_force_relaxation_scales_vertex_response(test, device):
-    initial_q, state_1, solver, boundary_model, dt = run_vbd_fsi_vertex_force_step(
-        device, fsi_force_relaxation=0.25
-    )
+    initial_q, state_1, solver, boundary_model, dt = run_vbd_fsi_vertex_force_step(device, fsi_force_relaxation=0.25)
 
     mass = float(solver.model.particle_mass.numpy()[0])
     force = boundary_model.vertex_force.numpy()[0] * 0.25
@@ -171,6 +229,28 @@ def test_vbd_fsi_force_relaxation_scales_vertex_response(test, device):
     expected_delta = force * (dt * dt) / mass
 
     np.testing.assert_allclose(final_q - initial_q[0], expected_delta, rtol=1.0e-5, atol=1.0e-6)
+
+
+def test_vbd_particle_range_preserves_nonowned_particles(test, device):
+    initial_q, initial_qd, state_1, solver, boundary_model, dt = run_vbd_particle_range_step(device)
+
+    final_q = state_1.particle_q.numpy()
+    final_qd = state_1.particle_qd.numpy()
+    particle_forces = solver.particle_forces.numpy()
+    force = boundary_model.vertex_force.numpy()[1]
+    mass = float(solver.model.particle_mass.numpy()[1])
+    expected_delta = force * (dt * dt) / mass
+
+    np.testing.assert_allclose(final_q[0], initial_q[0], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(final_qd[0], initial_qd[0], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(final_q[1] - initial_q[1], expected_delta, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(final_qd[1], expected_delta / dt, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(
+        final_q[2:] - initial_q[2:], np.zeros((2, 3), dtype=np.float32), rtol=1.0e-6, atol=1.0e-6
+    )
+    np.testing.assert_allclose(final_qd[2:], np.zeros((2, 3), dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(particle_forces[0], np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(particle_forces[1], force, rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_vbd_reset_restores_rigid_history(test, device):
@@ -222,6 +302,14 @@ add_function_test(
     TestSolverVBDFSI,
     "test_vbd_fsi_force_relaxation_scales_vertex_response",
     test_vbd_fsi_force_relaxation_scales_vertex_response,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverVBDFSI,
+    "test_vbd_particle_range_preserves_nonowned_particles",
+    test_vbd_particle_range_preserves_nonowned_particles,
     devices=devices,
     check_output=False,
 )
