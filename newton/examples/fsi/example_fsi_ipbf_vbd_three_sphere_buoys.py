@@ -90,8 +90,56 @@ class Example:
         parser.add_argument(
             "--include-static-boundary-samples",
             action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Include sampled static walls in the FSI boundary density and local dissipation paths.",
+        )
+        parser.add_argument(
+            "--show-boundary-samples",
+            action=argparse.BooleanOptionalAction,
             default=False,
-            help="Include static tank walls in the FSI boundary-sample density/pressure path.",
+            help="Render FSI boundary samples for debugging.",
+        )
+        parser.add_argument(
+            "--static-boundary-weight",
+            type=float,
+            default=None,
+            help="Diagnostic weight applied to static boundary samples.",
+        )
+        parser.add_argument(
+            "--viscosity-boundary-coefficient",
+            type=float,
+            default=None,
+            help="Boundary-sample viscosity coefficient used for local wall/body dissipation.",
+        )
+        parser.add_argument(
+            "--viscosity-coefficient",
+            type=float,
+            default=None,
+            help="Fluid-fluid viscosity coefficient used for internal velocity diffusion.",
+        )
+        parser.add_argument(
+            "--xsph-boundary-coefficient",
+            type=float,
+            default=None,
+            help="Boundary-sample XSPH coefficient used for local wall/body velocity smoothing.",
+        )
+        parser.add_argument(
+            "--xsph-coefficient",
+            type=float,
+            default=None,
+            help="Fluid-fluid XSPH velocity smoothing coefficient.",
+        )
+        parser.add_argument(
+            "--boundary-velocity-damping",
+            type=float,
+            default=None,
+            help="Tangential velocity damping applied at final particle-shape contacts.",
+        )
+        parser.add_argument(
+            "--velocity-damping",
+            type=float,
+            default=None,
+            help="Example-level global velocity damping multiplier.",
         )
         parser.add_argument(
             "--hydrostatic-volume-mode",
@@ -140,8 +188,15 @@ class Example:
                 "ipbf_iterations": 6,
                 "sim_substeps": 6,
                 "velocity_damping": 0.996,
+                "viscosity_coefficient": 0.002,
+                "viscosity_boundary_coefficient": 0.0,
+                "xsph_coefficient": 0.004,
+                "xsph_boundary_coefficient": 0.0,
+                "boundary_velocity_damping": 1.0,
                 "rigid_iterations": 2,
                 "boundary_spacing": 0.04,
+                "static_boundary_weight": 1.0,
+                "include_static_boundary_samples": False,
                 "water_render_radius_scale": 0.45,
                 "boundary_render_radius_scale": 0.30,
                 "expected_min_drop": 0.02,
@@ -166,11 +221,18 @@ class Example:
                 "sphere_bottom_gap": 0.035,
                 "sphere_densities": (250.0, 700.0, 1250.0),
                 "rest_density": 1000.0,
-                "ipbf_iterations": 2,
-                "sim_substeps": 6,
+                "ipbf_iterations": 4,
+                "sim_substeps": 4,
                 "velocity_damping": 0.999,
-                "rigid_iterations": 2,
+                "viscosity_coefficient": 0.0025,
+                "viscosity_boundary_coefficient": 0.0,
+                "xsph_coefficient": 0.010,
+                "xsph_boundary_coefficient": 0.0,
+                "boundary_velocity_damping": 0.97,
+                "rigid_iterations": 4,
                 "boundary_spacing": 0.014,
+                "static_boundary_weight": 0.10,
+                "include_static_boundary_samples": True,
                 "water_render_radius_scale": 0.45,
                 "boundary_render_radius_scale": 0.30,
                 "expected_min_drop": 0.0,
@@ -192,6 +254,23 @@ class Example:
         if getattr(self.args, "sphere_densities", None) is not None:
             config["sphere_densities"] = tuple(float(v) for v in self.args.sphere_densities)
 
+        include_static_override = getattr(self.args, "include_static_boundary_samples", None)
+        if include_static_override is not None:
+            config["include_static_boundary_samples"] = bool(include_static_override)
+
+        optional_float_overrides = {
+            "velocity_damping": getattr(self.args, "velocity_damping", None),
+            "viscosity_coefficient": getattr(self.args, "viscosity_coefficient", None),
+            "viscosity_boundary_coefficient": getattr(self.args, "viscosity_boundary_coefficient", None),
+            "xsph_coefficient": getattr(self.args, "xsph_coefficient", None),
+            "xsph_boundary_coefficient": getattr(self.args, "xsph_boundary_coefficient", None),
+            "boundary_velocity_damping": getattr(self.args, "boundary_velocity_damping", None),
+            "static_boundary_weight": getattr(self.args, "static_boundary_weight", None),
+        }
+        for key, value in optional_float_overrides.items():
+            if value is not None:
+                config[key] = float(value)
+
         return config
 
     def __init__(self, viewer, args=None):
@@ -202,11 +281,12 @@ class Example:
         self.viewer._paused = True
         self.args = args
         self._reset_key_prev = False
-        self.include_static_boundary_samples = bool(getattr(self.args, "include_static_boundary_samples", False))
         self.hydrostatic_volume_mode = self._parse_hydrostatic_volume_mode(
             getattr(self.args, "hydrostatic_volume_mode", "dynamic-shape-surface-quadrature")
         )
         self.config = self._get_scene_config()
+        self.include_static_boundary_samples = bool(self.config["include_static_boundary_samples"])
+        self.show_boundary_samples = bool(getattr(self.args, "show_boundary_samples", False))
         self.sim_substeps = int(self.config["sim_substeps"])
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.container_half_width = float(self.config["container_half_width"])
@@ -245,12 +325,15 @@ class Example:
                 compliance=1.0e-5,
                 iterations=int(self.config["ipbf_iterations"]),
                 relaxation=0.5,
-                viscosity_coefficient=0.0025,
-                xsph_coefficient=0.005,
+                viscosity_coefficient=float(self.config["viscosity_coefficient"]),
+                viscosity_boundary_coefficient=float(self.config["viscosity_boundary_coefficient"]),
+                xsph_coefficient=float(self.config["xsph_coefficient"]),
+                xsph_boundary_coefficient=float(self.config["xsph_boundary_coefficient"]),
+                boundary_velocity_damping=float(self.config["boundary_velocity_damping"]),
                 fsi_projection_reaction_relaxation=self._reaction_override("projection", 0.0),
                 fsi_velocity_projection_reaction_relaxation=self._reaction_override("velocity", 0.0),
                 fsi_pressure_reaction_relaxation=self._reaction_override("pressure", 2.0),
-                fsi_static_boundary_weight=1.0,
+                fsi_static_boundary_weight=float(self.config["static_boundary_weight"]),
             ),
             boundary_model=self.boundary_model,
         )
@@ -297,6 +380,16 @@ class Example:
             device=self.model.device,
         )
         self.boundary_colors = self._build_boundary_colors()
+        self.buoy_colors = wp.array(
+            [
+                wp.vec3(1.0, 0.78, 0.24),
+                wp.vec3(0.34, 0.86, 0.34),
+                wp.vec3(0.20, 0.92, 0.92),
+            ],
+            dtype=wp.vec3,
+            device=self.model.device,
+        )
+        self.rigid_material = wp.array([wp.vec4(0.42, 0.0, 0.0, 0.0)], dtype=wp.vec4, device=self.model.device)
         self.boundary_radii = wp.full(
             self.boundary_model.sample_count,
             value=float(self.config["boundary_spacing"]) * float(self.config["boundary_render_radius_scale"]),
@@ -353,6 +446,10 @@ class Example:
             colors[sample_body == body] = color
         colors[sample_body < 0] = np.array([0.92, 0.94, 0.98], dtype=np.float32)
         return wp.array(colors, dtype=wp.vec3, device=self.model.device)
+
+    def _body_xforms(self, body_indices: list[int]) -> wp.array(dtype=wp.transform):
+        body_q = self.state_0.body_q.numpy()[body_indices]
+        return wp.array(body_q, dtype=wp.transform, device=self.model.device)
 
     def _compute_pool_surface_y(self) -> float:
         _, pool_half_span_y, _ = get_particle_grid_half_span(
@@ -479,6 +576,7 @@ class Example:
         if ui.button("Reset"):
             self.reset()
         ui.text(f"Static boundary samples: {'on' if self.include_static_boundary_samples else 'off'}")
+        ui.text(f"Render boundary samples: {'on' if self.show_boundary_samples else 'off'}")
         ui.text(f"Hydrostatic mode: {self.args.hydrostatic_volume_mode!s}")
         ui.text(f"Sphere radius: {self.sphere_radius:.3f} m")
         ui.text(f"Sphere densities: {tuple(float(v) for v in self.config['sphere_densities'])}")
@@ -650,6 +748,14 @@ class Example:
             colors=(0.88, 0.90, 0.95),
             width=0.01,
         )
+        self.viewer.log_shapes(
+            "/fsi/three_sphere_buoys_rigid_bodies",
+            newton.GeoType.SPHERE,
+            self.sphere_radius,
+            self._body_xforms(self.buoy_bodies),
+            self.buoy_colors,
+            self.rigid_material,
+        )
         self.viewer.log_points(
             "/fsi/three_sphere_buoys_ipbf_particles",
             points=self.state_0.particle_q,
@@ -662,7 +768,7 @@ class Example:
             points=self.boundary_model.sample_x_world,
             radii=self.boundary_radii,
             colors=self.boundary_colors,
-            hidden=not self.viewer.show_particles,
+            hidden=not (self.viewer.show_particles and self.show_boundary_samples),
         )
         self.viewer.end_frame()
 

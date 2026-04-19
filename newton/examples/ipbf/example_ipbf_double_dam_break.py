@@ -53,7 +53,7 @@ class Example:
         parser.add_argument(
             "--include-static-boundary-samples",
             action=argparse.BooleanOptionalAction,
-            default=False,
+            default=None,
             help="Include sampled static walls in the IPBF boundary density and local dissipation paths.",
         )
         parser.add_argument(
@@ -75,10 +75,22 @@ class Example:
             help="Boundary-sample viscosity coefficient used for local wall dissipation.",
         )
         parser.add_argument(
+            "--viscosity-coefficient",
+            type=float,
+            default=None,
+            help="Fluid-fluid viscosity coefficient used for internal velocity diffusion.",
+        )
+        parser.add_argument(
             "--xsph-boundary-coefficient",
             type=float,
             default=None,
             help="Boundary-sample XSPH coefficient used for local wall velocity smoothing.",
+        )
+        parser.add_argument(
+            "--xsph-coefficient",
+            type=float,
+            default=None,
+            help="Fluid-fluid XSPH velocity smoothing coefficient.",
         )
         parser.add_argument(
             "--boundary-velocity-damping",
@@ -110,12 +122,14 @@ class Example:
                 "iterations": 6,
                 "sim_substeps": 6,
                 "velocity_damping": 0.997,
-                "viscosity": 0.002,
+                "viscosity_coefficient": 0.002,
                 "viscosity_boundary_coefficient": 0.0,
-                "xsph": 0.004,
+                "xsph_coefficient": 0.004,
                 "xsph_boundary_coefficient": 0.0,
                 "boundary_velocity_damping": 1.0,
                 "static_boundary_weight": 1.0,
+                "include_static_boundary_samples": False,
+                "boundary_sample_spacing": None,
             }
 
         return {
@@ -131,13 +145,15 @@ class Example:
             "bottom_clearance_y": 0.022,
             "iterations": 4,
             "sim_substeps": 4,
-            "velocity_damping": 0.999,
-            "viscosity": 0.0015,
-            "viscosity_boundary_coefficient": 0.0,
-            "xsph": 0.004,
+            "velocity_damping": 1.0,
+            "viscosity_coefficient": 0.006,
+            "viscosity_boundary_coefficient": 0.009,
+            "xsph_coefficient": 0.014,
             "xsph_boundary_coefficient": 0.0,
-            "boundary_velocity_damping": 1.0,
-            "static_boundary_weight": 1.0,
+            "boundary_velocity_damping": 0.985,
+            "static_boundary_weight": 0.10,
+            "include_static_boundary_samples": True,
+            "boundary_sample_spacing": None,
         }
 
     def _get_arg_or_scene_value(self, name: str, scene: dict[str, object]) -> object:
@@ -229,8 +245,8 @@ class Example:
         self.model.set_gravity((0.0, -9.81, 0.0))
 
         self.boundary_model = None
-        if bool(getattr(self.args, "include_static_boundary_samples", False)):
-            boundary_spacing = getattr(self.args, "boundary_sample_spacing", None)
+        if bool(self._get_arg_or_scene_value("include_static_boundary_samples", particle_block)):
+            boundary_spacing = self._get_arg_or_scene_value("boundary_sample_spacing", particle_block)
             if boundary_spacing is None:
                 boundary_spacing = particle_block["cell"]
             self.boundary_model = FSIBoundaryModel(
@@ -249,11 +265,11 @@ class Example:
                 smoothing_radius=particle_block["smoothing_radius"],
                 iterations=particle_block["iterations"],
                 relaxation=0.5,
-                viscosity_coefficient=particle_block["viscosity"],
+                viscosity_coefficient=float(self._get_arg_or_scene_value("viscosity_coefficient", particle_block)),
                 viscosity_boundary_coefficient=float(
                     self._get_arg_or_scene_value("viscosity_boundary_coefficient", particle_block)
                 ),
-                xsph_coefficient=particle_block["xsph"],
+                xsph_coefficient=float(self._get_arg_or_scene_value("xsph_coefficient", particle_block)),
                 xsph_boundary_coefficient=float(
                     self._get_arg_or_scene_value("xsph_boundary_coefficient", particle_block)
                 ),

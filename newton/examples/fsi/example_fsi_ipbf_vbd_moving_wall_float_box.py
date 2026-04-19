@@ -143,14 +143,56 @@ class Example:
         parser.add_argument(
             "--include-static-boundary-samples",
             action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Include sampled static walls in the FSI boundary density and local dissipation paths.",
+        )
+        parser.add_argument(
+            "--show-boundary-samples",
+            action=argparse.BooleanOptionalAction,
             default=False,
-            help="Include static container walls in the FSI boundary-sample density/pressure path.",
+            help="Render FSI boundary samples for debugging.",
         )
         parser.add_argument(
             "--static-boundary-weight",
             type=float,
             default=None,
             help="Diagnostic weight applied only to static boundary-sample density/pressure contributions.",
+        )
+        parser.add_argument(
+            "--viscosity-boundary-coefficient",
+            type=float,
+            default=None,
+            help="Boundary-sample viscosity coefficient used for local wall/body dissipation.",
+        )
+        parser.add_argument(
+            "--viscosity-coefficient",
+            type=float,
+            default=None,
+            help="Fluid-fluid viscosity coefficient used for internal velocity diffusion.",
+        )
+        parser.add_argument(
+            "--xsph-boundary-coefficient",
+            type=float,
+            default=None,
+            help="Boundary-sample XSPH coefficient used for local wall/body velocity smoothing.",
+        )
+        parser.add_argument(
+            "--xsph-coefficient",
+            type=float,
+            default=None,
+            help="Fluid-fluid XSPH velocity smoothing coefficient.",
+        )
+        parser.add_argument(
+            "--boundary-velocity-damping",
+            type=float,
+            default=None,
+            help="Tangential velocity damping applied at final particle-shape contacts.",
+        )
+        parser.add_argument(
+            "--velocity-damping",
+            type=float,
+            default=None,
+            help="Example-level global velocity damping multiplier.",
         )
         parser.add_argument(
             "--hydrostatic-volume-mode",
@@ -187,6 +229,7 @@ class Example:
         box_offset_x_override = getattr(self.args, "box_offset_x", None)
         box_bottom_gap_override = getattr(self.args, "box_bottom_gap", None)
         box_density_override = getattr(self.args, "box_density", None)
+        include_static_override = getattr(self.args, "include_static_boundary_samples", None)
         static_boundary_weight_override = getattr(self.args, "static_boundary_weight", None)
 
         if bool(getattr(self.args, "test", False)):
@@ -212,8 +255,11 @@ class Example:
                 "compliance": 1.0e-5,
                 "sim_substeps": 6,
                 "velocity_damping": 0.996,
-                "viscosity": 0.002,
-                "xsph": 0.004,
+                "viscosity_coefficient": 0.002,
+                "viscosity_boundary_coefficient": 0.0,
+                "xsph_coefficient": 0.004,
+                "xsph_boundary_coefficient": 0.0,
+                "boundary_velocity_damping": 1.0,
                 "rigid_iterations": 2,
                 "boundary_spacing": 0.04,
                 "wall_travel": 0.06,
@@ -227,6 +273,7 @@ class Example:
                 ),
                 "pressure_reaction_relaxation": (1.50 if pressure_relaxation is None else float(pressure_relaxation)),
                 "static_boundary_weight": 1.0,
+                "include_static_boundary_samples": False,
                 "expected_min_box_shift": 0.01,
                 "expected_min_box_force_norm": 0.50,
                 "expected_min_sample_force_norm": 0.02,
@@ -254,8 +301,11 @@ class Example:
                 "compliance": 1.0e-5,
                 "sim_substeps": 6,
                 "velocity_damping": 0.999,
-                "viscosity": 0.0025,
-                "xsph": 0.005,
+                "viscosity_coefficient": 0.0025,
+                "viscosity_boundary_coefficient": 0.0,
+                "xsph_coefficient": 0.005,
+                "xsph_boundary_coefficient": 0.0,
+                "boundary_velocity_damping": 1.0,
                 "rigid_iterations": 2,
                 "boundary_spacing": 0.014,
                 "wall_travel": 0.12,
@@ -269,6 +319,7 @@ class Example:
                 ),
                 "pressure_reaction_relaxation": (1.50 if pressure_relaxation is None else float(pressure_relaxation)),
                 "static_boundary_weight": 1.0,
+                "include_static_boundary_samples": False,
                 "expected_min_box_shift": 0.0,
                 "expected_min_box_force_norm": 0.0,
                 "expected_min_sample_force_norm": 0.0,
@@ -290,8 +341,22 @@ class Example:
             config["box_bottom_gap"] = float(box_bottom_gap_override)
         if box_density_override is not None:
             config["box_density"] = float(box_density_override)
+        if include_static_override is not None:
+            config["include_static_boundary_samples"] = bool(include_static_override)
         if static_boundary_weight_override is not None:
             config["static_boundary_weight"] = float(static_boundary_weight_override)
+
+        optional_float_overrides = {
+            "velocity_damping": getattr(self.args, "velocity_damping", None),
+            "viscosity_coefficient": getattr(self.args, "viscosity_coefficient", None),
+            "viscosity_boundary_coefficient": getattr(self.args, "viscosity_boundary_coefficient", None),
+            "xsph_coefficient": getattr(self.args, "xsph_coefficient", None),
+            "xsph_boundary_coefficient": getattr(self.args, "xsph_boundary_coefficient", None),
+            "boundary_velocity_damping": getattr(self.args, "boundary_velocity_damping", None),
+        }
+        for key, value in optional_float_overrides.items():
+            if value is not None:
+                config[key] = float(value)
 
         return config
 
@@ -305,11 +370,12 @@ class Example:
         self.args = args
         self._reset_key_prev = False
         self.wall_motion_enabled = bool(getattr(self.args, "wall_motion", True))
-        self.include_static_boundary_samples = bool(getattr(self.args, "include_static_boundary_samples", False))
         self.hydrostatic_volume_mode = self._parse_hydrostatic_volume_mode(
             getattr(self.args, "hydrostatic_volume_mode", "dynamic-box-surface-thickness")
         )
         self.config = self._get_scene_config()
+        self.include_static_boundary_samples = bool(self.config["include_static_boundary_samples"])
+        self.show_boundary_samples = bool(getattr(self.args, "show_boundary_samples", False))
         self.sim_substeps = int(self.config["sim_substeps"])
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.container_half_width = float(self.config["container_half_width"])
@@ -354,8 +420,11 @@ class Example:
                 compliance=float(self.config["compliance"]),
                 iterations=int(self.config["ipbf_iterations"]),
                 relaxation=float(self.config["ipbf_relaxation"]),
-                viscosity_coefficient=float(self.config["viscosity"]),
-                xsph_coefficient=float(self.config["xsph"]),
+                viscosity_coefficient=float(self.config["viscosity_coefficient"]),
+                viscosity_boundary_coefficient=float(self.config["viscosity_boundary_coefficient"]),
+                xsph_coefficient=float(self.config["xsph_coefficient"]),
+                xsph_boundary_coefficient=float(self.config["xsph_boundary_coefficient"]),
+                boundary_velocity_damping=float(self.config["boundary_velocity_damping"]),
                 fsi_projection_reaction_relaxation=float(self.config["projection_reaction_relaxation"]),
                 fsi_velocity_projection_reaction_relaxation=float(self.config["velocity_reaction_relaxation"]),
                 fsi_pressure_reaction_relaxation=float(self.config["pressure_reaction_relaxation"]),
@@ -407,6 +476,9 @@ class Example:
             device=self.model.device,
         )
         self.boundary_colors = self._build_boundary_colors()
+        self.float_box_color = wp.array([wp.vec3(1.0, 0.68, 0.24)], dtype=wp.vec3, device=self.model.device)
+        self.moving_wall_color = wp.array([wp.vec3(0.82, 0.86, 0.90)], dtype=wp.vec3, device=self.model.device)
+        self.rigid_material = wp.array([wp.vec4(0.45, 0.0, 0.0, 0.0)], dtype=wp.vec4, device=self.model.device)
         self.enable_runtime_diagnostics = bool(getattr(self.args, "enable_runtime_diagnostics", False)) or bool(
             getattr(self.args, "test", False)
         )
@@ -445,6 +517,10 @@ class Example:
         colors[sample_body == self.float_box_body] = np.array([1.0, 0.68, 0.24], dtype=np.float32)
         colors[sample_body == self.moving_wall_body] = np.array([0.92, 0.94, 0.98], dtype=np.float32)
         return wp.array(colors, dtype=wp.vec3, device=self.model.device)
+
+    def _body_xforms(self, body_indices: list[int]) -> wp.array(dtype=wp.transform):
+        body_q = self.state_0.body_q.numpy()[body_indices]
+        return wp.array(body_q, dtype=wp.transform, device=self.model.device)
 
     def _add_container(self, builder: newton.ModelBuilder) -> None:
         wall_t = self.wall_thickness
@@ -628,6 +704,7 @@ class Example:
             self.reset()
         ui.text(f"Wall motion: {'on' if self.wall_motion_enabled else 'off'}")
         ui.text(f"Static boundary samples: {'on' if self.include_static_boundary_samples else 'off'}")
+        ui.text(f"Render boundary samples: {'on' if self.show_boundary_samples else 'off'}")
         ui.text(f"Static boundary weight: {float(self.config['static_boundary_weight']):.2f}")
         ui.text(f"Hydrostatic mode: {self.args.hydrostatic_volume_mode!s}")
         ui.text(f"Wall travel: {self.wall_travel:.3f} m")
@@ -934,6 +1011,26 @@ class Example:
             colors=self.container_wire_color,
             width=0.01,
         )
+        self.viewer.log_shapes(
+            "/fsi/moving_wall_float_box_body",
+            newton.GeoType.BOX,
+            tuple(float(self.box_half_extent[i]) for i in range(3)),
+            self._body_xforms([self.float_box_body]),
+            self.float_box_color,
+            self.rigid_material,
+        )
+        self.viewer.log_shapes(
+            "/fsi/moving_wall_pusher_body",
+            newton.GeoType.BOX,
+            (
+                self.wall_thickness,
+                self.wall_half_height + self.wall_thickness,
+                self.container_half_depth + self.wall_thickness,
+            ),
+            self._body_xforms([self.moving_wall_body]),
+            self.moving_wall_color,
+            self.rigid_material,
+        )
         self.viewer.log_points(
             "/fsi/moving_wall_ipbf_particles",
             points=self.state_0.particle_q,
@@ -946,7 +1043,7 @@ class Example:
             points=self.boundary_model.sample_x_world,
             radii=self.boundary_radii,
             colors=self.boundary_colors,
-            hidden=not self.viewer.show_particles,
+            hidden=not (self.viewer.show_particles and self.show_boundary_samples),
         )
         self.viewer.end_frame()
 
