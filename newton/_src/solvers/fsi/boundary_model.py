@@ -30,6 +30,7 @@ from .boundary_kernels import (
     accumulate_step_reaction_diagnostics,
     update_boundary_sample_world_kinematics,
     update_deformable_boundary_sample_world_kinematics,
+    update_deformable_triangle_contact_proxy_world_kinematics,
     update_step_reaction_averages,
 )
 
@@ -196,6 +197,9 @@ class FSIBoundaryModel:
         self.triangle_sample_count = len(sample_triangle)
         self.triangle_indices = wp.array(sorted(set(sample_triangle)), dtype=wp.int32, device=self.device)
         self.triangle_count = self.triangle_indices.shape[0]
+        triangle_contact_radius = self._compute_triangle_contact_radii(model, sorted(set(sample_triangle)))
+        self.triangle_contact_radius = wp.array(triangle_contact_radius, dtype=float, device=self.device)
+        self.triangle_contact_radius_max = max(triangle_contact_radius, default=0.0)
         shape_sample_count = [0 for _ in range(model.shape_count)]
         for shape in sample_shape:
             if shape >= 0:
@@ -261,6 +265,7 @@ class FSIBoundaryModel:
         self.sample_x_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_v_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_normal_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
+        self.triangle_contact_x_world = wp.zeros(self.triangle_count, dtype=wp.vec3, device=self.device)
         self.sample_force = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.vertex_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         self.vertex_contact_delta = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
@@ -277,6 +282,7 @@ class FSIBoundaryModel:
         self.body_force_step_count = wp.zeros(1, dtype=wp.int32, device=self.device)
 
         self.boundary_grid = wp.HashGrid(128, 128, 128, device=self.device) if self.sample_count > 0 else None
+        self.triangle_contact_grid = wp.HashGrid(128, 128, 128, device=self.device) if self.triangle_count > 0 else None
 
         self._empty_body_q = wp.zeros(0, dtype=wp.transform, device=self.device)
         self._empty_body_qd = wp.zeros(0, dtype=wp.spatial_vector, device=self.device)
@@ -330,13 +336,28 @@ class FSIBoundaryModel:
                 device=self.device,
             )
 
+            if self.triangle_count > 0:
+                wp.launch(
+                    update_deformable_triangle_contact_proxy_world_kinematics,
+                    dim=self.triangle_count,
+                    inputs=[
+                        self.triangle_indices,
+                        self.model.tri_indices,
+                        state.particle_q,
+                    ],
+                    outputs=[
+                        self.triangle_contact_x_world,
+                    ],
+                    device=self.device,
+                )
+
     def build_grid(self) -> None:
         """Build the boundary sample hash grid for neighbor queries."""
-        if self.boundary_grid is None or self.sample_count == 0:
-            return
-
         with wp.ScopedDevice(self.device):
-            self.boundary_grid.build(self.sample_x_world, radius=self.support_radius)
+            if self.boundary_grid is not None and self.sample_count > 0:
+                self.boundary_grid.build(self.sample_x_world, radius=self.support_radius)
+            if self.triangle_contact_grid is not None and self.triangle_count > 0:
+                self.triangle_contact_grid.build(self.triangle_contact_x_world, radius=self.support_radius)
 
     def clear_forces(self) -> None:
         """Clear boundary sample, body wrench, and deformable reaction accumulators."""
@@ -584,6 +605,24 @@ class FSIBoundaryModel:
             sample_area_patch,
             sample_volume_quadrature,
         )
+
+    @staticmethod
+    def _compute_triangle_contact_radii(model: Model, triangle_indices: Sequence[int]) -> list[float]:
+        """Return conservative centroid radii for sampled deformable triangles."""
+        if len(triangle_indices) == 0 or model.tri_indices is None or model.particle_q is None:
+            return []
+
+        tri_indices = np.asarray(model.tri_indices.numpy(), dtype=np.int32).reshape((-1, 3))
+        particle_q = np.asarray(model.particle_q.numpy(), dtype=np.float32)
+
+        radii: list[float] = []
+        for triangle_index in triangle_indices:
+            vertices = tri_indices[int(triangle_index)]
+            points = particle_q[vertices]
+            centroid = np.mean(points, axis=0)
+            radii.append(float(np.linalg.norm(points - centroid, axis=1).max()))
+
+        return radii
 
     @classmethod
     def _calibrate_sample_volumes(

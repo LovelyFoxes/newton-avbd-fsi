@@ -38,6 +38,7 @@ from .ipbf_kernels import (
     accumulate_particle_shape_boundary_velocity_projection,
     accumulate_particle_shape_boundary_velocity_projection_with_reaction,
     accumulate_particle_triangle_contact_corrections,
+    accumulate_particle_triangle_contact_corrections_from_grid,
     apply_artificial_damping,
     apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
@@ -145,6 +146,13 @@ class SolverIPBF(SolverBase):
                 velocity-smoothing / viscosity paths.
             fsi_triangle_contact_enabled: Whether active fluid particles are
                 projected against triangle-bound deformable FSI boundaries.
+            fsi_triangle_contact_use_grid: Whether deformable triangle contact
+                should use the boundary model's triangle proxy grid instead of
+                scanning every sampled triangle.
+            fsi_triangle_contact_search_radius: Candidate triangle proxy query
+                radius [m]. If ``None``, a conservative radius based on the
+                triangle proxy radius, particle radius, and contact margin is
+                used.
             fsi_triangle_contact_margin: Additional particle-triangle contact
                 margin [m] added to the fluid particle radius.
             fsi_triangle_contact_relaxation: Unitless relaxation used when
@@ -182,6 +190,8 @@ class SolverIPBF(SolverBase):
         fsi_pressure_reaction_relaxation: float = 1.0
         fsi_static_boundary_weight: float = 1.0
         fsi_triangle_contact_enabled: bool = True
+        fsi_triangle_contact_use_grid: bool = True
+        fsi_triangle_contact_search_radius: float | None = None
         fsi_triangle_contact_margin: float = 0.0
         fsi_triangle_contact_relaxation: float = 1.0
         fluid_particle_start: int = 0
@@ -380,6 +390,15 @@ class SolverIPBF(SolverBase):
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
         self.fsi_triangle_contact_enabled = bool(self.config.fsi_triangle_contact_enabled)
+        self.fsi_triangle_contact_use_grid = bool(self.config.fsi_triangle_contact_use_grid)
+        configured_triangle_contact_search_radius = self.config.fsi_triangle_contact_search_radius
+        self.fsi_triangle_contact_search_radius = (
+            float(configured_triangle_contact_search_radius)
+            if configured_triangle_contact_search_radius is not None
+            else 0.0
+        )
+        if self.fsi_triangle_contact_search_radius < 0.0:
+            raise ValueError("IPBF triangle contact search radius must be non-negative.")
         self.fsi_triangle_contact_margin = float(self.config.fsi_triangle_contact_margin)
         if self.fsi_triangle_contact_margin < 0.0:
             raise ValueError("IPBF triangle contact margin must be non-negative.")
@@ -390,6 +409,7 @@ class SolverIPBF(SolverBase):
         self._uses_particle_subset = (
             self.fluid_particle_start != 0 or self.fluid_particle_count != self.model.particle_count
         )
+        self._max_particle_radius = self._compute_max_particle_radius()
         self.boundary_model = None
         self.set_boundary_model(boundary_model)
 
@@ -457,6 +477,13 @@ class SolverIPBF(SolverBase):
             raise ValueError("IPBF fluid particle count must fit inside the model particle range.")
 
         return start, count
+
+    def _compute_max_particle_radius(self) -> float:
+        """Return the largest model particle radius [m]."""
+        if self.model.particle_count == 0 or self.model.particle_radius is None:
+            return 0.0
+
+        return float(np.max(self.model.particle_radius.numpy()))
 
     def _refresh_particle_flags(self) -> None:
         """Refresh solver-local flags that mark only the IPBF fluid range active."""
@@ -649,33 +676,72 @@ class SolverIPBF(SolverBase):
             )
 
         if has_triangle_contacts:
+            boundary_model.update_world_kinematics(state)
+            boundary_model.build_grid()
+
             self._triangle_contact_particle_delta.zero_()
             self._triangle_contact_vertex_delta.zero_()
 
-            wp.launch(
-                accumulate_particle_triangle_contact_corrections,
-                dim=model.particle_count,
-                inputs=[
-                    state.particle_q,
-                    model.particle_mass,
-                    model.particle_inv_mass,
-                    model.particle_radius,
-                    self._ipbf_particle_flags,
-                    model.tri_indices,
-                    boundary_model.triangle_indices,
-                    boundary_model.triangle_count,
-                    self.fsi_triangle_contact_margin,
-                    self.fsi_triangle_contact_relaxation,
-                    dt,
-                ],
-                outputs=[
-                    self._triangle_contact_particle_delta,
-                    self._triangle_contact_vertex_delta,
-                    boundary_model.vertex_contact_delta,
-                    boundary_model.vertex_force,
-                ],
-                device=model.device,
-            )
+            if (
+                self.fsi_triangle_contact_use_grid
+                and getattr(boundary_model, "triangle_contact_grid", None) is not None
+            ):
+                contact_search_radius = max(
+                    self.fsi_triangle_contact_search_radius,
+                    float(getattr(boundary_model, "triangle_contact_radius_max", 0.0))
+                    + self._max_particle_radius
+                    + self.fsi_triangle_contact_margin,
+                )
+                wp.launch(
+                    accumulate_particle_triangle_contact_corrections_from_grid,
+                    dim=model.particle_count,
+                    inputs=[
+                        boundary_model.triangle_contact_grid.id,
+                        state.particle_q,
+                        model.particle_mass,
+                        model.particle_inv_mass,
+                        model.particle_radius,
+                        self._ipbf_particle_flags,
+                        model.tri_indices,
+                        boundary_model.triangle_indices,
+                        contact_search_radius,
+                        self.fsi_triangle_contact_margin,
+                        self.fsi_triangle_contact_relaxation,
+                        dt,
+                    ],
+                    outputs=[
+                        self._triangle_contact_particle_delta,
+                        self._triangle_contact_vertex_delta,
+                        boundary_model.vertex_contact_delta,
+                        boundary_model.vertex_force,
+                    ],
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    accumulate_particle_triangle_contact_corrections,
+                    dim=model.particle_count,
+                    inputs=[
+                        state.particle_q,
+                        model.particle_mass,
+                        model.particle_inv_mass,
+                        model.particle_radius,
+                        self._ipbf_particle_flags,
+                        model.tri_indices,
+                        boundary_model.triangle_indices,
+                        boundary_model.triangle_count,
+                        self.fsi_triangle_contact_margin,
+                        self.fsi_triangle_contact_relaxation,
+                        dt,
+                    ],
+                    outputs=[
+                        self._triangle_contact_particle_delta,
+                        self._triangle_contact_vertex_delta,
+                        boundary_model.vertex_contact_delta,
+                        boundary_model.vertex_force,
+                    ],
+                    device=model.device,
+                )
 
             wp.launch(
                 apply_particle_triangle_contact_deltas,

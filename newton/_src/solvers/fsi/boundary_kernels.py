@@ -138,3 +138,21 @@ def update_deformable_boundary_sample_world_kinematics(
         sample_normal_world[tid] = normal / normal_norm
     else:
         sample_normal_world[tid] = wp.vec3(0.0)
+
+
+@wp.kernel
+def update_deformable_triangle_contact_proxy_world_kinematics(
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    particle_q: wp.array(dtype=wp.vec3),
+    contact_triangle_x_world: wp.array(dtype=wp.vec3),
+):
+    """Update one centroid proxy per sampled deformable triangle."""
+    tid = wp.tid()
+
+    tri = contact_triangle_indices[tid]
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+
+    contact_triangle_x_world[tid] = (particle_q[v0] + particle_q[v1] + particle_q[v2]) / 3.0
