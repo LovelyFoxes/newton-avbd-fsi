@@ -1570,31 +1570,23 @@ def accumulate_particle_triangle_contact_corrections(
 
 
 @wp.kernel
-def accumulate_particle_triangle_contact_corrections_from_bvh(
+def collect_particle_triangle_contact_pairs_from_bvh(
     triangle_contact_bvh: wp.uint64,
     contact_triangle_indices: wp.array(dtype=wp.int32),
     particle_q_prev: wp.array(dtype=wp.vec3),
     particle_q: wp.array(dtype=wp.vec3),
-    particle_mass: wp.array(dtype=float),
-    particle_inv_mass: wp.array(dtype=float),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
-    tri_indices: wp.array(dtype=wp.int32, ndim=2),
     contact_margin: float,
-    relaxation: float,
-    continuous_enabled: int,
-    dt: float,
-    particle_contact_delta: wp.array(dtype=wp.vec3),
-    vertex_contact_delta: wp.array(dtype=wp.vec3),
-    vertex_contact_delta_total: wp.array(dtype=wp.vec3),
-    vertex_force: wp.array(dtype=wp.vec3),
+    pair_capacity: int,
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_triangle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
 ):
-    """Accumulate particle-triangle contact corrections from a swept triangle BVH."""
+    """Collect compact particle-triangle candidate pairs from a swept triangle BVH."""
     tid = wp.tid()
 
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
-        return
-    if relaxation == 0.0:
         return
 
     query_padding = particle_radius[tid] + contact_margin
@@ -1610,25 +1602,66 @@ def accumulate_particle_triangle_contact_corrections_from_bvh(
     triangle_leaf = wp.int32(-1)
 
     while wp.bvh_query_next(query, triangle_leaf):
-        tri = contact_triangle_indices[triangle_leaf]
-        accumulate_particle_triangle_contact_correction(
-            tid,
-            tri,
-            particle_q_prev,
-            particle_q,
-            particle_mass,
-            particle_inv_mass,
-            particle_radius,
-            tri_indices,
-            contact_margin,
-            relaxation,
-            continuous_enabled,
-            dt,
-            particle_contact_delta,
-            vertex_contact_delta,
-            vertex_contact_delta_total,
-            vertex_force,
-        )
+        pair_index = wp.atomic_add(pair_count, 0, 1)
+        if pair_index < pair_capacity:
+            pair_particle[pair_index] = tid
+            pair_triangle[pair_index] = contact_triangle_indices[triangle_leaf]
+
+
+@wp.kernel
+def accumulate_particle_triangle_contact_corrections_from_pairs(
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_triangle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_capacity: int,
+    particle_q_prev: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    contact_margin: float,
+    relaxation: float,
+    continuous_enabled: int,
+    dt: float,
+    particle_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta_total: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate particle-triangle contact corrections from compact candidate pairs."""
+    tid = wp.tid()
+
+    if relaxation == 0.0:
+        return
+
+    pair_total = wp.min(pair_count[0], pair_capacity)
+    if tid >= pair_total:
+        return
+
+    particle_index = pair_particle[tid]
+    tri = pair_triangle[tid]
+    if particle_index < 0 or tri < 0:
+        return
+
+    accumulate_particle_triangle_contact_correction(
+        particle_index,
+        tri,
+        particle_q_prev,
+        particle_q,
+        particle_mass,
+        particle_inv_mass,
+        particle_radius,
+        tri_indices,
+        contact_margin,
+        relaxation,
+        continuous_enabled,
+        dt,
+        particle_contact_delta,
+        vertex_contact_delta,
+        vertex_contact_delta_total,
+        vertex_force,
+    )
 
 
 @wp.kernel

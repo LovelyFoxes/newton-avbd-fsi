@@ -38,8 +38,8 @@ from .ipbf_kernels import (
     accumulate_particle_shape_boundary_velocity_projection,
     accumulate_particle_shape_boundary_velocity_projection_with_reaction,
     accumulate_particle_triangle_contact_corrections,
-    accumulate_particle_triangle_contact_corrections_from_bvh,
     accumulate_particle_triangle_contact_corrections_from_grid,
+    accumulate_particle_triangle_contact_corrections_from_pairs,
     apply_artificial_damping,
     apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
@@ -50,6 +50,7 @@ from .ipbf_kernels import (
     apply_xsph_velocity_smoothing,
     apply_xsph_velocity_smoothing_with_boundary,
     apply_xsph_velocity_smoothing_without_grid,
+    collect_particle_triangle_contact_pairs_from_bvh,
     compute_constraint_and_gradient,
     compute_constraint_and_gradient_with_boundary,
     compute_density_and_neighbor_count,
@@ -150,6 +151,10 @@ class SolverIPBF(SolverBase):
             fsi_triangle_contact_use_bvh: Whether deformable triangle contact
                 should query a swept triangle BVH before falling back to the
                 legacy proxy-grid or brute-force scan paths.
+            fsi_triangle_contact_pair_capacity: Maximum number of compact
+                cloth contact candidate pairs stored per triangle-contact
+                solve when the swept BVH broadphase is enabled. If ``None``,
+                the solver derives a capacity from the active fluid count.
             fsi_triangle_contact_use_grid: Whether deformable triangle contact
                 should use the boundary model's triangle proxy grid instead of
                 scanning every sampled triangle when BVH broadphase is
@@ -200,6 +205,7 @@ class SolverIPBF(SolverBase):
         fsi_static_boundary_weight: float = 1.0
         fsi_triangle_contact_enabled: bool = True
         fsi_triangle_contact_use_bvh: bool = True
+        fsi_triangle_contact_pair_capacity: int | None = None
         fsi_triangle_contact_use_grid: bool = True
         fsi_triangle_contact_search_radius: float | None = None
         fsi_triangle_contact_continuous_enabled: bool = True
@@ -419,6 +425,7 @@ class SolverIPBF(SolverBase):
         if self.fsi_triangle_contact_relaxation < 0.0:
             raise ValueError("IPBF triangle contact relaxation must be non-negative.")
         self.fluid_particle_start, self.fluid_particle_count = self._validate_fluid_particle_range()
+        self.fsi_triangle_contact_pair_capacity = self._resolve_triangle_contact_pair_capacity()
         self._uses_particle_subset = (
             self.fluid_particle_start != 0 or self.fluid_particle_count != self.model.particle_count
         )
@@ -451,6 +458,17 @@ class SolverIPBF(SolverBase):
             self._boundary_projection_delta_total = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_particle_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_vertex_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._triangle_contact_pair_particle = wp.full(
+                self.fsi_triangle_contact_pair_capacity,
+                value=-1,
+                dtype=wp.int32,
+            )
+            self._triangle_contact_pair_triangle = wp.full(
+                self.fsi_triangle_contact_pair_capacity,
+                value=-1,
+                dtype=wp.int32,
+            )
+            self._triangle_contact_pair_count = wp.zeros(1, dtype=wp.int32)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -490,6 +508,17 @@ class SolverIPBF(SolverBase):
             raise ValueError("IPBF fluid particle count must fit inside the model particle range.")
 
         return start, count
+
+    def _resolve_triangle_contact_pair_capacity(self) -> int:
+        """Return the compact BVH triangle-contact pair capacity."""
+        configured_capacity = self.config.fsi_triangle_contact_pair_capacity
+        if configured_capacity is not None:
+            capacity = int(configured_capacity)
+            if capacity <= 0:
+                raise ValueError("IPBF triangle contact pair capacity must be positive.")
+            return capacity
+
+        return max(256, max(1, self.fluid_particle_count) * 8)
 
     def _compute_max_particle_radius(self) -> float:
         """Return the largest model particle radius [m]."""
@@ -700,32 +729,82 @@ class SolverIPBF(SolverBase):
                 self.fsi_triangle_contact_use_bvh
                 and getattr(boundary_model, "triangle_contact_bvh", None) is not None
             ):
+                self._triangle_contact_pair_count.zero_()
                 wp.launch(
-                    accumulate_particle_triangle_contact_corrections_from_bvh,
+                    collect_particle_triangle_contact_pairs_from_bvh,
                     dim=model.particle_count,
                     inputs=[
                         boundary_model.triangle_contact_bvh.id,
                         boundary_model.triangle_indices,
                         boundary_model.triangle_contact_particle_q_prev,
                         state.particle_q,
-                        model.particle_mass,
-                        model.particle_inv_mass,
                         model.particle_radius,
                         self._ipbf_particle_flags,
-                        model.tri_indices,
                         self.fsi_triangle_contact_margin,
-                        self.fsi_triangle_contact_relaxation,
-                        int(self.fsi_triangle_contact_continuous_enabled),
-                        dt,
+                        self.fsi_triangle_contact_pair_capacity,
                     ],
                     outputs=[
-                        self._triangle_contact_particle_delta,
-                        self._triangle_contact_vertex_delta,
-                        boundary_model.vertex_contact_delta,
-                        boundary_model.vertex_force,
+                        self._triangle_contact_pair_particle,
+                        self._triangle_contact_pair_triangle,
+                        self._triangle_contact_pair_count,
                     ],
                     device=model.device,
                 )
+                if int(self._triangle_contact_pair_count.numpy()[0]) <= self.fsi_triangle_contact_pair_capacity:
+                    wp.launch(
+                        accumulate_particle_triangle_contact_corrections_from_pairs,
+                        dim=self.fsi_triangle_contact_pair_capacity,
+                        inputs=[
+                            self._triangle_contact_pair_particle,
+                            self._triangle_contact_pair_triangle,
+                            self._triangle_contact_pair_count,
+                            self.fsi_triangle_contact_pair_capacity,
+                            boundary_model.triangle_contact_particle_q_prev,
+                            state.particle_q,
+                            model.particle_mass,
+                            model.particle_inv_mass,
+                            model.particle_radius,
+                            model.tri_indices,
+                            self.fsi_triangle_contact_margin,
+                            self.fsi_triangle_contact_relaxation,
+                            int(self.fsi_triangle_contact_continuous_enabled),
+                            dt,
+                        ],
+                        outputs=[
+                            self._triangle_contact_particle_delta,
+                            self._triangle_contact_vertex_delta,
+                            boundary_model.vertex_contact_delta,
+                            boundary_model.vertex_force,
+                        ],
+                        device=model.device,
+                    )
+                else:
+                    wp.launch(
+                        accumulate_particle_triangle_contact_corrections,
+                        dim=model.particle_count,
+                        inputs=[
+                            boundary_model.triangle_contact_particle_q_prev,
+                            state.particle_q,
+                            model.particle_mass,
+                            model.particle_inv_mass,
+                            model.particle_radius,
+                            self._ipbf_particle_flags,
+                            model.tri_indices,
+                            boundary_model.triangle_indices,
+                            boundary_model.triangle_count,
+                            self.fsi_triangle_contact_margin,
+                            self.fsi_triangle_contact_relaxation,
+                            int(self.fsi_triangle_contact_continuous_enabled),
+                            dt,
+                        ],
+                        outputs=[
+                            self._triangle_contact_particle_delta,
+                            self._triangle_contact_vertex_delta,
+                            boundary_model.vertex_contact_delta,
+                            boundary_model.vertex_force,
+                        ],
+                        device=model.device,
+                    )
             elif (
                 self.fsi_triangle_contact_use_grid
                 and getattr(boundary_model, "triangle_contact_grid", None) is not None

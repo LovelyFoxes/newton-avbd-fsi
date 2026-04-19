@@ -1167,8 +1167,10 @@ def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, dev
     test.assertEqual(boundary_model.triangle_count, 1)
     test.assertTrue(solver.fsi_triangle_contact_use_bvh)
     test.assertTrue(solver.fsi_triangle_contact_use_grid)
+    test.assertGreaterEqual(solver.fsi_triangle_contact_pair_capacity, 1)
     test.assertIsNotNone(boundary_model.triangle_contact_bvh)
     test.assertIsNotNone(boundary_model.triangle_contact_grid)
+    test.assertGreaterEqual(int(solver._triangle_contact_pair_count.numpy()[0]), 1)
     np.testing.assert_array_equal(boundary_model.triangle_indices.numpy(), np.array([0], dtype=np.int32))
     np.testing.assert_allclose(q[0] - initial_q[0], expected_fluid_delta, rtol=1.0e-5, atol=1.0e-6)
     np.testing.assert_allclose(q[1:], initial_q[1:], rtol=1.0e-6, atol=1.0e-6)
@@ -1356,6 +1358,95 @@ def test_ipbf_triangle_contact_bvh_matches_brute_force_scan(test, device):
     np.testing.assert_allclose(bvh_particle_delta, scan_particle_delta, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(bvh_vertex_delta, scan_vertex_delta, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(bvh_vertex_force, scan_vertex_force, rtol=1.0e-6, atol=1.0e-6)
+
+
+def test_ipbf_triangle_contact_bvh_pair_overflow_falls_back_to_scan(test, device):
+    def run_step(*, use_bvh: bool, pair_capacity: int | None):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        SolverIPBF.register_custom_attributes(builder)
+
+        builder.add_particles(
+            pos=[
+                wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.02),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(0.0, 1.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.01),
+                wp.vec3(1.0, 0.0, 0.01),
+                wp.vec3(0.0, 1.0, 0.01),
+            ],
+            vel=[
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+            ],
+            mass=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            radius=[0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05],
+        )
+        builder.add_triangle(1, 2, 3)
+        builder.add_triangle(4, 5, 6)
+        model = builder.finalize(device=device)
+        model.set_gravity((0.0, 0.0, 0.0))
+
+        boundary_model = FSIBoundaryModel(
+            model,
+            spacing=2.0,
+            support_radius=0.5,
+            include_static=False,
+            include_dynamic=False,
+            include_triangles=True,
+            deformable_sample_thickness=0.2,
+            device=device,
+        )
+        solver = SolverIPBF(
+            model,
+            SolverIPBF.Config(
+                rest_density=1000.0,
+                smoothing_radius=0.5,
+                iterations=0,
+                use_constraint_clamp=False,
+                damping_beta=0.0,
+                fluid_particle_start=0,
+                fluid_particle_count=1,
+                fsi_triangle_contact_use_bvh=use_bvh,
+                fsi_triangle_contact_use_grid=False,
+                fsi_triangle_contact_pair_capacity=pair_capacity,
+                fsi_triangle_contact_relaxation=1.0,
+            ),
+            boundary_model=boundary_model,
+        )
+
+        state_0 = model.state()
+        state_1 = model.state()
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+        return (
+            state_1.particle_q.numpy(),
+            solver._triangle_contact_particle_delta.numpy(),
+            boundary_model.vertex_contact_delta.numpy(),
+            boundary_model.vertex_force.numpy(),
+            int(solver._triangle_contact_pair_count.numpy()[0]),
+        )
+
+    overflow_q, overflow_particle_delta, overflow_vertex_delta, overflow_vertex_force, overflow_pair_count = run_step(
+        use_bvh=True,
+        pair_capacity=1,
+    )
+    scan_q, scan_particle_delta, scan_vertex_delta, scan_vertex_force, _scan_pair_count = run_step(
+        use_bvh=False,
+        pair_capacity=None,
+    )
+
+    test.assertGreater(overflow_pair_count, 1)
+    np.testing.assert_allclose(overflow_q, scan_q, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(overflow_particle_delta, scan_particle_delta, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(overflow_vertex_delta, scan_vertex_delta, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(overflow_vertex_force, scan_vertex_force, rtol=1.0e-6, atol=1.0e-6)
 
 
 def test_ipbf_triangle_contact_prevents_swept_side_change(test, device):
@@ -2425,6 +2516,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_triangle_contact_bvh_matches_brute_force_scan",
     test_ipbf_triangle_contact_bvh_matches_brute_force_scan,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_contact_bvh_pair_overflow_falls_back_to_scan",
+    test_ipbf_triangle_contact_bvh_pair_overflow_falls_back_to_scan,
     devices=devices,
     check_output=False,
 )
