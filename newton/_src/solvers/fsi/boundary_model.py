@@ -51,8 +51,9 @@ class FSIBoundaryModel:
     """Boundary samples used by the AVBD/IPBF fluid-solid coupling path.
 
     The implementation follows an Akinci-style boundary particle model and
-    samples Newton box and sphere shapes. Samples are stored in the parent frame:
-    body-local for dynamic shapes and world-space for static shapes.
+    samples Newton box and sphere shapes, plus optional triangle elements.
+    Samples are stored in the parent frame: body-local for dynamic shapes and
+    world-space for static shapes.
 
     Args:
         model: Newton model containing shapes to sample.
@@ -259,6 +260,7 @@ class FSIBoundaryModel:
         self.sample_v_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_normal_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_force = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
+        self.vertex_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
 
         body_count = int(getattr(model, "body_count", 0))
         self.body_force = wp.zeros(body_count, dtype=wp.vec3, device=self.device)
@@ -336,6 +338,7 @@ class FSIBoundaryModel:
     def clear_forces(self) -> None:
         """Clear boundary sample and body wrench accumulators."""
         self.sample_force.zero_()
+        self.vertex_force.zero_()
         self.body_force.zero_()
         self.body_torque.zero_()
 

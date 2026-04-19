@@ -978,6 +978,11 @@ def accumulate_boundary_pressure_reaction(
     hessian: wp.array(dtype=wp.mat33),
     boundary_x: wp.array(dtype=wp.vec3),
     boundary_body: wp.array(dtype=wp.int32),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
     body_q: wp.array(dtype=wp.transform),
@@ -989,6 +994,7 @@ def accumulate_boundary_pressure_reaction(
     solve_relaxation: float,
     reaction_relaxation: float,
     sample_force: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
     body_force: wp.array(dtype=wp.vec3),
     body_torque: wp.array(dtype=wp.vec3),
 ):
@@ -1036,6 +1042,12 @@ def accumulate_boundary_pressure_reaction(
             reaction_relaxation,
         )
         wp.atomic_add(sample_force, boundary_index, force_on_boundary)
+
+        if boundary_triangle[boundary_index] >= 0:
+            barycentric = boundary_barycentric[boundary_index]
+            wp.atomic_add(vertex_force, boundary_vertex0[boundary_index], barycentric[0] * force_on_boundary)
+            wp.atomic_add(vertex_force, boundary_vertex1[boundary_index], barycentric[1] * force_on_boundary)
+            wp.atomic_add(vertex_force, boundary_vertex2[boundary_index], barycentric[2] * force_on_boundary)
 
         body_index = boundary_body[boundary_index]
         if body_index < 0:

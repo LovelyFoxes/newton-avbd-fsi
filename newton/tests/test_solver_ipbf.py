@@ -1028,6 +1028,78 @@ def test_ipbf_triangle_boundary_samples_contribute_density_and_gradient(test, de
     np.testing.assert_allclose(constraint_gradient[1:], np.zeros((3, 3), dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
 
 
+def test_ipbf_triangle_boundary_pressure_reaction_scatters_to_vertices(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.1),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0, 1.0, 1.0],
+        radius=[0.05, 0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(1, 2, 3)
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=1,
+            use_constraint_clamp=False,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_pressure_reaction_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    sample_force = boundary_model.sample_force.numpy()[0]
+    vertex_force = boundary_model.vertex_force.numpy()
+    barycentric = boundary_model.sample_barycentric.numpy()[0]
+
+    test.assertGreater(float(np.linalg.norm(sample_force)), 0.0)
+    np.testing.assert_allclose(barycentric, np.full(3, 1.0 / 3.0, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_force[0], np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_force[1], barycentric[0] * sample_force, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_allclose(vertex_force[2], barycentric[1] * sample_force, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_allclose(vertex_force[3], barycentric[2] * sample_force, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_allclose(np.sum(vertex_force, axis=0), sample_force, rtol=1.0e-5, atol=1.0e-5)
+
+    boundary_model.clear_forces()
+    np.testing.assert_allclose(
+        boundary_model.vertex_force.numpy(), np.zeros_like(vertex_force), rtol=1.0e-6, atol=1.0e-6
+    )
+
+
 def test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing(test, device):
     _, coarse_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.25)
     _, fine_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.125)
@@ -1882,6 +1954,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_triangle_boundary_samples_contribute_density_and_gradient",
     test_ipbf_triangle_boundary_samples_contribute_density_and_gradient,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_boundary_pressure_reaction_scatters_to_vertices",
+    test_ipbf_triangle_boundary_pressure_reaction_scatters_to_vertices,
     devices=devices,
     check_output=False,
 )
