@@ -1453,6 +1453,71 @@ def test_ipbf_triangle_contact_bvh_pair_overflow_falls_back_to_scan(test, device
     np.testing.assert_allclose(overflow_vertex_force, scan_vertex_force, rtol=1.0e-6, atol=1.0e-6)
 
 
+def test_ipbf_triangle_contact_pair_cache_reuses_pairs_within_skin(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.02),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0, 1.0, 1.0],
+        radius=[0.05, 0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(1, 2, 3)
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=2,
+            relaxation=1.0,
+            use_constraint_clamp=False,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_triangle_contact_use_bvh=True,
+            fsi_triangle_contact_use_grid=False,
+            fsi_triangle_contact_pair_cache_skin=0.2,
+            fsi_triangle_contact_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    test.assertEqual(int(solver._triangle_contact_pair_overflow.numpy()[0]), 0)
+    test.assertEqual(int(solver._triangle_contact_pair_cache_valid.numpy()[0]), 1)
+    test.assertEqual(int(solver._triangle_contact_pair_cache_reuse.numpy()[0]), 1)
+    test.assertGreaterEqual(int(solver._triangle_contact_pair_count.numpy()[0]), 1)
+    test.assertGreaterEqual(float(solver._triangle_contact_pair_cache_displacement_max.numpy()[0]), 0.0)
+
+
 def test_ipbf_triangle_contact_prevents_swept_side_change(test, device):
     def run_step(continuous_enabled: bool):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -2528,6 +2593,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_triangle_contact_bvh_pair_overflow_falls_back_to_scan",
     test_ipbf_triangle_contact_bvh_pair_overflow_falls_back_to_scan,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_contact_pair_cache_reuses_pairs_within_skin",
+    test_ipbf_triangle_contact_pair_cache_reuses_pairs_within_skin,
     devices=devices,
     check_output=False,
 )

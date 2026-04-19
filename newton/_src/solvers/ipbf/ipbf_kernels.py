@@ -1570,6 +1570,74 @@ def accumulate_particle_triangle_contact_corrections(
 
 
 @wp.kernel
+def initialize_triangle_contact_pair_cache_reuse(
+    pair_cache_valid: wp.array(dtype=wp.int32),
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_cache_displacement_max: wp.array(dtype=float),
+):
+    """Initialize device-side pair-cache reuse state for the current contact solve."""
+    if wp.tid() != 0:
+        return
+
+    pair_cache_reuse[0] = pair_cache_valid[0]
+    pair_cache_displacement_max[0] = 0.0
+
+
+@wp.kernel
+def accumulate_triangle_contact_pair_cache_displacement_max(
+    particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_cache_displacement_max: wp.array(dtype=float),
+):
+    """Accumulate the maximum particle displacement since the cached pair snapshot."""
+    if pair_cache_reuse[0] == 0:
+        return
+
+    tid = wp.tid()
+    displacement = wp.length(particle_q[tid] - pair_cache_particle_q[tid])
+    wp.atomic_max(pair_cache_displacement_max, 0, displacement)
+
+
+@wp.kernel
+def finalize_triangle_contact_pair_cache_reuse(
+    pair_cache_valid: wp.array(dtype=wp.int32),
+    pair_cache_overflow: wp.array(dtype=wp.int32),
+    pair_cache_displacement_max: wp.array(dtype=float),
+    pair_cache_skin: float,
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+):
+    """Finalize whether cached compact contact pairs may be reused this solve."""
+    if wp.tid() != 0:
+        return
+
+    reuse = 0
+    if (
+        pair_cache_valid[0] != 0
+        and pair_cache_overflow[0] == 0
+        and pair_cache_skin > 0.0
+        and pair_cache_displacement_max[0] <= pair_cache_skin
+    ):
+        reuse = 1
+
+    pair_cache_reuse[0] = reuse
+
+
+@wp.kernel
+def prepare_triangle_contact_pair_collection(
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_overflow: wp.array(dtype=wp.int32),
+):
+    """Reset compact pair collection buffers when cache reuse is not active."""
+    if wp.tid() != 0 or pair_cache_reuse[0] != 0:
+        return
+
+    pair_count[0] = 0
+    pair_overflow[0] = 0
+
+
+@wp.kernel
 def collect_particle_triangle_contact_pairs_from_bvh(
     triangle_contact_bvh: wp.uint64,
     contact_triangle_indices: wp.array(dtype=wp.int32),
@@ -1578,6 +1646,8 @@ def collect_particle_triangle_contact_pairs_from_bvh(
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     contact_margin: float,
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_cache_skin: float,
     pair_capacity: int,
     pair_particle: wp.array(dtype=wp.int32),
     pair_triangle: wp.array(dtype=wp.int32),
@@ -1587,10 +1657,12 @@ def collect_particle_triangle_contact_pairs_from_bvh(
     """Collect compact particle-triangle candidate pairs from a swept triangle BVH."""
     tid = wp.tid()
 
+    if pair_cache_reuse[0] != 0:
+        return
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
         return
 
-    query_padding = particle_radius[tid] + contact_margin
+    query_padding = particle_radius[tid] + contact_margin + 2.0 * pair_cache_skin
     if query_padding <= 0.0:
         return
 
@@ -1609,6 +1681,33 @@ def collect_particle_triangle_contact_pairs_from_bvh(
             pair_triangle[pair_index] = contact_triangle_indices[triangle_leaf]
         else:
             pair_overflow[0] = 1
+
+
+@wp.kernel
+def update_triangle_contact_pair_cache_snapshot(
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_particle_q: wp.array(dtype=wp.vec3),
+):
+    """Refresh the cached particle snapshot when a new compact pair set is collected."""
+    if pair_cache_reuse[0] != 0:
+        return
+
+    tid = wp.tid()
+    pair_cache_particle_q[tid] = particle_q[tid]
+
+
+@wp.kernel
+def finalize_triangle_contact_pair_cache_collection(
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_overflow: wp.array(dtype=wp.int32),
+    pair_cache_valid: wp.array(dtype=wp.int32),
+):
+    """Commit the current compact pair collection as reusable cache state."""
+    if wp.tid() != 0 or pair_cache_reuse[0] != 0:
+        return
+
+    pair_cache_valid[0] = 0 if pair_overflow[0] != 0 else 1
 
 
 @wp.kernel

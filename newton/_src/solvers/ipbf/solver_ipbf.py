@@ -41,6 +41,7 @@ from .ipbf_kernels import (
     accumulate_particle_triangle_contact_corrections_from_grid,
     accumulate_particle_triangle_contact_corrections_from_pairs,
     accumulate_particle_triangle_contact_corrections_if_overflow,
+    accumulate_triangle_contact_pair_cache_displacement_max,
     apply_artificial_damping,
     apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
@@ -61,18 +62,23 @@ from .ipbf_kernels import (
     compute_hessian,
     compute_hessian_without_grid,
     finalize_particle_shape_boundary_velocity_projection,
+    finalize_triangle_contact_pair_cache_collection,
+    finalize_triangle_contact_pair_cache_reuse,
     initialize_constraint_and_gradient,
     initialize_constraint_and_gradient_with_boundary,
     initialize_density_and_neighbor_count,
     initialize_density_and_neighbor_count_with_boundary,
     initialize_guess_positions,
     initialize_particle_shape_boundary_velocity_projection,
+    initialize_triangle_contact_pair_cache_reuse,
     mask_ipbf_particle_flags,
     predict_inertial_positions,
+    prepare_triangle_contact_pair_collection,
     project_particle_shape_contacts,
     project_particle_shape_contacts_with_reaction,
     restore_non_fluid_particle_state,
     solve_local_system,
+    update_triangle_contact_pair_cache_snapshot,
     update_velocity_from_positions,
 )
 
@@ -156,6 +162,10 @@ class SolverIPBF(SolverBase):
                 cloth contact candidate pairs stored per triangle-contact
                 solve when the swept BVH broadphase is enabled. If ``None``,
                 the solver derives a capacity from the active fluid count.
+            fsi_triangle_contact_pair_cache_skin: Conservative motion skin
+                [m] used to decide whether previously collected compact BVH
+                contact pairs may be reused. If ``None``, the solver derives
+                a small default from the maximum particle radius.
             fsi_triangle_contact_use_grid: Whether deformable triangle contact
                 should use the boundary model's triangle proxy grid instead of
                 scanning every sampled triangle when BVH broadphase is
@@ -207,6 +217,7 @@ class SolverIPBF(SolverBase):
         fsi_triangle_contact_enabled: bool = True
         fsi_triangle_contact_use_bvh: bool = True
         fsi_triangle_contact_pair_capacity: int | None = None
+        fsi_triangle_contact_pair_cache_skin: float | None = None
         fsi_triangle_contact_use_grid: bool = True
         fsi_triangle_contact_search_radius: float | None = None
         fsi_triangle_contact_continuous_enabled: bool = True
@@ -427,6 +438,7 @@ class SolverIPBF(SolverBase):
             raise ValueError("IPBF triangle contact relaxation must be non-negative.")
         self.fluid_particle_start, self.fluid_particle_count = self._validate_fluid_particle_range()
         self.fsi_triangle_contact_pair_capacity = self._resolve_triangle_contact_pair_capacity()
+        self.fsi_triangle_contact_pair_cache_skin = self._resolve_triangle_contact_pair_cache_skin()
         self._uses_particle_subset = (
             self.fluid_particle_start != 0 or self.fluid_particle_count != self.model.particle_count
         )
@@ -471,6 +483,10 @@ class SolverIPBF(SolverBase):
             )
             self._triangle_contact_pair_count = wp.zeros(1, dtype=wp.int32)
             self._triangle_contact_pair_overflow = wp.zeros(1, dtype=wp.int32)
+            self._triangle_contact_pair_cache_valid = wp.zeros(1, dtype=wp.int32)
+            self._triangle_contact_pair_cache_reuse = wp.zeros(1, dtype=wp.int32)
+            self._triangle_contact_pair_cache_displacement_max = wp.zeros(1, dtype=float)
+            self._triangle_contact_pair_cache_particle_q = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -521,6 +537,17 @@ class SolverIPBF(SolverBase):
             return capacity
 
         return max(256, max(1, self.fluid_particle_count) * 8)
+
+    def _resolve_triangle_contact_pair_cache_skin(self) -> float:
+        """Return the conservative motion skin used for compact pair cache reuse."""
+        configured_skin = self.config.fsi_triangle_contact_pair_cache_skin
+        if configured_skin is not None:
+            skin = float(configured_skin)
+            if skin < 0.0:
+                raise ValueError("IPBF triangle contact pair cache skin must be non-negative.")
+            return skin
+
+        return max(1.0e-6, 0.5 * self._compute_max_particle_radius())
 
     def _compute_max_particle_radius(self) -> float:
         """Return the largest model particle radius [m]."""
@@ -608,6 +635,10 @@ class SolverIPBF(SolverBase):
         self._triangle_contact_vertex_delta.zero_()
         self._triangle_contact_pair_count.zero_()
         self._triangle_contact_pair_overflow.zero_()
+        self._triangle_contact_pair_cache_valid.zero_()
+        self._triangle_contact_pair_cache_reuse.zero_()
+        self._triangle_contact_pair_cache_displacement_max.zero_()
+        self._triangle_contact_pair_cache_particle_q.zero_()
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
@@ -733,8 +764,57 @@ class SolverIPBF(SolverBase):
                 self.fsi_triangle_contact_use_bvh
                 and getattr(boundary_model, "triangle_contact_bvh", None) is not None
             ):
-                self._triangle_contact_pair_count.zero_()
-                self._triangle_contact_pair_overflow.zero_()
+                wp.launch(
+                    initialize_triangle_contact_pair_cache_reuse,
+                    dim=1,
+                    inputs=[
+                        self._triangle_contact_pair_cache_valid,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                        self._triangle_contact_pair_cache_displacement_max,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    accumulate_triangle_contact_pair_cache_displacement_max,
+                    dim=model.particle_count,
+                    inputs=[
+                        state.particle_q,
+                        self._triangle_contact_pair_cache_particle_q,
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_displacement_max,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    finalize_triangle_contact_pair_cache_reuse,
+                    dim=1,
+                    inputs=[
+                        self._triangle_contact_pair_cache_valid,
+                        self._triangle_contact_pair_overflow,
+                        self._triangle_contact_pair_cache_displacement_max,
+                        self.fsi_triangle_contact_pair_cache_skin,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    prepare_triangle_contact_pair_collection,
+                    dim=1,
+                    inputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_count,
+                        self._triangle_contact_pair_overflow,
+                    ],
+                    device=model.device,
+                )
                 wp.launch(
                     collect_particle_triangle_contact_pairs_from_bvh,
                     dim=model.particle_count,
@@ -746,6 +826,8 @@ class SolverIPBF(SolverBase):
                         model.particle_radius,
                         self._ipbf_particle_flags,
                         self.fsi_triangle_contact_margin,
+                        self._triangle_contact_pair_cache_reuse,
+                        self.fsi_triangle_contact_pair_cache_skin,
                         self.fsi_triangle_contact_pair_capacity,
                     ],
                     outputs=[
@@ -753,6 +835,30 @@ class SolverIPBF(SolverBase):
                         self._triangle_contact_pair_triangle,
                         self._triangle_contact_pair_count,
                         self._triangle_contact_pair_overflow,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    update_triangle_contact_pair_cache_snapshot,
+                    dim=model.particle_count,
+                    inputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                        state.particle_q,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_particle_q,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    finalize_triangle_contact_pair_cache_collection,
+                    dim=1,
+                    inputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                        self._triangle_contact_pair_overflow,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_valid,
                     ],
                     device=model.device,
                 )
