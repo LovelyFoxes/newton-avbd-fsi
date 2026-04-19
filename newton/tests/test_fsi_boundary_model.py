@@ -491,6 +491,90 @@ def test_step_reaction_diagnostics_accumulate_body_wrenches(test: unittest.TestC
     np.testing.assert_allclose(boundary.body_force_step_max_norm.numpy(), np.zeros(model.body_count), atol=1.0e-6)
 
 
+def test_triangle_samples_follow_deformable_particles(test: unittest.TestCase, device):
+    builder = newton.ModelBuilder(gravity=0.0)
+    builder.add_particles(
+        pos=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 2.0, 0.0),
+            wp.vec3(0.0, 0.0, 3.0),
+        ],
+        mass=[1.0, 1.0, 1.0],
+        radius=[0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(0, 1, 2)
+    model = builder.finalize(device=device)
+    state = model.state()
+
+    boundary = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=2.0,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    test.assertEqual(boundary.sample_count, 1)
+    test.assertEqual(boundary.triangle_sample_count, 1)
+
+    boundary.update_world_kinematics(state)
+
+    barycentric = boundary.sample_barycentric.numpy()[0]
+    q = state.particle_q.numpy()
+    qd = state.particle_qd.numpy()
+    expected_x = barycentric[0] * q[0] + barycentric[1] * q[1] + barycentric[2] * q[2]
+    expected_v = barycentric[0] * qd[0] + barycentric[1] * qd[1] + barycentric[2] * qd[2]
+
+    np.testing.assert_allclose(barycentric, np.full(3, 1.0 / 3.0, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_x_world.numpy()[0], expected_x, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_v_world.numpy()[0], expected_v, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_normal_world.numpy()[0], [0.0, 0.0, 1.0], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_area_patch.numpy(), np.array([0.5], dtype=np.float32), atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_volume.numpy(), np.array([0.1], dtype=np.float32), atol=1.0e-6)
+    np.testing.assert_allclose(
+        boundary.sample_volume_hydrostatic.numpy(), np.array([0.1], dtype=np.float32), atol=1.0e-6
+    )
+    np.testing.assert_array_equal(boundary.sample_triangle.numpy(), np.array([0], dtype=np.int32))
+    np.testing.assert_array_equal(boundary.sample_vertex0.numpy(), np.array([0], dtype=np.int32))
+    np.testing.assert_array_equal(boundary.sample_vertex1.numpy(), np.array([1], dtype=np.int32))
+    np.testing.assert_array_equal(boundary.sample_vertex2.numpy(), np.array([2], dtype=np.int32))
+    test.assertTrue(bool((boundary.sample_flags.numpy()[0] & int(BoundarySampleFlags.DYNAMIC)) != 0))
+    test.assertTrue(bool((boundary.sample_flags.numpy()[0] & int(BoundarySampleFlags.STATIC)) == 0))
+
+    moved_q = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [2.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    moved_qd = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [0.0, 2.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    state.particle_q.assign(moved_q)
+    state.particle_qd.assign(moved_qd)
+    boundary.update_world_kinematics(state)
+
+    expected_moved_x = barycentric[0] * moved_q[0] + barycentric[1] * moved_q[1] + barycentric[2] * moved_q[2]
+    expected_moved_v = barycentric[0] * moved_qd[0] + barycentric[1] * moved_qd[1] + barycentric[2] * moved_qd[2]
+    np.testing.assert_allclose(boundary.sample_x_world.numpy()[0], expected_moved_x, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_v_world.numpy()[0], expected_moved_v, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary.sample_normal_world.numpy()[0], [0.0, 0.0, 1.0], rtol=1.0e-6, atol=1.0e-6)
+
+
 devices = get_test_devices(mode="basic")
 
 
@@ -551,6 +635,13 @@ add_function_test(
     TestFSIBoundaryModel,
     "test_step_reaction_diagnostics_accumulate_body_wrenches",
     test_step_reaction_diagnostics_accumulate_body_wrenches,
+    devices=devices,
+)
+
+add_function_test(
+    TestFSIBoundaryModel,
+    "test_triangle_samples_follow_deformable_particles",
+    test_triangle_samples_follow_deformable_particles,
     devices=devices,
 )
 

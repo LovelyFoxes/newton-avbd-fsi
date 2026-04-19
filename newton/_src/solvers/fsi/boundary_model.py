@@ -29,6 +29,7 @@ from ...sim import BodyFlags, Model, State
 from .boundary_kernels import (
     accumulate_step_reaction_diagnostics,
     update_boundary_sample_world_kinematics,
+    update_deformable_boundary_sample_world_kinematics,
     update_step_reaction_averages,
 )
 
@@ -69,6 +70,12 @@ class FSIBoundaryModel:
             solver schedules can report the average wrench consumed over a
             timestep.
         shape_indices: Optional subset of shape indices to sample.
+        include_triangles: Whether triangle elements are sampled as deformable
+            thin-shell boundary samples.
+        triangle_indices: Optional subset of triangle indices to sample.
+        deformable_sample_thickness: Effective deformable shell thickness [m]
+            used to convert triangle patch areas into boundary sample volumes.
+            Defaults to ``spacing``.
         include_static: Whether static shapes with ``shape_body == -1`` are sampled.
         include_dynamic: Whether body-attached shapes are sampled.
         device: Warp device. Defaults to ``model.device``.
@@ -103,6 +110,9 @@ class FSIBoundaryModel:
         kernel_family: KernelFamily = KernelFamily.CUBIC_SPLINE,
         hydrostatic_volume_mode: HydrostaticVolumeMode = HydrostaticVolumeMode.NONE,
         shape_indices: Sequence[int] | None = None,
+        include_triangles: bool = False,
+        triangle_indices: Sequence[int] | None = None,
+        deformable_sample_thickness: float | None = None,
         include_static: bool = True,
         include_dynamic: bool = True,
         device: wp.context.Devicelike | None = None,
@@ -115,6 +125,8 @@ class FSIBoundaryModel:
         self.support_radius = float(support_radius) if support_radius is not None else float(spacing)
         if self.support_radius <= 0.0:
             raise ValueError("Boundary sample support radius must be positive.")
+        if deformable_sample_thickness is not None and deformable_sample_thickness <= 0.0:
+            raise ValueError("Deformable boundary sample thickness must be positive.")
 
         self.kernel_family = int(self.KernelFamily(kernel_family))
         self.hydrostatic_volume_mode = int(self.HydrostaticVolumeMode(hydrostatic_volume_mode))
@@ -134,12 +146,41 @@ class FSIBoundaryModel:
             include_static=include_static,
             include_dynamic=include_dynamic,
         )
+        (
+            sample_triangle,
+            sample_vertex0,
+            sample_vertex1,
+            sample_vertex2,
+            sample_barycentric,
+            triangle_sample_body,
+            triangle_sample_shape,
+            triangle_sample_x_local,
+            triangle_sample_normal_local,
+            triangle_sample_area_patch,
+            triangle_sample_volume_quadrature,
+        ) = self._sample_model_triangles(
+            model,
+            self.spacing,
+            thickness=float(deformable_sample_thickness) if deformable_sample_thickness is not None else self.spacing,
+            triangle_indices=triangle_indices,
+            include_triangles=include_triangles,
+        )
+
+        shape_sample_count_total = len(sample_body)
+        sample_body.extend(triangle_sample_body)
+        sample_shape.extend(triangle_sample_shape)
+        sample_x_local.extend(triangle_sample_x_local)
+        sample_normal_local.extend(triangle_sample_normal_local)
+        sample_area_patch.extend(triangle_sample_area_patch)
+        sample_volume_quadrature.extend(triangle_sample_volume_quadrature)
+
         sample_volume = self._calibrate_sample_volumes(
-            sample_body,
-            sample_x_local,
+            sample_body[:shape_sample_count_total],
+            sample_x_local[:shape_sample_count_total],
             self.support_radius,
             self.kernel_family,
         )
+        sample_volume.extend(sample_volume_quadrature[shape_sample_count_total:])
         sample_volume_hydrostatic, sample_volume_hydrostatic_scale = self._compute_hydrostatic_sample_volumes(
             model,
             sample_shape,
@@ -150,22 +191,55 @@ class FSIBoundaryModel:
         )
 
         self.sample_count = len(sample_body)
+        self.shape_sample_count_total = shape_sample_count_total
+        self.triangle_sample_count = len(sample_triangle)
         shape_sample_count = [0 for _ in range(model.shape_count)]
         for shape in sample_shape:
-            shape_sample_count[shape] += 1
+            if shape >= 0:
+                shape_sample_count[shape] += 1
 
         self.sample_body = wp.array(sample_body, dtype=wp.int32, device=self.device)
         self.sample_shape = wp.array(sample_shape, dtype=wp.int32, device=self.device)
         self.shape_sample_count = wp.array(shape_sample_count, dtype=wp.int32, device=self.device)
-        self.sample_flags = wp.array(
-            [
-                int(BoundarySampleFlags.ACTIVE)
-                | (int(BoundarySampleFlags.DYNAMIC) if body >= 0 else int(BoundarySampleFlags.STATIC))
-                for body in sample_body
-            ],
+        self.sample_triangle = wp.array(
+            [-1 for _ in range(shape_sample_count_total)] + sample_triangle,
             dtype=wp.int32,
             device=self.device,
         )
+        self.sample_vertex0 = wp.array(
+            [-1 for _ in range(shape_sample_count_total)] + sample_vertex0,
+            dtype=wp.int32,
+            device=self.device,
+        )
+        self.sample_vertex1 = wp.array(
+            [-1 for _ in range(shape_sample_count_total)] + sample_vertex1,
+            dtype=wp.int32,
+            device=self.device,
+        )
+        self.sample_vertex2 = wp.array(
+            [-1 for _ in range(shape_sample_count_total)] + sample_vertex2,
+            dtype=wp.int32,
+            device=self.device,
+        )
+        self.sample_barycentric = wp.array(
+            [(0.0, 0.0, 0.0) for _ in range(shape_sample_count_total)] + sample_barycentric,
+            dtype=wp.vec3,
+            device=self.device,
+        )
+        sample_flags = []
+        for sample_index, body in enumerate(sample_body):
+            is_triangle_sample = sample_index >= shape_sample_count_total
+            dynamic = body >= 0 or is_triangle_sample
+            sample_flags.append(
+                int(BoundarySampleFlags.ACTIVE)
+                | (int(BoundarySampleFlags.DYNAMIC) if dynamic else int(BoundarySampleFlags.STATIC))
+            )
+        self.sample_flags = wp.array(
+            sample_flags,
+            dtype=wp.int32,
+            device=self.device,
+        )
+
         self.sample_x_local = wp.array(sample_x_local, dtype=wp.vec3, device=self.device)
         self.sample_normal_local = wp.array(sample_normal_local, dtype=wp.vec3, device=self.device)
         self.sample_volume = wp.array(sample_volume, dtype=float, device=self.device)
@@ -226,6 +300,30 @@ class FSIBoundaryModel:
             ],
             device=self.device,
         )
+
+        if self.triangle_sample_count > 0:
+            if state.particle_q is None or state.particle_qd is None:
+                raise ValueError("Triangle boundary samples require particle positions and velocities.")
+
+            wp.launch(
+                update_deformable_boundary_sample_world_kinematics,
+                dim=self.sample_count,
+                inputs=[
+                    self.sample_triangle,
+                    self.sample_vertex0,
+                    self.sample_vertex1,
+                    self.sample_vertex2,
+                    self.sample_barycentric,
+                    state.particle_q,
+                    state.particle_qd,
+                ],
+                outputs=[
+                    self.sample_x_world,
+                    self.sample_v_world,
+                    self.sample_normal_world,
+                ],
+                device=self.device,
+            )
 
     def build_grid(self) -> None:
         """Build the boundary sample hash grid for neighbor queries."""
@@ -385,6 +483,102 @@ class FSIBoundaryModel:
         )
 
     @classmethod
+    def _sample_model_triangles(
+        cls,
+        model: Model,
+        spacing: float,
+        *,
+        thickness: float,
+        triangle_indices: Sequence[int] | None,
+        include_triangles: bool,
+    ) -> tuple[
+        list[int],
+        list[int],
+        list[int],
+        list[int],
+        list[tuple[float, float, float]],
+        list[int],
+        list[int],
+        list[tuple[float, float, float]],
+        list[tuple[float, float, float]],
+        list[float],
+        list[float],
+    ]:
+        if not include_triangles or model.tri_count == 0:
+            return [], [], [], [], [], [], [], [], [], [], []
+        if model.tri_indices is None or model.particle_q is None:
+            return [], [], [], [], [], [], [], [], [], [], []
+
+        tri_indices = np.asarray(model.tri_indices.numpy(), dtype=np.int32).reshape((-1, 3))
+        particle_q = np.asarray(model.particle_q.numpy(), dtype=np.float32)
+
+        if triangle_indices is None:
+            indices = range(model.tri_count)
+        else:
+            indices = triangle_indices
+
+        sample_triangle: list[int] = []
+        sample_vertex0: list[int] = []
+        sample_vertex1: list[int] = []
+        sample_vertex2: list[int] = []
+        sample_barycentric: list[tuple[float, float, float]] = []
+        sample_body: list[int] = []
+        sample_shape: list[int] = []
+        sample_x_local: list[tuple[float, float, float]] = []
+        sample_normal_local: list[tuple[float, float, float]] = []
+        sample_area_patch: list[float] = []
+        sample_volume_quadrature: list[float] = []
+
+        for triangle_index in indices:
+            if triangle_index < 0 or triangle_index >= model.tri_count:
+                raise ValueError(f"Triangle index {triangle_index} is out of bounds for {model.tri_count} triangles.")
+
+            vertices = tri_indices[int(triangle_index)]
+            p0 = particle_q[int(vertices[0])]
+            p1 = particle_q[int(vertices[1])]
+            p2 = particle_q[int(vertices[2])]
+            normal = np.cross(p1 - p0, p2 - p0)
+            normal_norm = float(np.linalg.norm(normal))
+            area = 0.5 * normal_norm
+            if area <= 0.0:
+                continue
+
+            normal = normal / normal_norm
+            barycentric_samples = cls._triangle_barycentric_samples(area, spacing)
+            patch_area = area / len(barycentric_samples)
+            sample_volume = patch_area * thickness
+
+            for barycentric in barycentric_samples:
+                bary = np.asarray(barycentric, dtype=np.float32)
+                point = bary[0] * p0 + bary[1] * p1 + bary[2] * p2
+
+                sample_triangle.append(int(triangle_index))
+                sample_vertex0.append(int(vertices[0]))
+                sample_vertex1.append(int(vertices[1]))
+                sample_vertex2.append(int(vertices[2]))
+                sample_barycentric.append(tuple(float(value) for value in barycentric))
+                sample_body.append(-1)
+                sample_shape.append(-1)
+                sample_x_local.append(tuple(float(value) for value in point))
+                sample_normal_local.append(tuple(float(value) for value in normal))
+                sample_area_patch.append(float(patch_area))
+                sample_volume_quadrature.append(float(sample_volume))
+
+        return (
+            sample_triangle,
+            sample_vertex0,
+            sample_vertex1,
+            sample_vertex2,
+            sample_barycentric,
+            sample_body,
+            sample_shape,
+            sample_x_local,
+            sample_normal_local,
+            sample_area_patch,
+            sample_volume_quadrature,
+        )
+
+    @classmethod
     def _calibrate_sample_volumes(
         cls,
         sample_body: Sequence[int],
@@ -482,6 +676,8 @@ class FSIBoundaryModel:
 
         sample_indices_by_shape: dict[int, list[int]] = {}
         for sample_index, shape_index in enumerate(sample_shape):
+            if shape_index < 0:
+                continue
             sample_indices_by_shape.setdefault(int(shape_index), []).append(sample_index)
 
         for shape_index, indices in sample_indices_by_shape.items():
@@ -632,6 +828,28 @@ class FSIBoundaryModel:
                     float(quadrature_volume),
                 )
             )
+
+        return samples
+
+    @staticmethod
+    def _triangle_barycentric_samples(area: float, spacing: float) -> list[tuple[float, float, float]]:
+        if area <= 0.0:
+            return []
+
+        sample_count = max(1, int(math.ceil(area / (spacing * spacing))))
+        if sample_count == 1:
+            return [(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)]
+
+        golden_ratio_fraction = (math.sqrt(5.0) - 1.0) * 0.5
+        samples: list[tuple[float, float, float]] = []
+        for sample_index in range(sample_count):
+            u = (sample_index + 0.5) / sample_count
+            v = (sample_index * golden_ratio_fraction) % 1.0
+            sqrt_u = math.sqrt(u)
+            b0 = 1.0 - sqrt_u
+            b1 = sqrt_u * (1.0 - v)
+            b2 = sqrt_u * v
+            samples.append((float(b0), float(b1), float(b2)))
 
         return samples
 

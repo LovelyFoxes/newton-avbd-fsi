@@ -99,3 +99,42 @@ def update_boundary_sample_world_kinematics(
         sample_x_world[tid] = x_local
         sample_v_world[tid] = wp.vec3(0.0)
         sample_normal_world[tid] = wp.normalize(n_local)
+
+
+@wp.kernel
+def update_deformable_boundary_sample_world_kinematics(
+    sample_triangle: wp.array(dtype=wp.int32),
+    sample_vertex0: wp.array(dtype=wp.int32),
+    sample_vertex1: wp.array(dtype=wp.int32),
+    sample_vertex2: wp.array(dtype=wp.int32),
+    sample_barycentric: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    sample_x_world: wp.array(dtype=wp.vec3),
+    sample_v_world: wp.array(dtype=wp.vec3),
+    sample_normal_world: wp.array(dtype=wp.vec3),
+):
+    """Update triangle-bound deformable boundary sample kinematics."""
+    tid = wp.tid()
+
+    if sample_triangle[tid] < 0:
+        return
+
+    v0 = sample_vertex0[tid]
+    v1 = sample_vertex1[tid]
+    v2 = sample_vertex2[tid]
+    b = sample_barycentric[tid]
+
+    x0 = particle_q[v0]
+    x1 = particle_q[v1]
+    x2 = particle_q[v2]
+
+    sample_x_world[tid] = b[0] * x0 + b[1] * x1 + b[2] * x2
+    sample_v_world[tid] = b[0] * particle_qd[v0] + b[1] * particle_qd[v1] + b[2] * particle_qd[v2]
+
+    normal = wp.cross(x1 - x0, x2 - x0)
+    normal_norm = wp.length(normal)
+    if normal_norm > 0.0:
+        sample_normal_world[tid] = normal / normal_norm
+    else:
+        sample_normal_world[tid] = wp.vec3(0.0)
