@@ -1518,6 +1518,96 @@ def test_ipbf_triangle_contact_pair_cache_reuses_pairs_within_skin(test, device)
     test.assertGreaterEqual(float(solver._triangle_contact_pair_cache_displacement_max.numpy()[0]), 0.0)
 
 
+def test_ipbf_triangle_contact_pair_cache_ignores_unpaired_fluid_motion(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.02),
+            wp.vec3(4.0, 4.0, 4.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0, 1.0, 1.0, 1.0],
+        radius=[0.05, 0.05, 0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(2, 3, 4)
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=1,
+            relaxation=1.0,
+            use_constraint_clamp=False,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=2,
+            fsi_triangle_contact_use_bvh=True,
+            fsi_triangle_contact_use_grid=False,
+            fsi_triangle_contact_pair_cache_skin=0.2,
+            fsi_triangle_contact_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    first_pair_count = int(solver._triangle_contact_pair_count.numpy()[0])
+    first_pair_particles = solver._triangle_contact_pair_particle.numpy()[:first_pair_count]
+
+    test.assertEqual(int(solver._triangle_contact_pair_cache_valid.numpy()[0]), 1)
+    test.assertGreaterEqual(first_pair_count, 1)
+    test.assertIn(0, first_pair_particles.tolist())
+    test.assertNotIn(1, first_pair_particles.tolist())
+
+    moved_q = state_1.particle_q.numpy()
+    moved_q[1] = moved_q[1] + np.array([0.18, -0.16, 0.14], dtype=np.float32)
+    state_1.particle_q.assign(moved_q)
+    state_1.particle_qd.zero_()
+    state_1.clear_forces()
+
+    state_2 = model.state()
+    solver.step(state_1, state_2, control=None, contacts=None, dt=0.05)
+
+    second_pair_count = int(solver._triangle_contact_pair_count.numpy()[0])
+    second_pair_particles = solver._triangle_contact_pair_particle.numpy()[:second_pair_count]
+    far_motion = float(np.linalg.norm(np.array([0.18, -0.16, 0.14], dtype=np.float32)))
+
+    test.assertEqual(int(solver._triangle_contact_pair_overflow.numpy()[0]), 0)
+    test.assertEqual(int(solver._triangle_contact_pair_cache_valid.numpy()[0]), 1)
+    test.assertEqual(int(solver._triangle_contact_pair_cache_reuse.numpy()[0]), 1)
+    test.assertGreaterEqual(second_pair_count, 1)
+    test.assertIn(0, second_pair_particles.tolist())
+    test.assertNotIn(1, second_pair_particles.tolist())
+    test.assertLess(float(solver._triangle_contact_pair_cache_displacement_max.numpy()[0]), far_motion - 1.0e-2)
+
+
 def test_ipbf_triangle_contact_prevents_swept_side_change(test, device):
     def run_step(continuous_enabled: bool):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -2601,6 +2691,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_triangle_contact_pair_cache_reuses_pairs_within_skin",
     test_ipbf_triangle_contact_pair_cache_reuses_pairs_within_skin,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_contact_pair_cache_ignores_unpaired_fluid_motion",
+    test_ipbf_triangle_contact_pair_cache_ignores_unpaired_fluid_motion,
     devices=devices,
     check_output=False,
 )

@@ -1584,13 +1584,217 @@ def initialize_triangle_contact_pair_cache_reuse(
 
 
 @wp.kernel
+def accumulate_triangle_contact_pair_cache_fluid_displacement_max(
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_capacity: int,
+    particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_cache_displacement_max: wp.array(dtype=float),
+):
+    """Accumulate the maximum displacement of cached fluid-pair particles since the snapshot."""
+    if pair_cache_reuse[0] == 0:
+        return
+
+    tid = wp.tid()
+    pair_total = wp.min(pair_count[0], pair_capacity)
+    if tid >= pair_total:
+        return
+
+    particle_index = pair_particle[tid]
+    if particle_index < 0:
+        return
+
+    displacement = wp.length(particle_q[particle_index] - pair_cache_particle_q[particle_index])
+    wp.atomic_max(pair_cache_displacement_max, 0, displacement)
+
+
+@wp.kernel
+def accumulate_triangle_contact_pair_cache_triangle_displacement_max(
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_cache_displacement_max: wp.array(dtype=float),
+):
+    """Accumulate the maximum displacement of sampled cloth-triangle vertices since the snapshot."""
+    if pair_cache_reuse[0] == 0:
+        return
+
+    tid = wp.tid()
+    tri = contact_triangle_indices[tid]
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+
+    displacement0 = wp.length(particle_q[v0] - pair_cache_particle_q[v0])
+    displacement1 = wp.length(particle_q[v1] - pair_cache_particle_q[v1])
+    displacement2 = wp.length(particle_q[v2] - pair_cache_particle_q[v2])
+
+    wp.atomic_max(pair_cache_displacement_max, 0, displacement0)
+    wp.atomic_max(pair_cache_displacement_max, 0, displacement1)
+    wp.atomic_max(pair_cache_displacement_max, 0, displacement2)
+
+
+@wp.kernel
+def update_triangle_contact_pair_cache_snapshot_if_active(
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_cache_particle_q: wp.array(dtype=wp.vec3),
+):
+    """Refresh cached snapshots only for active fluid particles when recollecting."""
+    if pair_cache_reuse[0] != 0:
+        return
+
+    tid = wp.tid()
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    pair_cache_particle_q[tid] = particle_q[tid]
+
+
+@wp.kernel
+def update_triangle_contact_pair_cache_snapshot_for_sampled_triangles(
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    particle_q: wp.array(dtype=wp.vec3),
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    pair_cache_particle_q: wp.array(dtype=wp.vec3),
+):
+    """Refresh cached snapshots for sampled cloth-triangle vertices when recollecting."""
+    if pair_cache_reuse[0] != 0:
+        return
+
+    tid = wp.tid()
+    tri = contact_triangle_indices[tid]
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+
+    pair_cache_particle_q[v0] = particle_q[v0]
+    pair_cache_particle_q[v1] = particle_q[v1]
+    pair_cache_particle_q[v2] = particle_q[v2]
+
+
+@wp.kernel
+def clear_triangle_contact_pair_cache_snapshot_if_inactive(
+    particle_flags: wp.array(dtype=wp.int32),
+    pair_cache_particle_q: wp.array(dtype=wp.vec3),
+):
+    """Clear cached snapshot entries for particles outside the active fluid set."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        pair_cache_particle_q[tid] = wp.vec3(0.0)
+
+
+@wp.kernel
+def clear_triangle_contact_pair_cache_reuse_for_inactive(
+    particle_flags: wp.array(dtype=wp.int32),
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_capacity: int,
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+):
+    """Invalidate reuse if a cached pair references a particle that is no longer active."""
+    if pair_cache_reuse[0] == 0:
+        return
+
+    tid = wp.tid()
+    pair_total = wp.min(pair_count[0], pair_capacity)
+    if tid >= pair_total:
+        return
+
+    particle_index = pair_particle[tid]
+    if particle_index < 0:
+        return
+
+    if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+        pair_cache_reuse[0] = 0
+
+
+@wp.kernel
+def mark_triangle_contact_pair_cached_particles(
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_capacity: int,
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+    cached_particle_mask: wp.array(dtype=wp.int32),
+):
+    """Mark active fluid particles that already own cached compact triangle pairs."""
+    if pair_cache_reuse[0] == 0:
+        return
+
+    tid = wp.tid()
+    pair_total = wp.min(pair_count[0], pair_capacity)
+    if tid >= pair_total:
+        return
+
+    particle_index = pair_particle[tid]
+    if particle_index >= 0:
+        cached_particle_mask[particle_index] = 1
+
+
+@wp.kernel
+def clear_triangle_contact_pair_cache_reuse_for_uncached_particles_near_bvh(
+    triangle_contact_bvh: wp.uint64,
+    particle_q_snapshot: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    cached_particle_mask: wp.array(dtype=wp.int32),
+    contact_margin: float,
+    pair_cache_skin: float,
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+):
+    """Invalidate reuse if an uncached active fluid particle enters triangle-BVH query range."""
+    if pair_cache_reuse[0] == 0:
+        return
+
+    tid = wp.tid()
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0 or cached_particle_mask[tid] != 0:
+        return
+
+    query_padding = particle_radius[tid] + contact_margin + 2.0 * pair_cache_skin
+    if query_padding <= 0.0:
+        return
+
+    x_prev = particle_q_snapshot[tid]
+    x = particle_q[tid]
+    lower = wp.min(x_prev, x) - wp.vec3(query_padding)
+    upper = wp.max(x_prev, x) + wp.vec3(query_padding)
+
+    query = wp.bvh_query_aabb(triangle_contact_bvh, lower, upper)
+    triangle_leaf = wp.int32(-1)
+    if wp.bvh_query_next(query, triangle_leaf):
+        pair_cache_reuse[0] = 0
+
+
+@wp.kernel
+def clear_triangle_contact_pair_cache_reuse_for_triangle_count_change(
+    pair_count: wp.array(dtype=wp.int32),
+    pair_cache_valid: wp.array(dtype=wp.int32),
+    pair_cache_reuse: wp.array(dtype=wp.int32),
+):
+    """Invalidate reuse if the cached compact pair set is empty or invalid."""
+    if wp.tid() != 0:
+        return
+
+    if pair_cache_valid[0] == 0 or pair_count[0] <= 0:
+        pair_cache_reuse[0] = 0
+
+
+@wp.kernel
 def accumulate_triangle_contact_pair_cache_displacement_max(
     particle_q: wp.array(dtype=wp.vec3),
     pair_cache_particle_q: wp.array(dtype=wp.vec3),
     pair_cache_reuse: wp.array(dtype=wp.int32),
     pair_cache_displacement_max: wp.array(dtype=float),
 ):
-    """Accumulate the maximum particle displacement since the cached pair snapshot."""
+    """Deprecated global displacement path kept for compatibility."""
     if pair_cache_reuse[0] == 0:
         return
 

@@ -41,7 +41,8 @@ from .ipbf_kernels import (
     accumulate_particle_triangle_contact_corrections_from_grid,
     accumulate_particle_triangle_contact_corrections_from_pairs,
     accumulate_particle_triangle_contact_corrections_if_overflow,
-    accumulate_triangle_contact_pair_cache_displacement_max,
+    accumulate_triangle_contact_pair_cache_fluid_displacement_max,
+    accumulate_triangle_contact_pair_cache_triangle_displacement_max,
     apply_artificial_damping,
     apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
@@ -52,6 +53,9 @@ from .ipbf_kernels import (
     apply_xsph_velocity_smoothing,
     apply_xsph_velocity_smoothing_with_boundary,
     apply_xsph_velocity_smoothing_without_grid,
+    clear_triangle_contact_pair_cache_reuse_for_inactive,
+    clear_triangle_contact_pair_cache_reuse_for_triangle_count_change,
+    clear_triangle_contact_pair_cache_reuse_for_uncached_particles_near_bvh,
     collect_particle_triangle_contact_pairs_from_bvh,
     compute_constraint_and_gradient,
     compute_constraint_and_gradient_with_boundary,
@@ -71,6 +75,7 @@ from .ipbf_kernels import (
     initialize_guess_positions,
     initialize_particle_shape_boundary_velocity_projection,
     initialize_triangle_contact_pair_cache_reuse,
+    mark_triangle_contact_pair_cached_particles,
     mask_ipbf_particle_flags,
     predict_inertial_positions,
     prepare_triangle_contact_pair_collection,
@@ -78,7 +83,8 @@ from .ipbf_kernels import (
     project_particle_shape_contacts_with_reaction,
     restore_non_fluid_particle_state,
     solve_local_system,
-    update_triangle_contact_pair_cache_snapshot,
+    update_triangle_contact_pair_cache_snapshot_for_sampled_triangles,
+    update_triangle_contact_pair_cache_snapshot_if_active,
     update_velocity_from_positions,
 )
 
@@ -487,6 +493,7 @@ class SolverIPBF(SolverBase):
             self._triangle_contact_pair_cache_reuse = wp.zeros(1, dtype=wp.int32)
             self._triangle_contact_pair_cache_displacement_max = wp.zeros(1, dtype=float)
             self._triangle_contact_pair_cache_particle_q = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._triangle_contact_pair_cached_particle_mask = wp.zeros(model.particle_count, dtype=wp.int32)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -639,6 +646,7 @@ class SolverIPBF(SolverBase):
         self._triangle_contact_pair_cache_reuse.zero_()
         self._triangle_contact_pair_cache_displacement_max.zero_()
         self._triangle_contact_pair_cache_particle_q.zero_()
+        self._triangle_contact_pair_cached_particle_mask.zero_()
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
@@ -777,9 +785,86 @@ class SolverIPBF(SolverBase):
                     device=model.device,
                 )
                 wp.launch(
-                    accumulate_triangle_contact_pair_cache_displacement_max,
+                    clear_triangle_contact_pair_cache_reuse_for_triangle_count_change,
+                    dim=1,
+                    inputs=[
+                        self._triangle_contact_pair_count,
+                        self._triangle_contact_pair_cache_valid,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    device=model.device,
+                )
+                self._triangle_contact_pair_cached_particle_mask.zero_()
+                wp.launch(
+                    mark_triangle_contact_pair_cached_particles,
+                    dim=self.fsi_triangle_contact_pair_capacity,
+                    inputs=[
+                        self._triangle_contact_pair_particle,
+                        self._triangle_contact_pair_count,
+                        self.fsi_triangle_contact_pair_capacity,
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cached_particle_mask,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    clear_triangle_contact_pair_cache_reuse_for_inactive,
+                    dim=self.fsi_triangle_contact_pair_capacity,
+                    inputs=[
+                        self._ipbf_particle_flags,
+                        self._triangle_contact_pair_particle,
+                        self._triangle_contact_pair_count,
+                        self.fsi_triangle_contact_pair_capacity,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    clear_triangle_contact_pair_cache_reuse_for_uncached_particles_near_bvh,
                     dim=model.particle_count,
                     inputs=[
+                        boundary_model.triangle_contact_bvh.id,
+                        self._triangle_contact_pair_cache_particle_q,
+                        state.particle_q,
+                        model.particle_radius,
+                        self._ipbf_particle_flags,
+                        self._triangle_contact_pair_cached_particle_mask,
+                        self.fsi_triangle_contact_margin,
+                        self.fsi_triangle_contact_pair_cache_skin,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    accumulate_triangle_contact_pair_cache_fluid_displacement_max,
+                    dim=self.fsi_triangle_contact_pair_capacity,
+                    inputs=[
+                        self._triangle_contact_pair_particle,
+                        self._triangle_contact_pair_count,
+                        self.fsi_triangle_contact_pair_capacity,
+                        state.particle_q,
+                        self._triangle_contact_pair_cache_particle_q,
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_displacement_max,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    accumulate_triangle_contact_pair_cache_triangle_displacement_max,
+                    dim=boundary_model.triangle_count,
+                    inputs=[
+                        boundary_model.triangle_indices,
+                        model.tri_indices,
                         state.particle_q,
                         self._triangle_contact_pair_cache_particle_q,
                         self._triangle_contact_pair_cache_reuse,
@@ -839,11 +924,26 @@ class SolverIPBF(SolverBase):
                     device=model.device,
                 )
                 wp.launch(
-                    update_triangle_contact_pair_cache_snapshot,
+                    update_triangle_contact_pair_cache_snapshot_if_active,
                     dim=model.particle_count,
                     inputs=[
-                        self._triangle_contact_pair_cache_reuse,
+                        self._ipbf_particle_flags,
                         state.particle_q,
+                        self._triangle_contact_pair_cache_reuse,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_cache_particle_q,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    update_triangle_contact_pair_cache_snapshot_for_sampled_triangles,
+                    dim=boundary_model.triangle_count,
+                    inputs=[
+                        boundary_model.triangle_indices,
+                        model.tri_indices,
+                        state.particle_q,
+                        self._triangle_contact_pair_cache_reuse,
                     ],
                     outputs=[
                         self._triangle_contact_pair_cache_particle_q,
