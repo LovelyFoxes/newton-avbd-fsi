@@ -947,6 +947,87 @@ def test_ipbf_boundary_model_contributes_density_and_gradient(test, device):
     )
 
 
+def test_ipbf_triangle_boundary_samples_contribute_density_and_gradient(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.1),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+            wp.vec3(0.0, 0.0, 1.0),
+        ],
+        mass=[1.0, 1.0, 1.0, 1.0],
+        radius=[0.05, 0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(1, 2, 3)
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    rest_density = 1000.0
+    support_radius = 0.5
+    boundary_thickness = 0.2
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=support_radius,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=boundary_thickness,
+        device=device,
+    )
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=rest_density,
+            smoothing_radius=support_radius,
+            iterations=0,
+            use_constraint_clamp=False,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    density = state_1.ipbf.density.numpy()
+    constraint_gradient = state_1.ipbf.constraint_gradient.numpy()
+    boundary_density = solver._boundary_density.numpy()
+    boundary_neighbor_count = solver._boundary_neighbor_count.numpy()
+    boundary_sample_x = boundary_model.sample_x_world.numpy()[0]
+    boundary_sample_v = boundary_model.sample_v_world.numpy()[0]
+    sample_volume = boundary_model.sample_volume_hydrostatic.numpy()[0]
+
+    fluid_x = state_1.particle_q.numpy()[0]
+    displacement = fluid_x - boundary_sample_x
+    expected_self_density = kernel_density_contribution(1.0, support_radius, 0.0)
+    expected_boundary_density = rest_density * kernel_density_contribution(sample_volume, support_radius, 0.1)
+    expected_gradient = kernel_gradient_contribution(sample_volume, support_radius, displacement)
+    expected_boundary_velocity = np.array([1.0, 1.0, 1.0], dtype=np.float32) / 3.0
+
+    np.testing.assert_allclose(boundary_sample_x, [1.0 / 3.0, 1.0 / 3.0, 0.0], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary_sample_v, expected_boundary_velocity, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(sample_volume, 0.5 * boundary_thickness, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(boundary_density[0], expected_boundary_density, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_allclose(density[0], expected_self_density + expected_boundary_density, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_allclose(constraint_gradient[0], expected_gradient, rtol=1.0e-5, atol=1.0e-5)
+    np.testing.assert_array_equal(boundary_neighbor_count, np.array([1, 0, 0, 0], dtype=np.int32))
+    np.testing.assert_allclose(density[1:], np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(constraint_gradient[1:], np.zeros((3, 3), dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+
+
 def test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing(test, device):
     _, coarse_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.25)
     _, fine_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.125)
@@ -1793,6 +1874,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_boundary_model_contributes_density_and_gradient",
     test_ipbf_boundary_model_contributes_density_and_gradient,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_boundary_samples_contribute_density_and_gradient",
+    test_ipbf_triangle_boundary_samples_contribute_density_and_gradient,
     devices=devices,
     check_output=False,
 )
