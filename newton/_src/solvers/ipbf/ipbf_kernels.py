@@ -1228,9 +1228,10 @@ def project_particle_shape_contacts_with_reaction(
 
 
 @wp.func
-def accumulate_particle_triangle_contact_correction(
+def accumulate_particle_triangle_swept_contact_correction(
     tid: wp.int32,
     tri: wp.int32,
+    particle_q_prev: wp.array(dtype=wp.vec3),
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
     particle_inv_mass: wp.array(dtype=float),
@@ -1243,7 +1244,129 @@ def accumulate_particle_triangle_contact_correction(
     vertex_contact_delta: wp.array(dtype=wp.vec3),
     vertex_contact_delta_total: wp.array(dtype=wp.vec3),
     vertex_force: wp.array(dtype=wp.vec3),
+) -> int:
+    wf = particle_inv_mass[tid]
+    if wf <= 0.0:
+        return 0
+
+    x = particle_q[tid]
+    contact_distance = particle_radius[tid] + contact_margin
+    if contact_distance <= 0.0:
+        return 0
+
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+    if tid == v0 or tid == v1 or tid == v2:
+        return 0
+
+    x0 = particle_q[v0]
+    x1 = particle_q[v1]
+    x2 = particle_q[v2]
+
+    normal = wp.cross(x1 - x0, x2 - x0)
+    normal_length = wp.length(normal)
+    if normal_length <= 0.0:
+        return 0
+    normal = normal / normal_length
+
+    x_prev = particle_q_prev[tid]
+    signed_prev = wp.dot(normal, x_prev - x0)
+    signed_curr = wp.dot(normal, x - x0)
+    signed_delta = signed_prev - signed_curr
+    if signed_prev * signed_curr >= 0.0 or wp.abs(signed_delta) <= 1.0e-8:
+        return 0
+
+    t = signed_prev / signed_delta
+    if t < 0.0 or t > 1.0:
+        return 0
+
+    hit = x_prev + t * (x - x_prev)
+    closest, barycentric, _feature_type = triangle_closest_point(x0, x1, x2, hit)
+    if wp.length(hit - closest) > contact_distance:
+        return 0
+
+    side = 1.0
+    if signed_prev < 0.0:
+        side = -1.0
+    direction = side * normal
+    c = side * signed_curr - contact_distance
+    if c >= 0.0:
+        return 0
+
+    w0 = particle_inv_mass[v0]
+    w1 = particle_inv_mass[v1]
+    w2 = particle_inv_mass[v2]
+    b0 = barycentric[0]
+    b1 = barycentric[1]
+    b2 = barycentric[2]
+    denom = wf + b0 * b0 * w0 + b1 * b1 * w1 + b2 * b2 * w2
+    if denom <= 0.0:
+        return 0
+
+    contact_lambda = -relaxation * c / denom
+    fluid_delta = wf * contact_lambda * direction
+    vertex_delta0 = -w0 * b0 * contact_lambda * direction
+    vertex_delta1 = -w1 * b1 * contact_lambda * direction
+    vertex_delta2 = -w2 * b2 * contact_lambda * direction
+
+    wp.atomic_add(particle_contact_delta, tid, fluid_delta)
+    wp.atomic_add(vertex_contact_delta, v0, vertex_delta0)
+    wp.atomic_add(vertex_contact_delta, v1, vertex_delta1)
+    wp.atomic_add(vertex_contact_delta, v2, vertex_delta2)
+    wp.atomic_add(vertex_contact_delta_total, v0, vertex_delta0)
+    wp.atomic_add(vertex_contact_delta_total, v1, vertex_delta1)
+    wp.atomic_add(vertex_contact_delta_total, v2, vertex_delta2)
+
+    if dt > 0.0:
+        inv_dt2 = 1.0 / (dt * dt)
+        wp.atomic_add(vertex_force, v0, particle_mass[v0] * vertex_delta0 * inv_dt2)
+        wp.atomic_add(vertex_force, v1, particle_mass[v1] * vertex_delta1 * inv_dt2)
+        wp.atomic_add(vertex_force, v2, particle_mass[v2] * vertex_delta2 * inv_dt2)
+
+    return 1
+
+
+@wp.func
+def accumulate_particle_triangle_contact_correction(
+    tid: wp.int32,
+    tri: wp.int32,
+    particle_q_prev: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_inv_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    contact_margin: float,
+    relaxation: float,
+    continuous_enabled: int,
+    dt: float,
+    particle_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_contact_delta_total: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
 ):
+    if continuous_enabled != 0:
+        swept_contacted = accumulate_particle_triangle_swept_contact_correction(
+            tid,
+            tri,
+            particle_q_prev,
+            particle_q,
+            particle_mass,
+            particle_inv_mass,
+            particle_radius,
+            tri_indices,
+            contact_margin,
+            relaxation,
+            dt,
+            particle_contact_delta,
+            vertex_contact_delta,
+            vertex_contact_delta_total,
+            vertex_force,
+        )
+        if swept_contacted != 0:
+            return
+
     wf = particle_inv_mass[tid]
     if wf <= 0.0:
         return
@@ -1319,6 +1442,7 @@ def accumulate_particle_triangle_contact_correction(
 
 @wp.kernel
 def accumulate_particle_triangle_contact_corrections(
+    particle_q_prev: wp.array(dtype=wp.vec3),
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
     particle_inv_mass: wp.array(dtype=float),
@@ -1329,6 +1453,7 @@ def accumulate_particle_triangle_contact_corrections(
     contact_triangle_count: int,
     contact_margin: float,
     relaxation: float,
+    continuous_enabled: int,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
@@ -1348,6 +1473,7 @@ def accumulate_particle_triangle_contact_corrections(
         accumulate_particle_triangle_contact_correction(
             tid,
             tri,
+            particle_q_prev,
             particle_q,
             particle_mass,
             particle_inv_mass,
@@ -1355,6 +1481,7 @@ def accumulate_particle_triangle_contact_corrections(
             tri_indices,
             contact_margin,
             relaxation,
+            continuous_enabled,
             dt,
             particle_contact_delta,
             vertex_contact_delta,
@@ -1366,6 +1493,7 @@ def accumulate_particle_triangle_contact_corrections(
 @wp.kernel
 def accumulate_particle_triangle_contact_corrections_from_grid(
     triangle_contact_grid: wp.uint64,
+    particle_q_prev: wp.array(dtype=wp.vec3),
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
     particle_inv_mass: wp.array(dtype=float),
@@ -1376,6 +1504,7 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
     contact_search_radius: float,
     contact_margin: float,
     relaxation: float,
+    continuous_enabled: int,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
@@ -1390,7 +1519,14 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
     if relaxation == 0.0 or contact_search_radius <= 0.0:
         return
 
-    query = wp.hash_grid_query(triangle_contact_grid, particle_q[tid], contact_search_radius)
+    query_center = particle_q[tid]
+    query_radius = contact_search_radius
+    if continuous_enabled != 0:
+        travel = particle_q[tid] - particle_q_prev[tid]
+        query_center = 0.5 * (particle_q[tid] + particle_q_prev[tid])
+        query_radius = query_radius + 0.5 * wp.length(travel)
+
+    query = wp.hash_grid_query(triangle_contact_grid, query_center, query_radius)
     triangle_proxy = int(0)
 
     while wp.hash_grid_query_next(query, triangle_proxy):
@@ -1398,6 +1534,7 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
         accumulate_particle_triangle_contact_correction(
             tid,
             tri,
+            particle_q_prev,
             particle_q,
             particle_mass,
             particle_inv_mass,
@@ -1405,6 +1542,7 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
             tri_indices,
             contact_margin,
             relaxation,
+            continuous_enabled,
             dt,
             particle_contact_delta,
             vertex_contact_delta,

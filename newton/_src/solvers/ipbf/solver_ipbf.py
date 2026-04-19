@@ -153,6 +153,10 @@ class SolverIPBF(SolverBase):
                 radius [m]. If ``None``, a conservative radius based on the
                 triangle proxy radius, particle radius, and contact margin is
                 used.
+            fsi_triangle_contact_continuous_enabled: Whether deformable
+                triangle contact should detect side changes between the
+                previous and current particle positions to reduce thin-shell
+                leakage.
             fsi_triangle_contact_margin: Additional particle-triangle contact
                 margin [m] added to the fluid particle radius.
             fsi_triangle_contact_relaxation: Unitless relaxation used when
@@ -192,6 +196,7 @@ class SolverIPBF(SolverBase):
         fsi_triangle_contact_enabled: bool = True
         fsi_triangle_contact_use_grid: bool = True
         fsi_triangle_contact_search_radius: float | None = None
+        fsi_triangle_contact_continuous_enabled: bool = True
         fsi_triangle_contact_margin: float = 0.0
         fsi_triangle_contact_relaxation: float = 1.0
         fluid_particle_start: int = 0
@@ -399,6 +404,7 @@ class SolverIPBF(SolverBase):
         )
         if self.fsi_triangle_contact_search_radius < 0.0:
             raise ValueError("IPBF triangle contact search radius must be non-negative.")
+        self.fsi_triangle_contact_continuous_enabled = bool(self.config.fsi_triangle_contact_continuous_enabled)
         self.fsi_triangle_contact_margin = float(self.config.fsi_triangle_contact_margin)
         if self.fsi_triangle_contact_margin < 0.0:
             raise ValueError("IPBF triangle contact margin must be non-negative.")
@@ -436,6 +442,7 @@ class SolverIPBF(SolverBase):
             self._boundary_projection_x_after = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta_total = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._triangle_contact_particle_q_prev = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_particle_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_vertex_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
@@ -560,6 +567,7 @@ class SolverIPBF(SolverBase):
         self._boundary_projection_x_after.zero_()
         self._boundary_projection_delta.zero_()
         self._boundary_projection_delta_total.zero_()
+        self._triangle_contact_particle_q_prev.zero_()
         self._triangle_contact_particle_delta.zero_()
         self._triangle_contact_vertex_delta.zero_()
 
@@ -610,6 +618,7 @@ class SolverIPBF(SolverBase):
             return
 
         model = self.model
+        self._triangle_contact_particle_q_prev.assign(state.particle_q)
         state.particle_q.assign(particle_q)
 
         boundary_model = self.boundary_model
@@ -697,6 +706,7 @@ class SolverIPBF(SolverBase):
                     dim=model.particle_count,
                     inputs=[
                         boundary_model.triangle_contact_grid.id,
+                        self._triangle_contact_particle_q_prev,
                         state.particle_q,
                         model.particle_mass,
                         model.particle_inv_mass,
@@ -707,6 +717,7 @@ class SolverIPBF(SolverBase):
                         contact_search_radius,
                         self.fsi_triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
+                        int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
                     ],
                     outputs=[
@@ -722,6 +733,7 @@ class SolverIPBF(SolverBase):
                     accumulate_particle_triangle_contact_corrections,
                     dim=model.particle_count,
                     inputs=[
+                        self._triangle_contact_particle_q_prev,
                         state.particle_q,
                         model.particle_mass,
                         model.particle_inv_mass,
@@ -732,6 +744,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.triangle_count,
                         self.fsi_triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
+                        int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
                     ],
                     outputs=[
