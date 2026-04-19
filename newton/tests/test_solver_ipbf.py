@@ -1158,9 +1158,11 @@ def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, dev
 
     q = state_1.particle_q.numpy()
     vertex_delta = boundary_model.vertex_contact_delta.numpy()
+    vertex_force = boundary_model.vertex_force.numpy()
     barycentric = np.full(3, 1.0 / 3.0, dtype=np.float32)
     expected_fluid_delta = np.array([0.0, 0.0, 0.0225], dtype=np.float32)
     expected_vertex_delta = np.array([0.0, 0.0, -0.0075], dtype=np.float32)
+    expected_vertex_force = expected_vertex_delta / (0.05 * 0.05)
 
     test.assertEqual(boundary_model.triangle_count, 1)
     np.testing.assert_array_equal(boundary_model.triangle_indices.numpy(), np.array([0], dtype=np.int32))
@@ -1171,6 +1173,10 @@ def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, dev
     np.testing.assert_allclose(vertex_delta[2], expected_vertex_delta, rtol=1.0e-5, atol=1.0e-6)
     np.testing.assert_allclose(vertex_delta[3], expected_vertex_delta, rtol=1.0e-5, atol=1.0e-6)
     np.testing.assert_allclose(vertex_delta[1] + vertex_delta[2] + vertex_delta[3], -expected_fluid_delta)
+    np.testing.assert_allclose(vertex_force[0], np.zeros(3, dtype=np.float32), rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_force[1], expected_vertex_force, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_force[2], expected_vertex_force, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(vertex_force[3], expected_vertex_force, rtol=1.0e-5, atol=1.0e-6)
 
     effective_triangle_point = (
         barycentric[0] * (q[1] + vertex_delta[1])
@@ -1183,6 +1189,9 @@ def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, dev
     np.testing.assert_allclose(
         boundary_model.vertex_contact_delta.numpy(), np.zeros_like(vertex_delta), rtol=1.0e-6, atol=1.0e-6
     )
+    np.testing.assert_allclose(
+        boundary_model.vertex_force.numpy(), np.zeros_like(vertex_force), rtol=1.0e-6, atol=1.0e-6
+    )
 
     solver.fsi_triangle_contact_enabled = False
     state_disabled = model.state()
@@ -1192,6 +1201,9 @@ def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, dev
     np.testing.assert_allclose(state_disabled.particle_q.numpy(), initial_q, rtol=1.0e-6, atol=1.0e-6)
     np.testing.assert_allclose(
         boundary_model.vertex_contact_delta.numpy(), np.zeros_like(vertex_delta), rtol=1.0e-6, atol=1.0e-6
+    )
+    np.testing.assert_allclose(
+        boundary_model.vertex_force.numpy(), np.zeros_like(vertex_force), rtol=1.0e-6, atol=1.0e-6
     )
 
 

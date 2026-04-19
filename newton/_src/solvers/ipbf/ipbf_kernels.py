@@ -1230,6 +1230,7 @@ def project_particle_shape_contacts_with_reaction(
 @wp.kernel
 def accumulate_particle_triangle_contact_corrections(
     particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
     particle_inv_mass: wp.array(dtype=float),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
@@ -1238,11 +1239,13 @@ def accumulate_particle_triangle_contact_corrections(
     contact_triangle_count: int,
     contact_margin: float,
     relaxation: float,
+    dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
     vertex_contact_delta_total: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
 ):
-    """Accumulate symmetric particle-triangle contact corrections."""
+    """Accumulate symmetric particle-triangle contact corrections and force handoff."""
     tid = wp.tid()
 
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
@@ -1317,6 +1320,12 @@ def accumulate_particle_triangle_contact_corrections(
         wp.atomic_add(vertex_contact_delta_total, v0, vertex_delta0)
         wp.atomic_add(vertex_contact_delta_total, v1, vertex_delta1)
         wp.atomic_add(vertex_contact_delta_total, v2, vertex_delta2)
+
+        if dt > 0.0:
+            inv_dt2 = 1.0 / (dt * dt)
+            wp.atomic_add(vertex_force, v0, particle_mass[v0] * vertex_delta0 * inv_dt2)
+            wp.atomic_add(vertex_force, v1, particle_mass[v1] * vertex_delta1 * inv_dt2)
+            wp.atomic_add(vertex_force, v2, particle_mass[v2] * vertex_delta2 * inv_dt2)
 
 
 @wp.kernel

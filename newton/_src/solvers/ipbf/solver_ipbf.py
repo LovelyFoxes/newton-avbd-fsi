@@ -657,6 +657,7 @@ class SolverIPBF(SolverBase):
                 dim=model.particle_count,
                 inputs=[
                     state.particle_q,
+                    model.particle_mass,
                     model.particle_inv_mass,
                     model.particle_radius,
                     self._ipbf_particle_flags,
@@ -665,11 +666,13 @@ class SolverIPBF(SolverBase):
                     boundary_model.triangle_count,
                     self.fsi_triangle_contact_margin,
                     self.fsi_triangle_contact_relaxation,
+                    dt,
                 ],
                 outputs=[
                     self._triangle_contact_particle_delta,
                     self._triangle_contact_vertex_delta,
                     boundary_model.vertex_contact_delta,
+                    boundary_model.vertex_force,
                 ],
                 device=model.device,
             )
