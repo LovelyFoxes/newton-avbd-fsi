@@ -320,7 +320,9 @@ class Example:
         self.boundary_model.build_grid()
         self.initial_particle_q = self.state_0.particle_q.numpy().copy()
         self.max_cloth_dx = 0.0
-        self.max_fluid_contact_delta = 0.0
+        self.max_triangle_contact_particle_delta = 0.0
+        self.max_triangle_contact_vertex_delta = 0.0
+        self.max_triangle_contact_pair_count = 0
         self.max_vertex_force_norm = 0.0
         self.max_density = 0.0
         self.viewer._paused = True
@@ -330,20 +332,30 @@ class Example:
         # per-frame validation metrics always observe the same state object.
         self.graph = None
 
-    def _record_diagnostics(self):
+    def _accumulate_substep_diagnostics(self) -> None:
+        triangle_particle_delta = self.fluid_solver._triangle_contact_particle_delta.numpy()
+        triangle_vertex_delta = self.boundary_model.vertex_contact_delta.numpy()[self.cloth_particle_start :]
+        triangle_pair_count = int(self.fluid_solver._triangle_contact_pair_count.numpy()[0])
+        vertex_force = self.boundary_model.vertex_force.numpy()[self.cloth_particle_start :]
+        density = self.solver._fluid_state.ipbf.density.numpy()
+
+        self.max_triangle_contact_particle_delta = max(
+            self.max_triangle_contact_particle_delta,
+            float(np.linalg.norm(triangle_particle_delta, axis=1).max()),
+        )
+        self.max_triangle_contact_vertex_delta = max(
+            self.max_triangle_contact_vertex_delta,
+            float(np.linalg.norm(triangle_vertex_delta, axis=1).max()),
+        )
+        self.max_triangle_contact_pair_count = max(self.max_triangle_contact_pair_count, triangle_pair_count)
+        self.max_vertex_force_norm = max(self.max_vertex_force_norm, float(np.linalg.norm(vertex_force, axis=1).max()))
+        self.max_density = max(self.max_density, float(np.max(density)))
+
+    def _record_frame_diagnostics(self):
         particle_q = self.state_0.particle_q.numpy()
         cloth_q = particle_q[self.cloth_particle_start :]
         cloth_q0 = self.initial_particle_q[self.cloth_particle_start :]
         self.max_cloth_dx = max(self.max_cloth_dx, float(np.max(cloth_q[:, 0] - cloth_q0[:, 0])))
-
-        fluid_delta = self.fluid_solver._triangle_contact_particle_delta.numpy()
-        vertex_force = self.boundary_model.vertex_force.numpy()
-        density = self.solver._fluid_state.ipbf.density.numpy()
-        self.max_fluid_contact_delta = max(
-            self.max_fluid_contact_delta, float(np.linalg.norm(fluid_delta, axis=1).max())
-        )
-        self.max_vertex_force_norm = max(self.max_vertex_force_norm, float(np.linalg.norm(vertex_force, axis=1).max()))
-        self.max_density = max(self.max_density, float(np.max(density)))
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -356,6 +368,7 @@ class Example:
                 device=self.model.device,
             )
             self.solver.step(self.state_0, self.state_1, control=None, contacts=None, dt=self.sim_dt)
+            self._accumulate_substep_diagnostics()
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
@@ -369,12 +382,12 @@ class Example:
             wp.capture_launch(self.graph)
         else:
             self.simulate()
-        self._record_diagnostics()
+        self._record_frame_diagnostics()
         self.sim_time += self.frame_dt
 
     def test_final(self):
         assert self.max_density > 0.0, "IPBF density diagnostics were not updated"
-        assert self.max_fluid_contact_delta > 0.0, "fluid particles never contacted the cloth triangles"
+        assert self.max_triangle_contact_vertex_delta > 0.0, "cloth triangle-contact deltas were never accumulated"
         assert self.max_vertex_force_norm > 0.0, "cloth-side FSI vertex forces were not accumulated"
         assert self.max_cloth_dx > 1.0e-4, f"cloth patch did not move in the expected +x direction: {self.max_cloth_dx}"
 

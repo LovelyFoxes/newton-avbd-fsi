@@ -131,6 +131,10 @@ class FSIBoundaryModel:
             raise ValueError("Boundary sample support radius must be positive.")
         if deformable_sample_thickness is not None and deformable_sample_thickness <= 0.0:
             raise ValueError("Deformable boundary sample thickness must be positive.")
+        self.deformable_sample_thickness = (
+            float(deformable_sample_thickness) if deformable_sample_thickness is not None else self.spacing
+        )
+        self.triangle_contact_aabb_padding = max(1.0e-6, 0.25 * self.deformable_sample_thickness)
 
         self.kernel_family = int(self.KernelFamily(kernel_family))
         self.hydrostatic_volume_mode = int(self.HydrostaticVolumeMode(hydrostatic_volume_mode))
@@ -165,7 +169,7 @@ class FSIBoundaryModel:
         ) = self._sample_model_triangles(
             model,
             self.spacing,
-            thickness=float(deformable_sample_thickness) if deformable_sample_thickness is not None else self.spacing,
+            thickness=self.deformable_sample_thickness,
             triangle_indices=triangle_indices,
             include_triangles=include_triangles,
         )
@@ -427,6 +431,7 @@ class FSIBoundaryModel:
                         self.model.tri_indices,
                         self.triangle_contact_particle_q_prev,
                         state.particle_q,
+                        self.triangle_contact_aabb_padding,
                     ],
                     outputs=[
                         self.triangle_contact_aabb_lower,

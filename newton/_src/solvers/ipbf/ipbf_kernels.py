@@ -1806,6 +1806,7 @@ def accumulate_triangle_contact_pair_cache_displacement_max(
 @wp.kernel
 def finalize_triangle_contact_pair_cache_reuse(
     pair_cache_valid: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
     pair_cache_overflow: wp.array(dtype=wp.int32),
     pair_cache_displacement_max: wp.array(dtype=float),
     pair_cache_skin: float,
@@ -1815,9 +1816,13 @@ def finalize_triangle_contact_pair_cache_reuse(
     if wp.tid() != 0:
         return
 
+    if pair_cache_reuse[0] == 0:
+        return
+
     reuse = 0
     if (
         pair_cache_valid[0] != 0
+        and pair_count[0] > 0
         and pair_cache_overflow[0] == 0
         and pair_cache_skin > 0.0
         and pair_cache_displacement_max[0] <= pair_cache_skin

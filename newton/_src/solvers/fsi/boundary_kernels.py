@@ -164,6 +164,7 @@ def update_deformable_triangle_contact_swept_aabbs(
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
     particle_q_prev: wp.array(dtype=wp.vec3),
     particle_q: wp.array(dtype=wp.vec3),
+    aabb_padding: float,
     contact_triangle_aabb_lower: wp.array(dtype=wp.vec3),
     contact_triangle_aabb_upper: wp.array(dtype=wp.vec3),
 ):
@@ -194,8 +195,9 @@ def update_deformable_triangle_contact_swept_aabbs(
     upper = wp.max(upper, x1)
     upper = wp.max(upper, x2)
 
-    contact_triangle_aabb_lower[tid] = lower
-    contact_triangle_aabb_upper[tid] = upper
+    padding = wp.vec3(aabb_padding)
+    contact_triangle_aabb_lower[tid] = lower - padding
+    contact_triangle_aabb_upper[tid] = upper + padding
 
 
 @wp.kernel

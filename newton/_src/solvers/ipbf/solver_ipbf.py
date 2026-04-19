@@ -879,6 +879,7 @@ class SolverIPBF(SolverBase):
                     dim=1,
                     inputs=[
                         self._triangle_contact_pair_cache_valid,
+                        self._triangle_contact_pair_count,
                         self._triangle_contact_pair_overflow,
                         self._triangle_contact_pair_cache_displacement_max,
                         self.fsi_triangle_contact_pair_cache_skin,
