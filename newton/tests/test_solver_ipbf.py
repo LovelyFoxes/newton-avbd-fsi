@@ -864,6 +864,67 @@ def test_ipbf_multi_particle_shell_step_builds_neighbor_search(test, device):
     np.testing.assert_allclose(state_0.ipbf.force.numpy(), np.zeros((2, 3), dtype=np.float32), rtol=1e-6, atol=1e-6)
 
 
+def test_ipbf_fluid_particle_range_preserves_nonfluid_particles(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(-0.05, 1.0, 0.0),
+            wp.vec3(0.05, 1.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 2.0, 3.0),
+        ],
+        mass=[1.0, 1.0, 5.0],
+        radius=[0.05, 0.05, 0.05],
+    )
+
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, -9.81, 0.0))
+
+    support_radius = 0.2
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1.0,
+            smoothing_radius=support_radius,
+            iterations=0,
+            fluid_particle_start=0,
+            fluid_particle_count=2,
+        ),
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+
+    dt = 0.05
+    solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+
+    q = state_1.particle_q.numpy()
+    qd = state_1.particle_qd.numpy()
+    density = state_1.ipbf.density.numpy()
+    neighbor_count = state_1.ipbf.neighbor_count.numpy()
+
+    expected_fluid_y = 1.0 - 9.81 * dt * dt
+    expected_fluid_vy = -9.81 * dt
+    expected_fluid_density = kernel_density_contribution(1.0, support_radius, 0.0) + kernel_density_contribution(
+        1.0, support_radius, 0.1
+    )
+
+    np.testing.assert_allclose(q[:2, 1], np.full(2, expected_fluid_y, dtype=np.float32), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(qd[:2, 1], np.full(2, expected_fluid_vy, dtype=np.float32), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(q[2], np.array([0.0, 1.0, 0.0], dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(qd[2], np.array([1.0, 2.0, 3.0], dtype=np.float32), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(density[:2], np.full(2, expected_fluid_density, dtype=np.float32), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(density[2], 0.0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(neighbor_count, np.array([1, 1, 0], dtype=np.int32))
+
+
 def test_ipbf_boundary_model_contributes_density_and_gradient(test, device):
     state_without_boundary, solver_without_boundary = run_boundary_density_step(device, use_boundary_model=False)
     state_with_boundary, solver_with_boundary = run_boundary_density_step(device, use_boundary_model=True)
@@ -1652,6 +1713,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_multi_particle_shell_step_builds_neighbor_search",
     test_ipbf_multi_particle_shell_step_builds_neighbor_search,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_fluid_particle_range_preserves_nonfluid_particles",
+    test_ipbf_fluid_particle_range_preserves_nonfluid_particles,
     devices=devices,
     check_output=False,
 )

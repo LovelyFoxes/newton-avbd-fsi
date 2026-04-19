@@ -255,6 +255,42 @@ def boundary_density_pressure_weight(boundary_flag: int, static_boundary_weight:
 
 
 @wp.kernel
+def mask_ipbf_particle_flags(
+    particle_flags: wp.array(dtype=wp.int32),
+    fluid_particle_start: int,
+    fluid_particle_count: int,
+    ipbf_particle_flags: wp.array(dtype=wp.int32),
+):
+    """Build solver-local particle flags for the active IPBF fluid range."""
+    tid = wp.tid()
+
+    if tid < fluid_particle_start or tid >= fluid_particle_start + fluid_particle_count:
+        ipbf_particle_flags[tid] = 0
+        return
+
+    ipbf_particle_flags[tid] = particle_flags[tid]
+
+
+@wp.kernel
+def restore_non_fluid_particle_state(
+    particle_q_in: wp.array(dtype=wp.vec3),
+    particle_qd_in: wp.array(dtype=wp.vec3),
+    fluid_particle_start: int,
+    fluid_particle_count: int,
+    particle_q_out: wp.array(dtype=wp.vec3),
+    particle_qd_out: wp.array(dtype=wp.vec3),
+):
+    """Restore particle state outside the active IPBF fluid range."""
+    tid = wp.tid()
+
+    if tid >= fluid_particle_start and tid < fluid_particle_start + fluid_particle_count:
+        return
+
+    particle_q_out[tid] = particle_q_in[tid]
+    particle_qd_out[tid] = particle_qd_in[tid]
+
+
+@wp.kernel
 def predict_inertial_positions(
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),

@@ -61,9 +61,11 @@ from .ipbf_kernels import (
     initialize_density_and_neighbor_count_with_boundary,
     initialize_guess_positions,
     initialize_particle_shape_boundary_velocity_projection,
+    mask_ipbf_particle_flags,
     predict_inertial_positions,
     project_particle_shape_contacts,
     project_particle_shape_contacts_with_reaction,
+    restore_non_fluid_particle_state,
     solve_local_system,
     update_velocity_from_positions,
 )
@@ -139,6 +141,10 @@ class SolverIPBF(SolverBase):
                 to static boundary-sample contributions in the density,
                 constraint-gradient, pressure-reaction, and boundary-aware
                 velocity-smoothing / viscosity paths.
+            fluid_particle_start: First particle index solved as IPBF fluid.
+            fluid_particle_count: Number of consecutive particles solved as
+                IPBF fluid. If ``None``, all particles from
+                :attr:`fluid_particle_start` to the end of the model are solved.
         """
 
         class KernelFamily(IntEnum):
@@ -167,6 +173,8 @@ class SolverIPBF(SolverBase):
         fsi_velocity_projection_reaction_relaxation: float | None = None
         fsi_pressure_reaction_relaxation: float = 1.0
         fsi_static_boundary_weight: float = 1.0
+        fluid_particle_start: int = 0
+        fluid_particle_count: int | None = None
 
     @override
     @classmethod
@@ -360,6 +368,10 @@ class SolverIPBF(SolverBase):
         self.fsi_static_boundary_weight = float(self.config.fsi_static_boundary_weight)
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
+        self.fluid_particle_start, self.fluid_particle_count = self._validate_fluid_particle_range()
+        self._uses_particle_subset = (
+            self.fluid_particle_start != 0 or self.fluid_particle_count != self.model.particle_count
+        )
         self.boundary_model = None
         self.set_boundary_model(boundary_model)
 
@@ -386,6 +398,8 @@ class SolverIPBF(SolverBase):
             self._boundary_projection_x_after = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta_total = wp.zeros(model.particle_count, dtype=wp.vec3)
+            self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
+            self._refresh_particle_flags()
 
         if model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
@@ -405,6 +419,59 @@ class SolverIPBF(SolverBase):
                 raise ValueError("IPBF boundary model device must match the solver model device.")
 
         self.boundary_model = boundary_model
+
+    def _validate_fluid_particle_range(self) -> tuple[int, int]:
+        """Return the validated consecutive particle range solved by IPBF."""
+        model_particle_count = int(self.model.particle_count)
+        start = int(self.config.fluid_particle_start)
+        if start < 0 or start > model_particle_count:
+            raise ValueError("IPBF fluid particle start must be within the model particle range.")
+
+        configured_count = self.config.fluid_particle_count
+        if configured_count is None:
+            count = model_particle_count - start
+        else:
+            count = int(configured_count)
+
+        if count < 0 or start + count > model_particle_count:
+            raise ValueError("IPBF fluid particle count must fit inside the model particle range.")
+
+        return start, count
+
+    def _refresh_particle_flags(self) -> None:
+        """Refresh solver-local flags that mark only the IPBF fluid range active."""
+        if self.model.particle_count == 0:
+            return
+
+        wp.launch(
+            mask_ipbf_particle_flags,
+            dim=self.model.particle_count,
+            inputs=[
+                self.model.particle_flags,
+                self.fluid_particle_start,
+                self.fluid_particle_count,
+            ],
+            outputs=[self._ipbf_particle_flags],
+            device=self.model.device,
+        )
+
+    def _restore_non_fluid_particle_state(self, state_in: State, state_out: State) -> None:
+        """Keep particles outside the IPBF fluid range untouched by the solver."""
+        if not self._uses_particle_subset or self.model.particle_count == 0:
+            return
+
+        wp.launch(
+            restore_non_fluid_particle_state,
+            dim=self.model.particle_count,
+            inputs=[
+                state_in.particle_q,
+                state_in.particle_qd,
+                self.fluid_particle_start,
+                self.fluid_particle_count,
+            ],
+            outputs=[state_out.particle_q, state_out.particle_qd],
+            device=self.model.device,
+        )
 
     def reset(self, state_out: State) -> None:
         """Reset a state to the solver's initial particle configuration.
@@ -498,7 +565,7 @@ class SolverIPBF(SolverBase):
                     state.particle_q,
                     model.particle_mass,
                     model.particle_radius,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     state.body_q,
                     model.body_com,
                     model.shape_body,
@@ -530,7 +597,7 @@ class SolverIPBF(SolverBase):
                 inputs=[
                     state.particle_q,
                     model.particle_radius,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     state.body_q if state.body_q is not None else self._empty_body_q,
                     model.shape_body,
                     contacts.soft_contact_count,
@@ -558,7 +625,7 @@ class SolverIPBF(SolverBase):
             initialize_particle_shape_boundary_velocity_projection,
             dim=model.particle_count,
             inputs=[
-                model.particle_flags,
+                self._ipbf_particle_flags,
             ],
             outputs=[
                 self._boundary_projected_particle_qd,
@@ -577,7 +644,7 @@ class SolverIPBF(SolverBase):
                 inputs=[
                     state.particle_qd,
                     model.particle_mass,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     state.body_q,
                     model.body_com,
                     model.shape_body,
@@ -607,7 +674,7 @@ class SolverIPBF(SolverBase):
                 dim=contacts.soft_contact_max,
                 inputs=[
                     state.particle_qd,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     contacts.soft_contact_count,
                     contacts.soft_contact_particle,
                     contacts.soft_contact_body_vel,
@@ -627,7 +694,7 @@ class SolverIPBF(SolverBase):
             dim=model.particle_count,
             inputs=[
                 state.particle_qd,
-                model.particle_flags,
+                self._ipbf_particle_flags,
                 self._boundary_projected_particle_qd,
                 self._boundary_projected_contact_count,
             ],
@@ -660,7 +727,7 @@ class SolverIPBF(SolverBase):
                         state.particle_qd,
                         state.ipbf.density,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
                         boundary_model.sample_v_world,
@@ -686,7 +753,7 @@ class SolverIPBF(SolverBase):
                         state.particle_qd,
                         state.ipbf.density,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         self.smoothing_radius,
                         self.kernel_family,
@@ -703,7 +770,7 @@ class SolverIPBF(SolverBase):
                     state.particle_q,
                     state.particle_qd,
                     state.ipbf.density,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     self.xsph_coefficient,
                 ],
                 outputs=[self._xsph_particle_qd],
@@ -742,7 +809,7 @@ class SolverIPBF(SolverBase):
                         state.particle_qd,
                         state.ipbf.density,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
                         boundary_model.sample_v_world,
@@ -769,7 +836,7 @@ class SolverIPBF(SolverBase):
                         state.particle_qd,
                         state.ipbf.density,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         self.smoothing_radius,
                         self.kernel_family,
@@ -789,7 +856,7 @@ class SolverIPBF(SolverBase):
                         state.particle_q,
                         state.particle_qd,
                         state.ipbf.density,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
                         boundary_model.sample_v_world,
                         boundary_model.sample_volume_hydrostatic,
@@ -811,7 +878,7 @@ class SolverIPBF(SolverBase):
                     inputs=[
                         state.particle_q,
                         state.particle_qd,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         self.viscosity_coefficient,
                         dt,
                     ],
@@ -877,7 +944,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.boundary_grid.id,
                         particle_q,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume_hydrostatic,
@@ -904,7 +971,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.boundary_grid.id,
                         particle_q,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume_hydrostatic,
@@ -927,7 +994,7 @@ class SolverIPBF(SolverBase):
                         model.particle_grid.id,
                         particle_q,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         self.smoothing_radius,
                         self.kernel_family,
@@ -943,7 +1010,7 @@ class SolverIPBF(SolverBase):
                         model.particle_grid.id,
                         particle_q,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         model.particle_world,
                         state.ipbf.density,
                         self.rest_density,
@@ -963,7 +1030,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.boundary_grid.id,
                         particle_q,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
@@ -987,7 +1054,7 @@ class SolverIPBF(SolverBase):
                     inputs=[
                         boundary_model.boundary_grid.id,
                         particle_q,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
@@ -1008,7 +1075,7 @@ class SolverIPBF(SolverBase):
                     inputs=[
                         particle_q,
                         model.particle_mass,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         self.smoothing_radius,
                         self.kernel_family,
                     ],
@@ -1021,7 +1088,7 @@ class SolverIPBF(SolverBase):
                     dim=model.particle_count,
                     inputs=[
                         state.ipbf.density,
-                        model.particle_flags,
+                        self._ipbf_particle_flags,
                         self.rest_density,
                         int(self.use_constraint_clamp),
                     ],
@@ -1038,7 +1105,7 @@ class SolverIPBF(SolverBase):
                     particle_q,
                     state.ipbf.y,
                     model.particle_mass,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     model.particle_world,
                     state.ipbf.constraint,
                     state.ipbf.constraint_gradient,
@@ -1059,7 +1126,7 @@ class SolverIPBF(SolverBase):
                     model.particle_grid.id,
                     particle_q,
                     model.particle_mass,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     model.particle_world,
                     state.ipbf.constraint,
                     state.ipbf.constraint_gradient,
@@ -1081,7 +1148,7 @@ class SolverIPBF(SolverBase):
                     particle_q,
                     state.ipbf.y,
                     model.particle_mass,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     state.ipbf.constraint,
                     state.ipbf.constraint_gradient,
                     compliance_value,
@@ -1096,7 +1163,7 @@ class SolverIPBF(SolverBase):
                 dim=model.particle_count,
                 inputs=[
                     model.particle_mass,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     state.ipbf.constraint,
                     state.ipbf.constraint_gradient,
                     self.rest_density,
@@ -1169,8 +1236,9 @@ class SolverIPBF(SolverBase):
             )
 
         model = self.model
-        if model.particle_count == 0:
+        if model.particle_count == 0 or self.fluid_particle_count == 0:
             return False
+        self._refresh_particle_flags()
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
@@ -1190,7 +1258,7 @@ class SolverIPBF(SolverBase):
                 state_in.particle_qd,
                 state_in.particle_f,
                 model.particle_inv_mass,
-                model.particle_flags,
+                self._ipbf_particle_flags,
                 model.particle_world,
                 model.gravity,
                 dt,
@@ -1246,7 +1314,7 @@ class SolverIPBF(SolverBase):
                 solve_local_system,
                 dim=model.particle_count,
                 inputs=[
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     state_out.ipbf.force,
                     state_out.ipbf.hessian,
                 ],
@@ -1258,7 +1326,7 @@ class SolverIPBF(SolverBase):
                 apply_relaxed_jacobi_update,
                 dim=model.particle_count,
                 inputs=[
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     state_out.ipbf.x_guess,
                     state_out.ipbf.delta_q,
                     self.relaxation,
@@ -1284,7 +1352,7 @@ class SolverIPBF(SolverBase):
             solve_local_system,
             dim=model.particle_count,
             inputs=[
-                model.particle_flags,
+                self._ipbf_particle_flags,
                 state_out.ipbf.force,
                 state_out.ipbf.hessian,
             ],
@@ -1296,7 +1364,7 @@ class SolverIPBF(SolverBase):
             apply_relaxed_jacobi_update,
             dim=model.particle_count,
             inputs=[
-                model.particle_flags,
+                self._ipbf_particle_flags,
                 state_out.ipbf.x_guess,
                 state_out.ipbf.delta_q,
                 self.relaxation,
@@ -1332,7 +1400,7 @@ class SolverIPBF(SolverBase):
                 boundary_model.boundary_grid.id,
                 particle_q,
                 model.particle_mass,
-                model.particle_flags,
+                self._ipbf_particle_flags,
                 state.ipbf.constraint,
                 state.ipbf.hessian,
                 boundary_model.sample_x_world,
@@ -1380,7 +1448,7 @@ class SolverIPBF(SolverBase):
                     state_out.ipbf.x_guess,
                     state_out.ipbf.x_star,
                     state_in.particle_q,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     dt,
                     self.smoothing_radius,
                     self.damping_beta,
@@ -1396,7 +1464,7 @@ class SolverIPBF(SolverBase):
                 inputs=[
                     state_out.ipbf.x_guess,
                     state_in.particle_q,
-                    model.particle_flags,
+                    self._ipbf_particle_flags,
                     dt,
                 ],
                 outputs=[state_out.particle_qd],
@@ -1406,3 +1474,4 @@ class SolverIPBF(SolverBase):
         self._apply_shape_boundary_velocity_projection(state_out, contacts, dt)
         self._apply_viscosity_velocity_diffusion(state_out, dt)
         self._apply_xsph_velocity_smoothing(state_out)
+        self._restore_non_fluid_particle_state(state_in, state_out)
