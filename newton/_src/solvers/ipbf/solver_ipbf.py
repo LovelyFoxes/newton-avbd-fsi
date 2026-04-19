@@ -154,9 +154,9 @@ class SolverIPBF(SolverBase):
                 triangle proxy radius, particle radius, and contact margin is
                 used.
             fsi_triangle_contact_continuous_enabled: Whether deformable
-                triangle contact should detect side changes between the
-                previous and current particle positions to reduce thin-shell
-                leakage.
+                triangle contact should use a swept moving-triangle side-change
+                test between the previous and current particle/triangle
+                positions to reduce thin-shell leakage.
             fsi_triangle_contact_margin: Additional particle-triangle contact
                 margin [m] added to the fluid particle radius.
             fsi_triangle_contact_relaxation: Unitless relaxation used when
@@ -442,7 +442,6 @@ class SolverIPBF(SolverBase):
             self._boundary_projection_x_after = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_delta_total = wp.zeros(model.particle_count, dtype=wp.vec3)
-            self._triangle_contact_particle_q_prev = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_particle_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_vertex_delta = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
@@ -567,12 +566,12 @@ class SolverIPBF(SolverBase):
         self._boundary_projection_x_after.zero_()
         self._boundary_projection_delta.zero_()
         self._boundary_projection_delta_total.zero_()
-        self._triangle_contact_particle_q_prev.zero_()
         self._triangle_contact_particle_delta.zero_()
         self._triangle_contact_vertex_delta.zero_()
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
+            self.boundary_model.reset_deformable_contact_history()
 
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
             with wp.ScopedDevice(self.model.device):
@@ -618,7 +617,6 @@ class SolverIPBF(SolverBase):
             return
 
         model = self.model
-        self._triangle_contact_particle_q_prev.assign(state.particle_q)
         state.particle_q.assign(particle_q)
 
         boundary_model = self.boundary_model
@@ -706,7 +704,7 @@ class SolverIPBF(SolverBase):
                     dim=model.particle_count,
                     inputs=[
                         boundary_model.triangle_contact_grid.id,
-                        self._triangle_contact_particle_q_prev,
+                        boundary_model.triangle_contact_particle_q_prev,
                         state.particle_q,
                         model.particle_mass,
                         model.particle_inv_mass,
@@ -714,6 +712,7 @@ class SolverIPBF(SolverBase):
                         self._ipbf_particle_flags,
                         model.tri_indices,
                         boundary_model.triangle_indices,
+                        boundary_model.triangle_contact_proxy_motion_max,
                         contact_search_radius,
                         self.fsi_triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
@@ -733,7 +732,7 @@ class SolverIPBF(SolverBase):
                     accumulate_particle_triangle_contact_corrections,
                     dim=model.particle_count,
                     inputs=[
-                        self._triangle_contact_particle_q_prev,
+                        boundary_model.triangle_contact_particle_q_prev,
                         state.particle_q,
                         model.particle_mass,
                         model.particle_inv_mass,
@@ -1401,6 +1400,7 @@ class SolverIPBF(SolverBase):
 
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
+            self.boundary_model.initialize_deformable_contact_history(state_in)
             self._boundary_projection_delta_total.zero_()
             self._triangle_contact_particle_delta.zero_()
             self._triangle_contact_vertex_delta.zero_()

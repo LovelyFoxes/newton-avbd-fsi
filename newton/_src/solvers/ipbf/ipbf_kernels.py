@@ -1228,6 +1228,36 @@ def project_particle_shape_contacts_with_reaction(
 
 
 @wp.func
+def _lerp_vec3(a: wp.vec3, b: wp.vec3, t: float):
+    return a + t * (b - a)
+
+
+@wp.func
+def _moving_triangle_plane_signed_distance(
+    t: float,
+    particle_x_prev: wp.vec3,
+    particle_x_curr: wp.vec3,
+    tri_x0_prev: wp.vec3,
+    tri_x1_prev: wp.vec3,
+    tri_x2_prev: wp.vec3,
+    tri_x0_curr: wp.vec3,
+    tri_x1_curr: wp.vec3,
+    tri_x2_curr: wp.vec3,
+):
+    x = _lerp_vec3(particle_x_prev, particle_x_curr, t)
+    x0 = _lerp_vec3(tri_x0_prev, tri_x0_curr, t)
+    x1 = _lerp_vec3(tri_x1_prev, tri_x1_curr, t)
+    x2 = _lerp_vec3(tri_x2_prev, tri_x2_curr, t)
+
+    normal = wp.cross(x1 - x0, x2 - x0)
+    normal_length = wp.length(normal)
+    if normal_length <= 1.0e-8:
+        return 0.0
+
+    return wp.dot(normal / normal_length, x - x0)
+
+
+@wp.func
 def accumulate_particle_triangle_swept_contact_correction(
     tid: wp.int32,
     tri: wp.int32,
@@ -1260,37 +1290,86 @@ def accumulate_particle_triangle_swept_contact_correction(
     if tid == v0 or tid == v1 or tid == v2:
         return 0
 
+    x_prev = particle_q_prev[tid]
+    x0_prev = particle_q_prev[v0]
+    x1_prev = particle_q_prev[v1]
+    x2_prev = particle_q_prev[v2]
     x0 = particle_q[v0]
     x1 = particle_q[v1]
     x2 = particle_q[v2]
 
-    normal = wp.cross(x1 - x0, x2 - x0)
-    normal_length = wp.length(normal)
+    normal_curr = wp.cross(x1 - x0, x2 - x0)
+    normal_length = wp.length(normal_curr)
     if normal_length <= 0.0:
         return 0
-    normal = normal / normal_length
+    normal_curr = normal_curr / normal_length
 
-    x_prev = particle_q_prev[tid]
-    signed_prev = wp.dot(normal, x_prev - x0)
-    signed_curr = wp.dot(normal, x - x0)
-    signed_delta = signed_prev - signed_curr
-    if signed_prev * signed_curr >= 0.0 or wp.abs(signed_delta) <= 1.0e-8:
+    signed_prev = _moving_triangle_plane_signed_distance(
+        0.0,
+        x_prev,
+        x,
+        x0_prev,
+        x1_prev,
+        x2_prev,
+        x0,
+        x1,
+        x2,
+    )
+    signed_curr = _moving_triangle_plane_signed_distance(
+        1.0,
+        x_prev,
+        x,
+        x0_prev,
+        x1_prev,
+        x2_prev,
+        x0,
+        x1,
+        x2,
+    )
+    if signed_prev * signed_curr >= 0.0 or wp.abs(signed_prev) <= 1.0e-8 or wp.abs(signed_curr) <= 1.0e-8:
         return 0
 
-    t = signed_prev / signed_delta
-    if t < 0.0 or t > 1.0:
-        return 0
+    t_lo = 0.0
+    t_hi = 1.0
+    d_lo = signed_prev
 
-    hit = x_prev + t * (x - x_prev)
-    closest, barycentric, _feature_type = triangle_closest_point(x0, x1, x2, hit)
+    for _ in range(8):
+        t_mid = 0.5 * (t_lo + t_hi)
+        d_mid = _moving_triangle_plane_signed_distance(
+            t_mid,
+            x_prev,
+            x,
+            x0_prev,
+            x1_prev,
+            x2_prev,
+            x0,
+            x1,
+            x2,
+        )
+        if d_lo * d_mid <= 0.0:
+            t_hi = t_mid
+        else:
+            t_lo = t_mid
+            d_lo = d_mid
+
+    t = 0.5 * (t_lo + t_hi)
+    hit = _lerp_vec3(x_prev, x, t)
+    x0_hit = _lerp_vec3(x0_prev, x0, t)
+    x1_hit = _lerp_vec3(x1_prev, x1, t)
+    x2_hit = _lerp_vec3(x2_prev, x2, t)
+
+    closest, barycentric, _feature_type = triangle_closest_point(x0_hit, x1_hit, x2_hit, hit)
     if wp.length(hit - closest) > contact_distance:
         return 0
 
     side = 1.0
     if signed_prev < 0.0:
         side = -1.0
-    direction = side * normal
-    c = side * signed_curr - contact_distance
+    direction = side * normal_curr
+
+    current_anchor = barycentric[0] * x0 + barycentric[1] * x1 + barycentric[2] * x2
+    signed_curr_material = wp.dot(normal_curr, x - current_anchor)
+    c = side * signed_curr_material - contact_distance
     if c >= 0.0:
         return 0
 
@@ -1501,6 +1580,7 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
     particle_flags: wp.array(dtype=wp.int32),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
     contact_triangle_indices: wp.array(dtype=wp.int32),
+    triangle_proxy_motion_max: wp.array(dtype=float),
     contact_search_radius: float,
     contact_margin: float,
     relaxation: float,
@@ -1524,7 +1604,7 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
     if continuous_enabled != 0:
         travel = particle_q[tid] - particle_q_prev[tid]
         query_center = 0.5 * (particle_q[tid] + particle_q_prev[tid])
-        query_radius = query_radius + 0.5 * wp.length(travel)
+        query_radius = query_radius + 0.5 * wp.length(travel) + 0.5 * triangle_proxy_motion_max[0]
 
     query = wp.hash_grid_query(triangle_contact_grid, query_center, query_radius)
     triangle_proxy = int(0)

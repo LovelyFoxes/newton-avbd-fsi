@@ -156,3 +156,19 @@ def update_deformable_triangle_contact_proxy_world_kinematics(
     v2 = tri_indices[tri, 2]
 
     contact_triangle_x_world[tid] = (particle_q[v0] + particle_q[v1] + particle_q[v2]) / 3.0
+
+
+@wp.kernel
+def update_deformable_triangle_contact_proxy_query_kinematics(
+    contact_triangle_x_prev: wp.array(dtype=wp.vec3),
+    contact_triangle_x_world: wp.array(dtype=wp.vec3),
+    contact_triangle_x_query: wp.array(dtype=wp.vec3),
+    contact_triangle_proxy_motion_max: wp.array(dtype=float),
+):
+    """Update swept triangle proxy query points and max centroid motion."""
+    tid = wp.tid()
+
+    x_prev = contact_triangle_x_prev[tid]
+    x_curr = contact_triangle_x_world[tid]
+    contact_triangle_x_query[tid] = 0.5 * (x_prev + x_curr)
+    wp.atomic_max(contact_triangle_proxy_motion_max, 0, wp.length(x_curr - x_prev))

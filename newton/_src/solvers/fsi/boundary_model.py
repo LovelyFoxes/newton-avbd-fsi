@@ -30,6 +30,7 @@ from .boundary_kernels import (
     accumulate_step_reaction_diagnostics,
     update_boundary_sample_world_kinematics,
     update_deformable_boundary_sample_world_kinematics,
+    update_deformable_triangle_contact_proxy_query_kinematics,
     update_deformable_triangle_contact_proxy_world_kinematics,
     update_step_reaction_averages,
 )
@@ -265,7 +266,12 @@ class FSIBoundaryModel:
         self.sample_x_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_v_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_normal_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
+        self.triangle_contact_particle_q_prev = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.triangle_contact_particle_q_last = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         self.triangle_contact_x_world = wp.zeros(self.triangle_count, dtype=wp.vec3, device=self.device)
+        self.triangle_contact_x_prev = wp.zeros(self.triangle_count, dtype=wp.vec3, device=self.device)
+        self.triangle_contact_x_query = wp.zeros(self.triangle_count, dtype=wp.vec3, device=self.device)
+        self.triangle_contact_proxy_motion_max = wp.zeros(1, dtype=float, device=self.device)
         self.sample_force = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.vertex_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         self.vertex_contact_delta = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
@@ -287,6 +293,30 @@ class FSIBoundaryModel:
         self._empty_body_q = wp.zeros(0, dtype=wp.transform, device=self.device)
         self._empty_body_qd = wp.zeros(0, dtype=wp.spatial_vector, device=self.device)
         self._empty_body_com = wp.zeros(0, dtype=wp.vec3, device=self.device)
+        self._triangle_contact_history_initialized = False
+
+    def initialize_deformable_contact_history(self, state: State) -> None:
+        """Initialize deformable swept-contact history from a state."""
+        if self.triangle_count == 0 or state.particle_q is None:
+            return
+        if self._triangle_contact_history_initialized:
+            return
+
+        self.triangle_contact_particle_q_prev.assign(state.particle_q)
+        self.triangle_contact_particle_q_last.assign(state.particle_q)
+        self._triangle_contact_history_initialized = True
+
+    def reset_deformable_contact_history(self) -> None:
+        """Clear deformable swept-contact history."""
+        if self.triangle_count == 0:
+            return
+
+        self.triangle_contact_particle_q_prev.zero_()
+        self.triangle_contact_particle_q_last.zero_()
+        self.triangle_contact_x_prev.zero_()
+        self.triangle_contact_x_query.zero_()
+        self.triangle_contact_proxy_motion_max.zero_()
+        self._triangle_contact_history_initialized = False
 
     def update_world_kinematics(self, state: State) -> None:
         """Update sample positions [m], velocities [m/s], and normals."""
@@ -316,6 +346,12 @@ class FSIBoundaryModel:
             if state.particle_q is None or state.particle_qd is None:
                 raise ValueError("Triangle boundary samples require particle positions and velocities.")
 
+            if not self._triangle_contact_history_initialized:
+                self.initialize_deformable_contact_history(state)
+            else:
+                self.triangle_contact_particle_q_prev.assign(self.triangle_contact_particle_q_last)
+                self.triangle_contact_particle_q_last.assign(state.particle_q)
+
             wp.launch(
                 update_deformable_boundary_sample_world_kinematics,
                 dim=self.sample_count,
@@ -343,10 +379,37 @@ class FSIBoundaryModel:
                     inputs=[
                         self.triangle_indices,
                         self.model.tri_indices,
+                        self.triangle_contact_particle_q_prev,
+                    ],
+                    outputs=[
+                        self.triangle_contact_x_prev,
+                    ],
+                    device=self.device,
+                )
+                wp.launch(
+                    update_deformable_triangle_contact_proxy_world_kinematics,
+                    dim=self.triangle_count,
+                    inputs=[
+                        self.triangle_indices,
+                        self.model.tri_indices,
                         state.particle_q,
                     ],
                     outputs=[
                         self.triangle_contact_x_world,
+                    ],
+                    device=self.device,
+                )
+                self.triangle_contact_proxy_motion_max.zero_()
+                wp.launch(
+                    update_deformable_triangle_contact_proxy_query_kinematics,
+                    dim=self.triangle_count,
+                    inputs=[
+                        self.triangle_contact_x_prev,
+                        self.triangle_contact_x_world,
+                    ],
+                    outputs=[
+                        self.triangle_contact_x_query,
+                        self.triangle_contact_proxy_motion_max,
                     ],
                     device=self.device,
                 )
@@ -357,7 +420,7 @@ class FSIBoundaryModel:
             if self.boundary_grid is not None and self.sample_count > 0:
                 self.boundary_grid.build(self.sample_x_world, radius=self.support_radius)
             if self.triangle_contact_grid is not None and self.triangle_count > 0:
-                self.triangle_contact_grid.build(self.triangle_contact_x_world, radius=self.support_radius)
+                self.triangle_contact_grid.build(self.triangle_contact_x_query, radius=self.support_radius)
 
     def clear_forces(self) -> None:
         """Clear boundary sample, body wrench, and deformable reaction accumulators."""

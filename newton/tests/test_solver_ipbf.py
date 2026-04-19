@@ -1370,6 +1370,99 @@ def test_ipbf_triangle_contact_prevents_swept_side_change(test, device):
     np.testing.assert_allclose(disabled_vertex_force, np.zeros_like(disabled_vertex_force), atol=1.0e-6)
 
 
+def test_ipbf_triangle_contact_detects_moving_triangle_sweep(test, device):
+    def run_step(continuous_enabled: bool):
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+        SolverIPBF.register_custom_attributes(builder)
+
+        builder.add_particles(
+            pos=[
+                wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.1),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(1.0, 0.0, 0.0),
+                wp.vec3(0.0, 1.0, 0.0),
+            ],
+            vel=[
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+                wp.vec3(0.0, 0.0, 0.0),
+            ],
+            mass=[1.0, 1.0, 1.0, 1.0],
+            radius=[0.05, 0.05, 0.05, 0.05],
+        )
+        builder.add_triangle(1, 2, 3)
+        model = builder.finalize(device=device)
+        model.set_gravity((0.0, 0.0, 0.0))
+
+        boundary_model = FSIBoundaryModel(
+            model,
+            spacing=2.0,
+            support_radius=0.5,
+            include_static=False,
+            include_dynamic=False,
+            include_triangles=True,
+            deformable_sample_thickness=0.2,
+            device=device,
+        )
+
+        history_state = model.state()
+        boundary_model.initialize_deformable_contact_history(history_state)
+
+        solver = SolverIPBF(
+            model,
+            SolverIPBF.Config(
+                rest_density=1000.0,
+                smoothing_radius=0.5,
+                iterations=0,
+                use_constraint_clamp=False,
+                damping_beta=0.0,
+                fluid_particle_start=0,
+                fluid_particle_count=1,
+                fsi_triangle_contact_continuous_enabled=continuous_enabled,
+                fsi_triangle_contact_relaxation=1.0,
+            ),
+            boundary_model=boundary_model,
+        )
+
+        state_0 = model.state()
+        state_1 = model.state()
+        moved_q = state_0.particle_q.numpy()
+        moved_q[1:, 2] = 0.2
+        state_0.particle_q.assign(moved_q)
+        state_0.particle_qd.zero_()
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+        return (
+            state_1.particle_q.numpy(),
+            solver._triangle_contact_particle_delta.numpy(),
+            boundary_model.vertex_contact_delta.numpy(),
+            boundary_model.vertex_force.numpy(),
+        )
+
+    enabled_q, enabled_particle_delta, enabled_vertex_delta, enabled_vertex_force = run_step(continuous_enabled=True)
+    disabled_q, disabled_particle_delta, disabled_vertex_delta, disabled_vertex_force = run_step(
+        continuous_enabled=False
+    )
+
+    expected_fluid_delta = np.array([0.0, 0.0, 0.1125], dtype=np.float32)
+    expected_vertex_delta = np.array([0.0, 0.0, -0.0375], dtype=np.float32)
+    expected_vertex_force = expected_vertex_delta / (0.05 * 0.05)
+    expected_vertex_delta_stack = np.repeat(expected_vertex_delta.reshape(1, 3), 3, axis=0)
+    expected_vertex_force_stack = np.repeat(expected_vertex_force.reshape(1, 3), 3, axis=0)
+
+    np.testing.assert_allclose(enabled_q[0], [1.0 / 3.0, 1.0 / 3.0, 0.2125], rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(enabled_particle_delta[0], expected_fluid_delta, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(enabled_vertex_delta[1:], expected_vertex_delta_stack, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(enabled_vertex_force[1:], expected_vertex_force_stack, rtol=1.0e-5, atol=1.0e-6)
+
+    np.testing.assert_allclose(disabled_q[0], [1.0 / 3.0, 1.0 / 3.0, 0.1], rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(disabled_particle_delta, np.zeros_like(disabled_particle_delta), atol=1.0e-6)
+    np.testing.assert_allclose(disabled_vertex_delta, np.zeros_like(disabled_vertex_delta), atol=1.0e-6)
+    np.testing.assert_allclose(disabled_vertex_force, np.zeros_like(disabled_vertex_force), atol=1.0e-6)
+
+
 def test_ipbf_boundary_model_density_stays_consistent_across_sample_spacing(test, device):
     _, coarse_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.25)
     _, fine_solver = run_boundary_density_step(device, use_boundary_model=True, boundary_spacing=0.125)
@@ -2256,6 +2349,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_triangle_contact_prevents_swept_side_change",
     test_ipbf_triangle_contact_prevents_swept_side_change,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_contact_detects_moving_triangle_sweep",
+    test_ipbf_triangle_contact_detects_moving_triangle_sweep,
     devices=devices,
     check_output=False,
 )
