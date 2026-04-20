@@ -71,6 +71,11 @@ class Example:
             default=None,
             help="Scale the initial fluid particle velocity for control studies.",
         )
+        parser.add_argument(
+            "--disable-cloth-self-contact",
+            action="store_true",
+            help="Disable VBD cloth particle self-contact diagnostics.",
+        )
         return parser
 
     def _get_scene_config(self) -> dict[str, float | int | wp.vec3]:
@@ -109,6 +114,7 @@ class Example:
                 "velocity_damping": 0.997,
                 "triangle_contact_enabled": True,
                 "triangle_contact_relaxation": 1.0,
+                "cloth_self_contact_enabled": True,
             }
         else:
             config = {
@@ -142,10 +148,13 @@ class Example:
                 "velocity_damping": 0.998,
                 "triangle_contact_enabled": True,
                 "triangle_contact_relaxation": 1.0,
+                "cloth_self_contact_enabled": True,
             }
 
         if bool(getattr(self.args, "disable_triangle_contact", False)):
             config["triangle_contact_enabled"] = False
+        if bool(getattr(self.args, "disable_cloth_self_contact", False)):
+            config["cloth_self_contact_enabled"] = False
 
         triangle_contact_relaxation = getattr(self.args, "triangle_contact_relaxation", None)
         if triangle_contact_relaxation is not None:
@@ -304,7 +313,7 @@ class Example:
             iterations=int(self.config["vbd_iterations"]),
             particle_start=self.cloth_particle_start,
             particle_count=self.cloth_particle_count,
-            particle_enable_self_contact=True,
+            particle_enable_self_contact=bool(self.config["cloth_self_contact_enabled"]),
             particle_self_contact_radius=float(self.config["cloth_self_contact_radius"]),
             particle_self_contact_margin=float(self.config["cloth_self_contact_margin"]),
             fsi_boundary_model=self.boundary_model,
