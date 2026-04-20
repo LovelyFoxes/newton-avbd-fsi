@@ -65,6 +65,12 @@ class Example:
             default=None,
             help="Override the IPBF cloth triangle-contact relaxation.",
         )
+        parser.add_argument(
+            "--fluid-velocity-scale",
+            type=float,
+            default=None,
+            help="Scale the initial fluid particle velocity for control studies.",
+        )
         return parser
 
     def _get_scene_config(self) -> dict[str, float | int | wp.vec3]:
@@ -144,6 +150,16 @@ class Example:
         triangle_contact_relaxation = getattr(self.args, "triangle_contact_relaxation", None)
         if triangle_contact_relaxation is not None:
             config["triangle_contact_relaxation"] = float(triangle_contact_relaxation)
+
+        fluid_velocity_scale = getattr(self.args, "fluid_velocity_scale", None)
+        if fluid_velocity_scale is not None:
+            scale = float(fluid_velocity_scale)
+            fluid_velocity = config["fluid_velocity"]
+            config["fluid_velocity"] = wp.vec3(
+                scale * float(fluid_velocity[0]),
+                scale * float(fluid_velocity[1]),
+                scale * float(fluid_velocity[2]),
+            )
 
         return config
 
