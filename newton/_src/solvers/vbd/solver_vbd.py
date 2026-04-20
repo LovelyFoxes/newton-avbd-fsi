@@ -517,7 +517,9 @@ class SolverVBD(SolverBase):
         self.particle_q_prev = wp.zeros_like(
             model.particle_q, device=self.device
         )  # per-substep previous q (for velocity)
+        self.inertia_base = wp.zeros_like(model.particle_q, device=self.device)
         self.inertia = wp.zeros_like(model.particle_q, device=self.device)  # inertial target positions
+        self.fsi_particle_inertia_offset = wp.zeros_like(model.particle_q, device=self.device)
         self._vbd_particle_flags = wp.empty(model.particle_count, dtype=wp.int32, device=self.device)
         self._refresh_particle_flags()
 
@@ -1494,6 +1496,8 @@ class SolverVBD(SolverBase):
             dim=self.model.particle_count,
             device=self.device,
         )
+        self.inertia_base.assign(self.inertia)
+        self.fsi_particle_inertia_offset.zero_()
 
         self._penetration_free_truncation(state_in.particle_q)
 
@@ -1717,6 +1721,7 @@ class SolverVBD(SolverBase):
         # Zero out forces and hessians
         self.particle_forces.zero_()
         self.particle_hessians.zero_()
+        self.inertia.assign(self.inertia_base)
 
         if self.fsi_boundary_model is not None and self.fsi_force_relaxation != 0.0:
             current_generation = int(getattr(self.fsi_boundary_model, "vertex_contact_delta_generation", -1))
@@ -1731,12 +1736,26 @@ class SolverVBD(SolverBase):
                         self._vbd_particle_flags,
                     ],
                     outputs=[
-                        self.inertia,
+                        self.fsi_particle_inertia_offset,
                     ],
                     device=self.device,
                 )
                 self._fsi_vertex_delta_generation_consumed = current_generation
-            elif not has_vertex_delta and getattr(self.fsi_boundary_model, "vertex_force", None) is not None:
+            if has_vertex_delta:
+                wp.launch(
+                    kernel=add_fsi_vertex_deltas_to_particle_inertia,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.fsi_particle_inertia_offset,
+                        1.0,
+                        self._vbd_particle_flags,
+                    ],
+                    outputs=[
+                        self.inertia,
+                    ],
+                    device=self.device,
+                )
+            elif getattr(self.fsi_boundary_model, "vertex_force", None) is not None:
                 wp.launch(
                     kernel=add_fsi_vertex_forces_to_particle_accumulators,
                     dim=model.particle_count,

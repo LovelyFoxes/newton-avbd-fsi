@@ -25,6 +25,17 @@ from newton.solvers import FSIBoundaryModel, SolverFSI, SolverIPBF, SolverVBD
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
+@wp.kernel
+def offset_particle_subset(
+    particle_start: int,
+    delta: wp.vec3,
+    particle_q: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    particle = particle_start + tid
+    particle_q[particle] = particle_q[particle] + delta
+
+
 def build_single_particle_box_fsi(device):
     """Build a small IPBF particle / AVBD box coupling scene."""
     builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -262,6 +273,280 @@ def run_interlinked_cloth_fsi_step(device):
     return state_0, state_1, solver, boundary_model, dt
 
 
+def run_vbd_cloth_vertex_delta_generation_step(device):
+    """Run two VBD cloth iterations with incremental FSI delta generations."""
+    model = build_single_particle_cloth_fsi(device)
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    solid_solver = SolverVBD(
+        model,
+        iterations=1,
+        particle_start=1,
+        particle_count=3,
+        fsi_boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    dt = 0.05
+    solid_solver._begin_step(state_0, state_1, contacts=None, dt=dt)
+
+    base_inertia = solid_solver.inertia.numpy().copy()
+
+    delta_1 = np.zeros((model.particle_count, 3), dtype=np.float32)
+    delta_1[1:, 2] = -0.01
+    boundary_model.clear_forces()
+    boundary_model.vertex_contact_delta.assign(wp.array(delta_1, dtype=wp.vec3, device=device))
+    solid_solver._solve_particle_iteration(state_0, state_1, contacts=None, dt=dt, iter_num=0)
+    inertia_after_first = solid_solver.inertia.numpy().copy()
+
+    delta_2 = np.zeros((model.particle_count, 3), dtype=np.float32)
+    delta_2[1:, 2] = -0.02
+    boundary_model.clear_forces()
+    boundary_model.vertex_contact_delta.assign(wp.array(delta_2, dtype=wp.vec3, device=device))
+    solid_solver._solve_particle_iteration(state_0, state_1, contacts=None, dt=dt, iter_num=1)
+    inertia_after_second = solid_solver.inertia.numpy().copy()
+
+    return base_inertia, inertia_after_first, inertia_after_second, delta_1, delta_2
+
+
+class TrackingContinuousIPBF(SolverIPBF):
+    """IPBF variant that records the triangle CCD mode used per split iteration."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.continuous_flags: list[bool] = []
+        self.iteration_calls: list[tuple[int, int]] = []
+
+    def _solve_iteration(self, state_out, contacts, dt, iteration, iteration_count=None):
+        iteration_count = self.iterations if iteration_count is None else int(iteration_count)
+        self.continuous_flags.append(bool(self.fsi_triangle_contact_continuous_enabled))
+        self.iteration_calls.append((int(iteration), iteration_count))
+        return super()._solve_iteration(state_out, contacts, dt, iteration, iteration_count)
+
+
+class TrackingVBD(SolverVBD):
+    """VBD variant that records split iteration indices."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.iteration_calls: list[int] = []
+
+    def _solve_iteration(self, state_in, state_out, contacts, dt, iter_num):
+        self.iteration_calls.append(int(iter_num))
+        return super()._solve_iteration(state_in, state_out, contacts, dt, iter_num)
+
+
+class NudgingVBD(TrackingVBD):
+    """VBD variant that applies a deterministic solid-particle test motion."""
+
+    def __init__(self, *args, nudge_delta: wp.vec3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nudge_delta = nudge_delta
+
+    def _solve_iteration(self, state_in, state_out, contacts, dt, iter_num):
+        result = super()._solve_iteration(state_in, state_out, contacts, dt, iter_num)
+        wp.launch(
+            offset_particle_subset,
+            dim=self.particle_count,
+            inputs=[self.particle_start, self.nudge_delta],
+            outputs=[state_out.particle_q],
+            device=self.model.device,
+        )
+        return result
+
+
+class TrackingSolidBoundaryIPBF(SolverIPBF):
+    """IPBF variant that records external cloth positions in split scratch state."""
+
+    def __init__(self, *args, solid_particle_start: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.solid_particle_start = int(solid_particle_start)
+        self.solid_x_guess_z: list[float] = []
+
+    def _solve_iteration(self, state_out, contacts, dt, iteration, iteration_count=None):
+        x_guess = state_out.ipbf.x_guess.numpy()
+        self.solid_x_guess_z.append(float(np.mean(x_guess[self.solid_particle_start :, 2])))
+        return super()._solve_iteration(state_out, contacts, dt, iteration, iteration_count)
+
+
+def run_interlinked_cloth_continuous_mode_step(device):
+    """Run two interlinked cloth coupling iterations and record CCD flags."""
+    model = build_single_particle_cloth_fsi(device)
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    fluid_solver = TrackingContinuousIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=2,
+            relaxation=1.0,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_triangle_contact_enabled=True,
+            fsi_triangle_contact_continuous_enabled=True,
+            fsi_triangle_contact_margin=0.0,
+            fsi_triangle_contact_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+    solid_solver = SolverVBD(
+        model,
+        iterations=2,
+        particle_start=1,
+        particle_count=3,
+        fsi_boundary_model=boundary_model,
+    )
+    solver = SolverFSI(
+        model,
+        fluid_solver,
+        solid_solver,
+        boundary_model,
+        SolverFSI.Config(
+            mode=SolverFSI.Config.CouplingMode.INTERLINKED,
+            coupling_iterations=2,
+        ),
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    return fluid_solver.continuous_flags
+
+
+def run_interlinked_iteration_budget_step(device):
+    """Run interlinked FSI and record participant split iteration budgets."""
+    model = build_single_particle_cloth_fsi(device)
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    fluid_solver = TrackingContinuousIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=4,
+            relaxation=1.0,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_triangle_contact_enabled=False,
+        ),
+        boundary_model=boundary_model,
+    )
+    solid_solver = TrackingVBD(
+        model,
+        iterations=6,
+        particle_start=1,
+        particle_count=3,
+        fsi_boundary_model=boundary_model,
+    )
+    solver = SolverFSI(
+        model,
+        fluid_solver,
+        solid_solver,
+        boundary_model,
+        SolverFSI.Config(
+            mode=SolverFSI.Config.CouplingMode.INTERLINKED,
+            coupling_iterations=2,
+        ),
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    return fluid_solver.iteration_calls, solid_solver.iteration_calls
+
+
+def run_interlinked_cloth_solid_particle_sync_step(device):
+    """Run two interlinked cloth passes and record cloth scratch positions."""
+    model = build_single_particle_cloth_fsi(device)
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    fluid_solver = TrackingSolidBoundaryIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=2,
+            relaxation=1.0,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_triangle_contact_enabled=False,
+        ),
+        boundary_model=boundary_model,
+        solid_particle_start=1,
+    )
+    solid_solver = NudgingVBD(
+        model,
+        iterations=2,
+        particle_start=1,
+        particle_count=3,
+        fsi_boundary_model=boundary_model,
+        nudge_delta=wp.vec3(0.0, 0.0, -0.01),
+    )
+    solver = SolverFSI(
+        model,
+        fluid_solver,
+        solid_solver,
+        boundary_model,
+        SolverFSI.Config(
+            mode=SolverFSI.Config.CouplingMode.INTERLINKED,
+            coupling_iterations=2,
+        ),
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    solver.step(state_0, state_1, control=None, contacts=None, dt=0.05)
+
+    return fluid_solver.solid_x_guess_z
+
+
 def test_solver_fsi_loose_coupling_moves_body_from_ipbf_reaction(test, device):
     state_0, state_1, solver, boundary_model, contacts, body, dt = run_loose_fsi_step(device)
 
@@ -330,6 +615,40 @@ def test_solver_fsi_interlinked_coupling_preserves_fluid_subset_state_for_cloth(
     test.assertTrue(np.all(final_q[1:, 2] <= initial_q[1:, 2]))
 
 
+def test_solver_fsi_cloth_vertex_delta_generations_accumulate_inertia_offset(test, device):
+    base_inertia, inertia_after_first, inertia_after_second, delta_1, delta_2 = run_vbd_cloth_vertex_delta_generation_step(
+        device
+    )
+
+    np.testing.assert_allclose(inertia_after_first[1:], base_inertia[1:] + delta_1[1:], rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(
+        inertia_after_second[1:],
+        base_inertia[1:] + delta_1[1:] + delta_2[1:],
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+
+
+def test_solver_fsi_interlinked_cloth_disables_continuous_triangle_contact_during_split_iterations(test, device):
+    continuous_flags = run_interlinked_cloth_continuous_mode_step(device)
+
+    test.assertEqual(continuous_flags, [False, False])
+
+
+def test_solver_fsi_interlinked_preserves_participant_iteration_budgets(test, device):
+    fluid_iterations, solid_iterations = run_interlinked_iteration_budget_step(device)
+
+    test.assertEqual(fluid_iterations, [(0, 4), (1, 4), (2, 4), (3, 4)])
+    test.assertEqual(solid_iterations, [0, 1, 2, 3, 4, 5])
+
+
+def test_solver_fsi_interlinked_syncs_solid_particles_into_fluid_scratch(test, device):
+    solid_x_guess_z = run_interlinked_cloth_solid_particle_sync_step(device)
+
+    test.assertGreaterEqual(len(solid_x_guess_z), 2)
+    test.assertLess(solid_x_guess_z[1], solid_x_guess_z[0] - 1.0e-6)
+
+
 devices = get_test_devices()
 
 
@@ -362,6 +681,34 @@ add_function_test(
     TestSolverFSI,
     "test_solver_fsi_interlinked_coupling_preserves_fluid_subset_state_for_cloth",
     test_solver_fsi_interlinked_coupling_preserves_fluid_subset_state_for_cloth,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverFSI,
+    "test_solver_fsi_cloth_vertex_delta_generations_accumulate_inertia_offset",
+    test_solver_fsi_cloth_vertex_delta_generations_accumulate_inertia_offset,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverFSI,
+    "test_solver_fsi_interlinked_cloth_disables_continuous_triangle_contact_during_split_iterations",
+    test_solver_fsi_interlinked_cloth_disables_continuous_triangle_contact_during_split_iterations,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverFSI,
+    "test_solver_fsi_interlinked_preserves_participant_iteration_budgets",
+    test_solver_fsi_interlinked_preserves_participant_iteration_budgets,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverFSI,
+    "test_solver_fsi_interlinked_syncs_solid_particles_into_fluid_scratch",
+    test_solver_fsi_interlinked_syncs_solid_particles_into_fluid_scratch,
     devices=devices,
     check_output=False,
 )

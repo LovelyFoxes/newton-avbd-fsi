@@ -52,7 +52,7 @@ class Example:
             "--coupling-iterations",
             type=int,
             default=3,
-            help="Number of IPBF/VBD iteration pairs for interlinked mode.",
+            help="Number of outer fluid-solid feedback passes used only in interlinked mode.",
         )
         return parser
 
@@ -83,6 +83,8 @@ class Example:
                 "cloth_tri_kd": 0.30,
                 "cloth_edge_ke": 12.0,
                 "cloth_edge_kd": 0.07,
+                "cloth_self_contact_radius": 0.020,
+                "cloth_self_contact_margin": 0.035,
                 "smoothing_radius": 0.075,
                 "rest_density": 1000.0,
                 "ipbf_iterations": 2,
@@ -112,6 +114,8 @@ class Example:
             "cloth_tri_kd": 0.25,
             "cloth_edge_ke": 8.0,
             "cloth_edge_kd": 0.05,
+            "cloth_self_contact_radius": 0.018,
+            "cloth_self_contact_margin": 0.032,
             "smoothing_radius": 0.080,
             "rest_density": 1000.0,
             "ipbf_iterations": 4,
@@ -260,6 +264,9 @@ class Example:
             iterations=int(self.config["vbd_iterations"]),
             particle_start=self.cloth_particle_start,
             particle_count=self.cloth_particle_count,
+            particle_enable_self_contact=True,
+            particle_self_contact_radius=float(self.config["cloth_self_contact_radius"]),
+            particle_self_contact_margin=float(self.config["cloth_self_contact_margin"]),
             fsi_boundary_model=self.boundary_model,
         )
 
@@ -325,6 +332,7 @@ class Example:
         self.max_cloth_dx = 0.0
         self.max_triangle_contact_particle_delta = 0.0
         self.max_triangle_contact_vertex_delta = 0.0
+        self.max_fsi_particle_inertia_offset = 0.0
         self.max_triangle_contact_pair_count = 0
         self.max_vertex_force_norm = 0.0
         self.max_density = 0.0
@@ -340,6 +348,7 @@ class Example:
         triangle_vertex_delta = self.boundary_model.vertex_contact_delta.numpy()[self.cloth_particle_start :]
         triangle_pair_count = int(self.fluid_solver._triangle_contact_pair_count.numpy()[0])
         vertex_force = self.boundary_model.vertex_force.numpy()[self.cloth_particle_start :]
+        fsi_inertia_offset = self.solid_solver.fsi_particle_inertia_offset.numpy()[self.cloth_particle_start :]
         density = self.solver._fluid_state.ipbf.density.numpy()
 
         self.max_triangle_contact_particle_delta = max(
@@ -349,6 +358,10 @@ class Example:
         self.max_triangle_contact_vertex_delta = max(
             self.max_triangle_contact_vertex_delta,
             float(np.linalg.norm(triangle_vertex_delta, axis=1).max()),
+        )
+        self.max_fsi_particle_inertia_offset = max(
+            self.max_fsi_particle_inertia_offset,
+            float(np.linalg.norm(fsi_inertia_offset, axis=1).max()),
         )
         self.max_triangle_contact_pair_count = max(self.max_triangle_contact_pair_count, triangle_pair_count)
         self.max_vertex_force_norm = max(self.max_vertex_force_norm, float(np.linalg.norm(vertex_force, axis=1).max()))
@@ -390,7 +403,7 @@ class Example:
 
     def test_final(self):
         assert self.max_density > 0.0, "IPBF density diagnostics were not updated"
-        assert self.max_triangle_contact_vertex_delta > 0.0, "cloth triangle-contact deltas were never accumulated"
+        assert self.max_fsi_particle_inertia_offset > 0.0, "cloth triangle-contact deltas never reached VBD"
         assert self.max_vertex_force_norm > 0.0, "cloth-side FSI vertex forces were not accumulated"
         assert self.max_cloth_dx > 1.0e-4, f"cloth patch did not move in the expected +x direction: {self.max_cloth_dx}"
 

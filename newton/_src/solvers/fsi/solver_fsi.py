@@ -69,9 +69,11 @@ class SolverFSI(SolverBase):
 
         Attributes:
             mode: Coupling schedule.
-            coupling_iterations: Number of interlinked IPBF/AVBD iteration
-                pairs. If ``None``, uses the larger ``iterations`` value found
-                on the participating solvers, clamped to at least one.
+            coupling_iterations: Number of interlinked fluid-solid feedback
+                passes. Each pass consumes a chunk of the participating solvers'
+                own ``iterations`` budgets. If ``None``, uses the larger
+                ``iterations`` value found on the participating solvers,
+                clamped to at least one.
             pass_contacts_to_solid: Whether the same contact buffer passed to
                 :meth:`step` should also be passed to the solid solver.
             update_boundary_after_solid: Whether to refresh boundary sample
@@ -204,30 +206,60 @@ class SolverFSI(SolverBase):
         self.solid_solver._begin_step(self._fluid_state, state_out, solid_contacts, dt)
 
         coupling_iterations = self._coupling_iteration_count()
-        fluid_iterations = int(getattr(self.fluid_solver, "iterations", coupling_iterations))
-        for iteration in range(coupling_iterations):
-            self.boundary_model.clear_forces()
-            if fluid_iterations <= 0:
-                if iteration == 0:
-                    self.fluid_solver._solve_zero_iteration(self._fluid_state, contacts, dt)
-            else:
-                self.fluid_solver._solve_iteration(
-                    self._fluid_state,
-                    contacts,
-                    dt,
-                    iteration,
-                    coupling_iterations,
-                )
-            self.boundary_model.accumulate_step_diagnostics()
-            self.solid_solver._solve_iteration(
-                self._fluid_state,
-                state_out,
-                solid_contacts,
-                dt,
-                iteration,
-            )
-            self._copy_body_state(state_out, self._fluid_state)
-            self._refresh_boundary(state_out)
+        fluid_iterations = max(0, int(getattr(self.fluid_solver, "iterations", coupling_iterations)))
+        solid_iterations = max(0, int(getattr(self.solid_solver, "iterations", coupling_iterations)))
+        triangle_continuous_enabled = getattr(self.fluid_solver, "fsi_triangle_contact_continuous_enabled", None)
+        try:
+            if triangle_continuous_enabled is not None:
+                # Interlinked fluid-solid iterations are fixed-point
+                # refinements inside one timestep, not new physical motion
+                # intervals. Treating cloth iteration updates as swept CCD
+                # motion overestimates triangle contact corrections.
+                self.fluid_solver.fsi_triangle_contact_continuous_enabled = False
+
+            for coupling_iteration in range(coupling_iterations):
+                ran_fluid_chunk = False
+                if fluid_iterations <= 0:
+                    if coupling_iteration == 0:
+                        self.boundary_model.clear_forces()
+                        self.fluid_solver._solve_zero_iteration(self._fluid_state, contacts, dt)
+                        ran_fluid_chunk = True
+                else:
+                    fluid_iteration_range = self._iteration_chunk(
+                        fluid_iterations,
+                        coupling_iteration,
+                        coupling_iterations,
+                    )
+                    if fluid_iteration_range:
+                        self.boundary_model.clear_forces()
+                        for fluid_iteration in fluid_iteration_range:
+                            self.fluid_solver._solve_iteration(
+                                self._fluid_state,
+                                contacts,
+                                dt,
+                                fluid_iteration,
+                                fluid_iterations,
+                            )
+                        ran_fluid_chunk = True
+
+                if ran_fluid_chunk:
+                    self.boundary_model.accumulate_step_diagnostics()
+
+                for solid_iteration in self._iteration_chunk(solid_iterations, coupling_iteration, coupling_iterations):
+                    self.solid_solver._solve_iteration(
+                        self._fluid_state,
+                        state_out,
+                        solid_contacts,
+                        dt,
+                        solid_iteration,
+                    )
+
+                self._sync_solid_particle_state_to_fluid_state(state_out)
+                self._copy_body_state(state_out, self._fluid_state)
+                self._refresh_boundary(state_out)
+        finally:
+            if triangle_continuous_enabled is not None:
+                self.fluid_solver.fsi_triangle_contact_continuous_enabled = bool(triangle_continuous_enabled)
 
         self.fluid_solver._finalize_step(state_in, self._fluid_state, contacts, dt)
         self.solid_solver._finalize_step(self._fluid_state, state_out, dt)
@@ -264,6 +296,18 @@ class SolverFSI(SolverBase):
         solid_iterations = int(getattr(self.solid_solver, "iterations", 1))
         return max(fluid_iterations, solid_iterations, 1)
 
+    @staticmethod
+    def _iteration_chunk(iteration_count: int, chunk_index: int, chunk_count: int) -> range:
+        """Return the split-iteration range assigned to one feedback pass."""
+        if iteration_count <= 0:
+            return range(0, 0)
+
+        base_count = iteration_count // chunk_count
+        remainder = iteration_count % chunk_count
+        start = chunk_index * base_count + min(chunk_index, remainder)
+        end = start + base_count + (1 if chunk_index < remainder else 0)
+        return range(start, end)
+
     def _refresh_boundary(self, state: State) -> None:
         """Update boundary sample world kinematics and spatial grid."""
         self.boundary_model.update_world_kinematics(state)
@@ -280,6 +324,19 @@ class SolverFSI(SolverBase):
         particle_start = int(getattr(self.fluid_solver, "fluid_particle_start", 0))
         return particle_start != 0 or particle_count != self.model.particle_count
 
+    def _solid_particle_range(self) -> tuple[int, int]:
+        particle_start = int(getattr(self.solid_solver, "particle_start", 0))
+        particle_count = getattr(self.solid_solver, "particle_count", None)
+        if particle_count is None:
+            particle_count = self.model.particle_count - particle_start
+        return particle_start, int(particle_count)
+
+    @staticmethod
+    def _particle_ranges_overlap(start_a: int, count_a: int, start_b: int, count_b: int) -> bool:
+        if count_a <= 0 or count_b <= 0:
+            return False
+        return start_a < start_b + count_b and start_b < start_a + count_a
+
     def _sync_fluid_particle_state(self, state_out: State) -> None:
         if self._should_copy_fluid_particle_state():
             self._copy_particle_state(self._fluid_state, state_out)
@@ -289,6 +346,43 @@ class SolverFSI(SolverBase):
         if self._has_fluid_particle_subset():
             self._copy_particle_subset_state(self._fluid_state, state_out)
             self._copy_custom_state_namespaces(self._fluid_state, state_out)
+
+    def _sync_solid_particle_state_to_fluid_state(self, state_out: State) -> None:
+        if not bool(getattr(self.solid_solver, "integrate_particles", False)):
+            return
+
+        solid_start, solid_count = self._solid_particle_range()
+        fluid_start = int(getattr(self.fluid_solver, "fluid_particle_start", 0))
+        fluid_count = int(getattr(self.fluid_solver, "fluid_particle_count", self.model.particle_count))
+        if self._particle_ranges_overlap(solid_start, solid_count, fluid_start, fluid_count):
+            return
+
+        self._copy_particle_subset_state_range(state_out, self._fluid_state, solid_start, solid_count)
+        if hasattr(self._fluid_state, "ipbf"):
+            self._copy_vec3_particle_subset(
+                state_out.particle_q,
+                self._fluid_state.ipbf.y,
+                solid_start,
+                solid_count,
+            )
+            self._copy_vec3_particle_subset(
+                state_out.particle_q,
+                self._fluid_state.ipbf.x_guess,
+                solid_start,
+                solid_count,
+            )
+            self._copy_vec3_particle_subset(
+                state_out.particle_q,
+                self._fluid_state.ipbf.x_new,
+                solid_start,
+                solid_count,
+            )
+            self._copy_vec3_particle_subset(
+                state_out.particle_q,
+                self._fluid_state.ipbf.x_star,
+                solid_start,
+                solid_count,
+            )
 
     def _copy_particle_state(self, state_src: State, state_dst: State) -> None:
         if self.model.particle_count == 0:
@@ -304,33 +398,39 @@ class SolverFSI(SolverBase):
     def _copy_particle_subset_state(self, state_src: State, state_dst: State) -> None:
         particle_start = int(getattr(self.fluid_solver, "fluid_particle_start", 0))
         particle_count = int(getattr(self.fluid_solver, "fluid_particle_count", self.model.particle_count))
+        self._copy_particle_subset_state_range(state_src, state_dst, particle_start, particle_count)
+
+    def _copy_particle_subset_state_range(
+        self,
+        state_src: State,
+        state_dst: State,
+        particle_start: int,
+        particle_count: int,
+    ) -> None:
         if particle_count <= 0:
             return
 
-        if state_src.particle_q is not None and state_dst.particle_q is not None:
-            wp.launch(
-                copy_vec3_particle_subset,
-                dim=particle_count,
-                inputs=[state_src.particle_q, particle_start],
-                outputs=[state_dst.particle_q],
-                device=self.model.device,
-            )
-        if state_src.particle_qd is not None and state_dst.particle_qd is not None:
-            wp.launch(
-                copy_vec3_particle_subset,
-                dim=particle_count,
-                inputs=[state_src.particle_qd, particle_start],
-                outputs=[state_dst.particle_qd],
-                device=self.model.device,
-            )
-        if state_src.particle_f is not None and state_dst.particle_f is not None:
-            wp.launch(
-                copy_vec3_particle_subset,
-                dim=particle_count,
-                inputs=[state_src.particle_f, particle_start],
-                outputs=[state_dst.particle_f],
-                device=self.model.device,
-            )
+        self._copy_vec3_particle_subset(state_src.particle_q, state_dst.particle_q, particle_start, particle_count)
+        self._copy_vec3_particle_subset(state_src.particle_qd, state_dst.particle_qd, particle_start, particle_count)
+        self._copy_vec3_particle_subset(state_src.particle_f, state_dst.particle_f, particle_start, particle_count)
+
+    def _copy_vec3_particle_subset(
+        self,
+        array_src: wp.array(dtype=wp.vec3) | None,
+        array_dst: wp.array(dtype=wp.vec3) | None,
+        particle_start: int,
+        particle_count: int,
+    ) -> None:
+        if array_src is None or array_dst is None or particle_count <= 0:
+            return
+
+        wp.launch(
+            copy_vec3_particle_subset,
+            dim=particle_count,
+            inputs=[array_src, particle_start],
+            outputs=[array_dst],
+            device=self.model.device,
+        )
 
     def _copy_body_state(self, state_src: State, state_dst: State) -> None:
         if self.model.body_count == 0:
