@@ -1214,6 +1214,73 @@ def test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta(test, dev
     )
 
 
+def test_ipbf_triangle_contact_split_iteration_keeps_external_boundary_vertices_fixed(test, device):
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverIPBF.register_custom_attributes(builder)
+
+    builder.add_particles(
+        pos=[
+            wp.vec3(1.0 / 3.0, 1.0 / 3.0, 0.02),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(1.0, 0.0, 0.0),
+            wp.vec3(0.0, 1.0, 0.0),
+        ],
+        vel=[
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+            wp.vec3(0.0, 0.0, 0.0),
+        ],
+        mass=[1.0, 1.0, 1.0, 1.0],
+        radius=[0.05, 0.05, 0.05, 0.05],
+    )
+    builder.add_triangle(1, 2, 3)
+    model = builder.finalize(device=device)
+    model.set_gravity((0.0, 0.0, 0.0))
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=0,
+            use_constraint_clamp=False,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_triangle_contact_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+
+    state_0 = model.state()
+    state_mid = model.state()
+    initial_q = state_0.particle_q.numpy().copy()
+
+    state_0.clear_forces()
+    test.assertTrue(solver._begin_step(state_0, state_mid, dt=0.05))
+    solver._solve_zero_iteration(state_mid, contacts=None, dt=0.05)
+
+    q_mid = state_mid.particle_q.numpy()
+    vertex_delta = boundary_model.vertex_contact_delta.numpy()
+    vertex_force = boundary_model.vertex_force.numpy()
+
+    test.assertGreater(float(np.linalg.norm(q_mid[0] - initial_q[0])), 0.0)
+    np.testing.assert_allclose(q_mid[1:], initial_q[1:], rtol=1.0e-6, atol=1.0e-6)
+    test.assertGreater(float(np.linalg.norm(vertex_delta[1:])), 0.0)
+    test.assertGreater(float(np.linalg.norm(vertex_force[1:])), 0.0)
+
+
 def test_ipbf_triangle_contact_grid_matches_brute_force_scan(test, device):
     def run_step(*, use_bvh: bool, use_grid: bool):
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
@@ -2808,6 +2875,14 @@ add_function_test(
     TestSolverIPBF,
     "test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta",
     test_ipbf_triangle_contact_projects_fluid_and_records_vertex_delta,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverIPBF,
+    "test_ipbf_triangle_contact_split_iteration_keeps_external_boundary_vertices_fixed",
+    test_ipbf_triangle_contact_split_iteration_keeps_external_boundary_vertices_fixed,
     devices=devices,
     check_output=False,
 )

@@ -30,6 +30,18 @@ from .boundary_model import FSIBoundaryModel
 __all__ = ["SolverFSI"]
 
 
+@wp.kernel
+def copy_vec3_particle_subset(
+    state_src: wp.array(dtype=wp.vec3),
+    particle_start: int,
+    state_dst: wp.array(dtype=wp.vec3),
+):
+    """Copy one contiguous vec3 particle subset from ``state_src`` to ``state_dst``."""
+    tid = wp.tid()
+    particle = particle_start + tid
+    state_dst[particle] = state_src[particle]
+
+
 class SolverFSI(SolverBase):
     """Fluid-solid solver wrapper.
 
@@ -164,9 +176,7 @@ class SolverFSI(SolverBase):
         solid_contacts = contacts if self.config.pass_contacts_to_solid else None
         self.solid_solver.step(self._fluid_state, state_out, control, solid_contacts, dt)
 
-        if self._should_copy_fluid_particle_state():
-            self._copy_particle_state(self._fluid_state, state_out)
-            self._copy_custom_state_namespaces(self._fluid_state, state_out)
+        self._sync_fluid_particle_state(state_out)
 
         if self.config.update_boundary_after_solid:
             self.boundary_model.update_world_kinematics(state_out)
@@ -222,9 +232,7 @@ class SolverFSI(SolverBase):
         self.fluid_solver._finalize_step(state_in, self._fluid_state, contacts, dt)
         self.solid_solver._finalize_step(self._fluid_state, state_out, dt)
 
-        if self._should_copy_fluid_particle_state():
-            self._copy_particle_state(self._fluid_state, state_out)
-            self._copy_custom_state_namespaces(self._fluid_state, state_out)
+        self._sync_fluid_particle_state(state_out)
 
         if self.config.update_boundary_after_solid:
             self._refresh_boundary(state_out)
@@ -267,6 +275,21 @@ class SolverFSI(SolverBase):
 
         return not bool(getattr(self.solid_solver, "integrate_particles", True))
 
+    def _has_fluid_particle_subset(self) -> bool:
+        particle_count = int(getattr(self.fluid_solver, "fluid_particle_count", self.model.particle_count))
+        particle_start = int(getattr(self.fluid_solver, "fluid_particle_start", 0))
+        return particle_start != 0 or particle_count != self.model.particle_count
+
+    def _sync_fluid_particle_state(self, state_out: State) -> None:
+        if self._should_copy_fluid_particle_state():
+            self._copy_particle_state(self._fluid_state, state_out)
+            self._copy_custom_state_namespaces(self._fluid_state, state_out)
+            return
+
+        if self._has_fluid_particle_subset():
+            self._copy_particle_subset_state(self._fluid_state, state_out)
+            self._copy_custom_state_namespaces(self._fluid_state, state_out)
+
     def _copy_particle_state(self, state_src: State, state_dst: State) -> None:
         if self.model.particle_count == 0:
             return
@@ -277,6 +300,37 @@ class SolverFSI(SolverBase):
             state_dst.particle_qd.assign(state_src.particle_qd)
         if state_src.particle_f is not None and state_dst.particle_f is not None:
             state_dst.particle_f.assign(state_src.particle_f)
+
+    def _copy_particle_subset_state(self, state_src: State, state_dst: State) -> None:
+        particle_start = int(getattr(self.fluid_solver, "fluid_particle_start", 0))
+        particle_count = int(getattr(self.fluid_solver, "fluid_particle_count", self.model.particle_count))
+        if particle_count <= 0:
+            return
+
+        if state_src.particle_q is not None and state_dst.particle_q is not None:
+            wp.launch(
+                copy_vec3_particle_subset,
+                dim=particle_count,
+                inputs=[state_src.particle_q, particle_start],
+                outputs=[state_dst.particle_q],
+                device=self.model.device,
+            )
+        if state_src.particle_qd is not None and state_dst.particle_qd is not None:
+            wp.launch(
+                copy_vec3_particle_subset,
+                dim=particle_count,
+                inputs=[state_src.particle_qd, particle_start],
+                outputs=[state_dst.particle_qd],
+                device=self.model.device,
+            )
+        if state_src.particle_f is not None and state_dst.particle_f is not None:
+            wp.launch(
+                copy_vec3_particle_subset,
+                dim=particle_count,
+                inputs=[state_src.particle_f, particle_start],
+                outputs=[state_dst.particle_f],
+                device=self.model.device,
+            )
 
     def _copy_body_state(self, state_src: State, state_dst: State) -> None:
         if self.model.body_count == 0:

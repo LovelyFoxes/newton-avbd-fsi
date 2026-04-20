@@ -1848,6 +1848,21 @@ def add_fsi_vertex_forces_to_particle_accumulators(
 
 
 @wp.kernel
+def add_fsi_vertex_deltas_to_particle_inertia(
+    fsi_vertex_delta: wp.array(dtype=wp.vec3),
+    delta_relaxation: float,
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_inertia: wp.array(dtype=wp.vec3),
+):
+    particle = wp.tid()
+
+    if not particle_flags[particle] & ParticleFlags.ACTIVE:
+        return
+
+    particle_inertia[particle] = particle_inertia[particle] + delta_relaxation * fsi_vertex_delta[particle]
+
+
+@wp.kernel
 def compute_particle_conservative_bound(
     # inputs
     conservative_bound_relaxation: float,

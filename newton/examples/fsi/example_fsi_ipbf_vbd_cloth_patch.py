@@ -45,7 +45,7 @@ class Example:
         parser.add_argument(
             "--coupling-mode",
             choices=["loose", "interlinked"],
-            default="loose",
+            default="interlinked",
             help="FSI scheduler mode used for the cloth-fluid demo.",
         )
         parser.add_argument(

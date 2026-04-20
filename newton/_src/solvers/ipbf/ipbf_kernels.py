@@ -2095,14 +2095,22 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
 
 @wp.kernel
 def apply_particle_triangle_contact_deltas(
+    particle_flags: wp.array(dtype=wp.int32),
     particle_contact_delta: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
+    apply_vertex_deltas: int,
     particle_q: wp.array(dtype=wp.vec3),
 ):
     """Apply accumulated particle-triangle contact deltas to positions."""
     tid = wp.tid()
 
-    particle_q[tid] = particle_q[tid] + particle_contact_delta[tid] + vertex_contact_delta[tid]
+    delta = wp.vec3(0.0)
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) != 0:
+        delta = delta + particle_contact_delta[tid]
+    if apply_vertex_deltas != 0:
+        delta = delta + vertex_contact_delta[tid]
+
+    particle_q[tid] = particle_q[tid] + delta
 
 
 @wp.kernel

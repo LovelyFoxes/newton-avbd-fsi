@@ -206,6 +206,62 @@ def run_loose_cloth_fsi_step(device):
     return state_0, state_1, solver, boundary_model, dt
 
 
+def run_interlinked_cloth_fsi_step(device):
+    model = build_single_particle_cloth_fsi(device)
+
+    boundary_model = FSIBoundaryModel(
+        model,
+        spacing=2.0,
+        support_radius=0.5,
+        include_static=False,
+        include_dynamic=False,
+        include_triangles=True,
+        deformable_sample_thickness=0.2,
+        device=device,
+    )
+    fluid_solver = SolverIPBF(
+        model,
+        SolverIPBF.Config(
+            rest_density=1000.0,
+            smoothing_radius=0.5,
+            iterations=1,
+            relaxation=1.0,
+            damping_beta=0.0,
+            fluid_particle_start=0,
+            fluid_particle_count=1,
+            fsi_triangle_contact_enabled=True,
+            fsi_triangle_contact_margin=0.0,
+            fsi_triangle_contact_relaxation=1.0,
+        ),
+        boundary_model=boundary_model,
+    )
+    solid_solver = SolverVBD(
+        model,
+        iterations=1,
+        particle_start=1,
+        particle_count=3,
+        fsi_boundary_model=boundary_model,
+    )
+    solver = SolverFSI(
+        model,
+        fluid_solver,
+        solid_solver,
+        boundary_model,
+        SolverFSI.Config(
+            mode=SolverFSI.Config.CouplingMode.INTERLINKED,
+            coupling_iterations=1,
+        ),
+    )
+
+    state_0 = model.state()
+    state_1 = model.state()
+    state_0.clear_forces()
+    dt = 0.05
+    solver.step(state_0, state_1, control=None, contacts=None, dt=dt)
+
+    return state_0, state_1, solver, boundary_model, dt
+
+
 def test_solver_fsi_loose_coupling_moves_body_from_ipbf_reaction(test, device):
     state_0, state_1, solver, boundary_model, contacts, body, dt = run_loose_fsi_step(device)
 
@@ -259,6 +315,21 @@ def test_solver_fsi_interlinked_coupling_moves_body_from_ipbf_reaction(test, dev
     test.assertGreater(float(state_1.ipbf.density.numpy()[0]), 0.0)
 
 
+def test_solver_fsi_interlinked_coupling_preserves_fluid_subset_state_for_cloth(test, device):
+    state_0, state_1, solver, boundary_model, _dt = run_interlinked_cloth_fsi_step(device)
+
+    initial_q = state_0.particle_q.numpy()
+    final_q = state_1.particle_q.numpy()
+    fluid_q = solver._fluid_state.particle_q.numpy()
+    vertex_force = boundary_model.vertex_force.numpy()
+
+    test.assertGreater(float(final_q[0, 2] - initial_q[0, 2]), 0.0)
+    np.testing.assert_allclose(final_q[0], fluid_q[0], rtol=1.0e-6, atol=1.0e-6)
+    test.assertGreaterEqual(int(solver.fluid_solver._triangle_contact_pair_count.numpy()[0]), 1)
+    test.assertTrue(np.all(vertex_force[1:, 2] < 0.0))
+    test.assertTrue(np.all(final_q[1:, 2] <= initial_q[1:, 2]))
+
+
 devices = get_test_devices()
 
 
@@ -284,6 +355,13 @@ add_function_test(
     TestSolverFSI,
     "test_solver_fsi_interlinked_coupling_moves_body_from_ipbf_reaction",
     test_solver_fsi_interlinked_coupling_moves_body_from_ipbf_reaction,
+    devices=devices,
+    check_output=False,
+)
+add_function_test(
+    TestSolverFSI,
+    "test_solver_fsi_interlinked_coupling_preserves_fluid_subset_state_for_cloth",
+    test_solver_fsi_interlinked_coupling_preserves_fluid_subset_state_for_cloth,
     devices=devices,
     check_output=False,
 )

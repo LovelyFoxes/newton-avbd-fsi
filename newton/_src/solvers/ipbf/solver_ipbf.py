@@ -1088,8 +1088,13 @@ class SolverIPBF(SolverBase):
                 apply_particle_triangle_contact_deltas,
                 dim=model.particle_count,
                 inputs=[
+                    self._ipbf_particle_flags,
                     self._triangle_contact_particle_delta,
                     self._triangle_contact_vertex_delta,
+                    # In subset / FSI mode the deformable boundary is owned by
+                    # the solid solver, so IPBF should only move the fluid side
+                    # and leave cloth vertex motion to VBD.
+                    int(not self._uses_particle_subset),
                     state.particle_q,
                 ],
                 device=model.device,

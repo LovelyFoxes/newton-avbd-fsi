@@ -48,6 +48,7 @@ from .particle_vbd_kernels import (
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
     # Solver kernels (particle VBD)
+    add_fsi_vertex_deltas_to_particle_inertia,
     add_fsi_vertex_forces_to_particle_accumulators,
     # Planar DAT (Divide and Truncate) kernels
     apply_planar_truncation_parallel_by_collision,
@@ -308,6 +309,7 @@ class SolverVBD(SolverBase):
         self._uses_particle_subset = self.particle_start != 0 or self.particle_count != self.model.particle_count
         self.fsi_boundary_model = None
         self.fsi_force_relaxation = float(fsi_force_relaxation)
+        self._fsi_vertex_delta_generation_consumed = -1
         self.set_fsi_boundary_model(fsi_boundary_model)
 
         # Initialize particle system
@@ -393,13 +395,13 @@ class SolverVBD(SolverBase):
         )
 
     def set_fsi_boundary_model(self, fsi_boundary_model: FSIBoundaryModel | None) -> None:
-        """Set the optional FSI boundary model used as a solid force source.
+        """Set the optional FSI boundary model used as a solid reaction source.
 
         Args:
             fsi_boundary_model: Boundary model whose body force [N] and body
                 torque [N*m] buffers are injected into AVBD rigid iterations,
-                and whose vertex force [N] buffer is injected into VBD
-                particle iterations, or ``None`` to disable FSI force injection.
+                and whose cloth-side vertex reaction buffers are injected into
+                VBD particle iterations, or ``None`` to disable FSI coupling.
         """
         if fsi_boundary_model is not None:
             if getattr(fsi_boundary_model, "model", self.model) is not self.model:
@@ -411,8 +413,13 @@ class SolverVBD(SolverBase):
                 or getattr(fsi_boundary_model, "body_torque", None) is None
             ):
                 raise ValueError("SolverVBD FSI boundary model must provide body_force and body_torque buffers.")
-            if self.integrate_particles and getattr(fsi_boundary_model, "vertex_force", None) is None:
-                raise ValueError("SolverVBD FSI boundary model must provide a vertex_force buffer.")
+            if self.integrate_particles and (
+                getattr(fsi_boundary_model, "vertex_force", None) is None
+                or getattr(fsi_boundary_model, "vertex_contact_delta", None) is None
+            ):
+                raise ValueError(
+                    "SolverVBD FSI boundary model must provide vertex_force and vertex_contact_delta buffers."
+                )
 
         self.fsi_boundary_model = fsi_boundary_model
 
@@ -1347,6 +1354,8 @@ class SolverVBD(SolverBase):
 
     def _begin_step(self, state_in: State, state_out: State, contacts: Contacts | None, dt: float) -> None:
         """Prepare VBD/AVBD state for one timestep."""
+        self._fsi_vertex_delta_generation_consumed = -1
+
         # Use and reset the rigid history update flag (warmstarts).
         update_rigid_history = self.update_rigid_history
         self.update_rigid_history = True
@@ -1710,19 +1719,37 @@ class SolverVBD(SolverBase):
         self.particle_hessians.zero_()
 
         if self.fsi_boundary_model is not None and self.fsi_force_relaxation != 0.0:
-            wp.launch(
-                kernel=add_fsi_vertex_forces_to_particle_accumulators,
-                dim=model.particle_count,
-                inputs=[
-                    self.fsi_boundary_model.vertex_force,
-                    self.fsi_force_relaxation,
-                    self._vbd_particle_flags,
-                ],
-                outputs=[
-                    self.particle_forces,
-                ],
-                device=self.device,
-            )
+            current_generation = int(getattr(self.fsi_boundary_model, "vertex_contact_delta_generation", -1))
+            has_vertex_delta = getattr(self.fsi_boundary_model, "vertex_contact_delta", None) is not None
+            if has_vertex_delta and current_generation != self._fsi_vertex_delta_generation_consumed:
+                wp.launch(
+                    kernel=add_fsi_vertex_deltas_to_particle_inertia,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.fsi_boundary_model.vertex_contact_delta,
+                        self.fsi_force_relaxation,
+                        self._vbd_particle_flags,
+                    ],
+                    outputs=[
+                        self.inertia,
+                    ],
+                    device=self.device,
+                )
+                self._fsi_vertex_delta_generation_consumed = current_generation
+            elif not has_vertex_delta and getattr(self.fsi_boundary_model, "vertex_force", None) is not None:
+                wp.launch(
+                    kernel=add_fsi_vertex_forces_to_particle_accumulators,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.fsi_boundary_model.vertex_force,
+                        self.fsi_force_relaxation,
+                        self._vbd_particle_flags,
+                    ],
+                    outputs=[
+                        self.particle_forces,
+                    ],
+                    device=self.device,
+                )
 
         # Iterate over color groups
         for color in range(len(self.model.particle_color_groups)):
