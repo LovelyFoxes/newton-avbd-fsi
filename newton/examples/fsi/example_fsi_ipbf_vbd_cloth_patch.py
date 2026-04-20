@@ -66,7 +66,10 @@ class Example:
                 "fluid_radius": 0.012,
                 "fluid_mass": 0.018,
                 "fluid_center": wp.vec3(0.060, 0.170, 0.0),
-                "fluid_velocity": wp.vec3(1.0, 0.0, 0.0),
+                # Use a controlled verification setup for test mode so the
+                # interlinked cloth demo exercises sustained contact without
+                # immediately driving the free curtain into a long-horizon blow-up.
+                "fluid_velocity": wp.vec3(0.55, 0.0, 0.0),
                 "cloth_dim_x": 4,
                 "cloth_dim_y": 4,
                 "cloth_cell": 0.050,
@@ -75,11 +78,11 @@ class Example:
                 "cloth_x": 0.140,
                 "cloth_center_y": 0.170,
                 "cloth_center_z": 0.0,
-                "cloth_tri_ke": 55.0,
-                "cloth_tri_ka": 55.0,
-                "cloth_tri_kd": 0.15,
-                "cloth_edge_ke": 6.0,
-                "cloth_edge_kd": 0.04,
+                "cloth_tri_ke": 110.0,
+                "cloth_tri_ka": 110.0,
+                "cloth_tri_kd": 0.30,
+                "cloth_edge_ke": 12.0,
+                "cloth_edge_kd": 0.07,
                 "smoothing_radius": 0.075,
                 "rest_density": 1000.0,
                 "ipbf_iterations": 2,
