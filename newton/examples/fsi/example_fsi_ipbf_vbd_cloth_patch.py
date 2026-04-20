@@ -54,11 +54,22 @@ class Example:
             default=3,
             help="Number of outer fluid-solid feedback passes used only in interlinked mode.",
         )
+        parser.add_argument(
+            "--disable-triangle-contact",
+            action="store_true",
+            help="Disable IPBF particle-triangle contact against the VBD cloth.",
+        )
+        parser.add_argument(
+            "--triangle-contact-relaxation",
+            type=float,
+            default=None,
+            help="Override the IPBF cloth triangle-contact relaxation.",
+        )
         return parser
 
     def _get_scene_config(self) -> dict[str, float | int | wp.vec3]:
         if bool(getattr(self.args, "test", False)):
-            return {
+            config = {
                 "fluid_dim_x": 4,
                 "fluid_dim_y": 3,
                 "fluid_dim_z": 3,
@@ -90,38 +101,51 @@ class Example:
                 "ipbf_iterations": 6,
                 "vbd_iterations": 6,
                 "velocity_damping": 0.997,
+                "triangle_contact_enabled": True,
+                "triangle_contact_relaxation": 1.0,
+            }
+        else:
+            config = {
+                "fluid_dim_x": 9,
+                "fluid_dim_y": 6,
+                "fluid_dim_z": 5,
+                "fluid_cell": 0.025,
+                "fluid_radius": 0.010,
+                "fluid_mass": 0.011,
+                "fluid_center": wp.vec3(-0.040, 0.200, 0.0),
+                "fluid_velocity": wp.vec3(0.9, 0.0, 0.0),
+                "cloth_dim_x": 10,
+                "cloth_dim_y": 8,
+                "cloth_cell": 0.045,
+                "cloth_particle_mass": 0.030,
+                "cloth_particle_radius": 0.009,
+                "cloth_x": 0.160,
+                "cloth_center_y": 0.200,
+                "cloth_center_z": 0.0,
+                "cloth_tri_ke": 70.0,
+                "cloth_tri_ka": 70.0,
+                "cloth_tri_kd": 0.25,
+                "cloth_edge_ke": 8.0,
+                "cloth_edge_kd": 0.05,
+                "cloth_self_contact_radius": 0.018,
+                "cloth_self_contact_margin": 0.032,
+                "smoothing_radius": 0.080,
+                "rest_density": 1000.0,
+                "ipbf_iterations": 6,
+                "vbd_iterations": 6,
+                "velocity_damping": 0.998,
+                "triangle_contact_enabled": True,
+                "triangle_contact_relaxation": 1.0,
             }
 
-        return {
-            "fluid_dim_x": 9,
-            "fluid_dim_y": 6,
-            "fluid_dim_z": 5,
-            "fluid_cell": 0.025,
-            "fluid_radius": 0.010,
-            "fluid_mass": 0.011,
-            "fluid_center": wp.vec3(-0.040, 0.200, 0.0),
-            "fluid_velocity": wp.vec3(0.9, 0.0, 0.0),
-            "cloth_dim_x": 10,
-            "cloth_dim_y": 8,
-            "cloth_cell": 0.045,
-            "cloth_particle_mass": 0.030,
-            "cloth_particle_radius": 0.009,
-            "cloth_x": 0.160,
-            "cloth_center_y": 0.200,
-            "cloth_center_z": 0.0,
-            "cloth_tri_ke": 70.0,
-            "cloth_tri_ka": 70.0,
-            "cloth_tri_kd": 0.25,
-            "cloth_edge_ke": 8.0,
-            "cloth_edge_kd": 0.05,
-            "cloth_self_contact_radius": 0.018,
-            "cloth_self_contact_margin": 0.032,
-            "smoothing_radius": 0.080,
-            "rest_density": 1000.0,
-            "ipbf_iterations": 6,
-            "vbd_iterations": 6,
-            "velocity_damping": 0.998,
-        }
+        if bool(getattr(self.args, "disable_triangle_contact", False)):
+            config["triangle_contact_enabled"] = False
+
+        triangle_contact_relaxation = getattr(self.args, "triangle_contact_relaxation", None)
+        if triangle_contact_relaxation is not None:
+            config["triangle_contact_relaxation"] = float(triangle_contact_relaxation)
+
+        return config
 
     def __init__(self, viewer, args=None):
         self.fps = 60
@@ -251,9 +275,9 @@ class Example:
                 viscosity_coefficient=0.0004,
                 xsph_coefficient=0.002,
                 fsi_pressure_reaction_relaxation=0.15,
-                fsi_triangle_contact_enabled=True,
+                fsi_triangle_contact_enabled=bool(self.config["triangle_contact_enabled"]),
                 fsi_triangle_contact_margin=0.0,
-                fsi_triangle_contact_relaxation=1.0,
+                fsi_triangle_contact_relaxation=float(self.config["triangle_contact_relaxation"]),
                 fluid_particle_start=self.fluid_particle_start,
                 fluid_particle_count=self.fluid_particle_count,
             ),
