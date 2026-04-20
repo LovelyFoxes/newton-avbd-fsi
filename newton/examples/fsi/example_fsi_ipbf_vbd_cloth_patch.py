@@ -255,6 +255,7 @@ class Example:
             float(self.config["cloth_center_z"]) + 0.5 * cloth_width,
         )
         cloth_rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), wp.pi * 0.5)
+        self.cloth_triangle_start = builder.tri_count
         builder.add_cloth_grid(
             pos=cloth_pos,
             rot=cloth_rot,
@@ -273,13 +274,29 @@ class Example:
             particle_radius=float(self.config["cloth_particle_radius"]),
         )
         self.cloth_particle_count = (cloth_dim_x + 1) * (cloth_dim_y + 1)
+        self.cloth_triangle_count = builder.tri_count - self.cloth_triangle_start
 
         builder.color(include_bending=True)
 
         self.model = builder.finalize()
         self.model.set_gravity((0.0, 0.0, 0.0))
 
+    def _build_cloth_self_contact_vertex_filtering_map(self) -> dict[int, list[int]] | None:
+        """Exclude fluid particles from VBD cloth self-contact triangle queries."""
+        if self.cloth_triangle_count <= 0 or self.fluid_particle_count <= 0:
+            return None
+
+        cloth_triangle_ids = list(range(self.cloth_triangle_start, self.cloth_triangle_start + self.cloth_triangle_count))
+        return dict.fromkeys(
+            range(self.fluid_particle_start, self.fluid_particle_start + self.fluid_particle_count),
+            cloth_triangle_ids,
+        )
+
     def _build_solvers(self) -> None:
+        cloth_self_contact_vertex_filtering_map = None
+        if bool(self.config["cloth_self_contact_enabled"]):
+            cloth_self_contact_vertex_filtering_map = self._build_cloth_self_contact_vertex_filtering_map()
+
         self.boundary_model = FSIBoundaryModel(
             self.model,
             spacing=float(self.config["cloth_cell"]),
@@ -316,6 +333,7 @@ class Example:
             particle_enable_self_contact=bool(self.config["cloth_self_contact_enabled"]),
             particle_self_contact_radius=float(self.config["cloth_self_contact_radius"]),
             particle_self_contact_margin=float(self.config["cloth_self_contact_margin"]),
+            particle_external_vertex_contact_filtering_map=cloth_self_contact_vertex_filtering_map,
             fsi_boundary_model=self.boundary_model,
         )
 
