@@ -58,8 +58,8 @@ class Example:
         parser.add_argument(
             "--coupling-iterations",
             type=int,
-            default=3,
-            help="Number of IPBF/AVBD iteration pairs used in the drop-box pool scene.",
+            default=2,
+            help="Number of outer IPBF/AVBD feedback passes used in the drop-box pool scene.",
         )
         parser.add_argument(
             "--ipbf-iterations",
@@ -220,7 +220,7 @@ class Example:
                 "xsph_coefficient": 0.004,
                 "xsph_boundary_coefficient": 0.0,
                 "boundary_velocity_damping": 1.0,
-                "rigid_iterations": 2,
+                "rigid_iterations": 6,
                 "boundary_spacing": 0.04,
                 "static_boundary_weight": 1.0,
                 "include_static_boundary_samples": False,
@@ -393,7 +393,7 @@ class Example:
                     if getattr(self.args, "coupling_mode", "interlinked") == "interlinked"
                     else SolverFSI.Config.CouplingMode.LOOSE
                 ),
-                coupling_iterations=max(1, int(getattr(self.args, "coupling_iterations", 3))),
+                coupling_iterations=max(1, int(getattr(self.args, "coupling_iterations", 2))),
             ),
         )
 

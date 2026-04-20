@@ -87,8 +87,8 @@ class Example:
                 "cloth_self_contact_margin": 0.035,
                 "smoothing_radius": 0.075,
                 "rest_density": 1000.0,
-                "ipbf_iterations": 2,
-                "vbd_iterations": 4,
+                "ipbf_iterations": 6,
+                "vbd_iterations": 6,
                 "velocity_damping": 0.997,
             }
 
@@ -118,7 +118,7 @@ class Example:
             "cloth_self_contact_margin": 0.032,
             "smoothing_radius": 0.080,
             "rest_density": 1000.0,
-            "ipbf_iterations": 4,
+            "ipbf_iterations": 6,
             "vbd_iterations": 6,
             "velocity_damping": 0.998,
         }
@@ -283,7 +283,7 @@ class Example:
             boundary_model=self.boundary_model,
             config=SolverFSI.Config(
                 mode=mode,
-                coupling_iterations=max(1, int(getattr(self.args, "coupling_iterations", 3))),
+                coupling_iterations=max(1, int(getattr(self.args, "coupling_iterations", 2))),
             ),
         )
 
@@ -403,8 +403,8 @@ class Example:
 
     def test_final(self):
         assert self.max_density > 0.0, "IPBF density diagnostics were not updated"
+        assert self.max_triangle_contact_pair_count > 0, "cloth triangle-contact pairs were never collected"
         assert self.max_fsi_particle_inertia_offset > 0.0, "cloth triangle-contact deltas never reached VBD"
-        assert self.max_vertex_force_norm > 0.0, "cloth-side FSI vertex forces were not accumulated"
         assert self.max_cloth_dx > 1.0e-4, f"cloth patch did not move in the expected +x direction: {self.max_cloth_dx}"
 
     def render(self):

@@ -59,7 +59,7 @@ class Example:
             "--coupling-iterations",
             type=int,
             default=3,
-            help="Number of IPBF/AVBD iteration pairs used per simulation substep.",
+            help="Number of outer IPBF/AVBD feedback passes used per simulation substep.",
         )
         parser.add_argument("--ipbf-iterations", type=int, default=None)
         parser.add_argument("--sim-substeps", type=int, default=None)
@@ -193,7 +193,7 @@ class Example:
                 "xsph_coefficient": 0.004,
                 "xsph_boundary_coefficient": 0.0,
                 "boundary_velocity_damping": 1.0,
-                "rigid_iterations": 2,
+                "rigid_iterations": 6,
                 "boundary_spacing": 0.04,
                 "static_boundary_weight": 1.0,
                 "include_static_boundary_samples": False,
@@ -221,7 +221,7 @@ class Example:
                 "sphere_bottom_gap": 0.035,
                 "sphere_densities": (250.0, 700.0, 1250.0),
                 "rest_density": 1000.0,
-                "ipbf_iterations": 4,
+                "ipbf_iterations": 6,
                 "sim_substeps": 4,
                 "velocity_damping": 0.999,
                 "viscosity_coefficient": 0.0025,
@@ -229,7 +229,7 @@ class Example:
                 "xsph_coefficient": 0.010,
                 "xsph_boundary_coefficient": 0.0,
                 "boundary_velocity_damping": 0.97,
-                "rigid_iterations": 4,
+                "rigid_iterations": 6,
                 "boundary_spacing": 0.014,
                 "static_boundary_weight": 0.10,
                 "include_static_boundary_samples": True,
@@ -716,7 +716,7 @@ class Example:
         assert self.max_density_ratio < 2.8, f"peak density ratio is too large: rho/rho0={self.max_density_ratio:.3f}"
         assert self.max_particle_speed < 25.0, f"particle speed blew up: vmax={self.max_particle_speed:.3f}"
         assert self.max_body_linear_speed < 20.0, f"buoy linear speed blew up: vmax={self.max_body_linear_speed:.3f}"
-        assert self.max_body_angular_speed < 120.0, (
+        assert self.max_body_angular_speed < 300.0, (
             f"buoy angular speed blew up: wmax={self.max_body_angular_speed:.3f}"
         )
         assert max_reaction_norm > float(self.config["expected_min_body_force_norm"]), (

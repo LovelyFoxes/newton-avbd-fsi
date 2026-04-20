@@ -50,8 +50,8 @@ class Example:
         parser.add_argument(
             "--coupling-iterations",
             type=int,
-            default=3,
-            help="Number of IPBF/AVBD iteration pairs for interlinked mode.",
+            default=2,
+            help="Number of outer IPBF/AVBD feedback passes for interlinked mode.",
         )
         parser.add_argument(
             "--pressure-reaction-relaxation",
@@ -80,7 +80,7 @@ class Example:
                 "radius": 0.011,
                 "smoothing_radius": 0.12,
                 "rest_density": 1000.0,
-                "ipbf_iterations": 3,
+                "ipbf_iterations": 2,
                 "ipbf_relaxation": 0.05,
                 "viscosity": 0.0,
                 "xsph": 0.0,
@@ -88,6 +88,7 @@ class Example:
                 "particle_velocity": wp.vec3(0.0, 0.0, 0.0),
                 "piston_center": wp.vec3(0.075, 0.16, 0.0),
                 "piston_mass": 0.9,
+                "rigid_iterations": 2,
                 "boundary_spacing": 0.05,
                 "pressure_reaction_relaxation": 0.08 if pressure_relaxation is None else float(pressure_relaxation),
             }
@@ -109,6 +110,7 @@ class Example:
             "particle_velocity": wp.vec3(0.04, 0.0, 0.0),
             "piston_center": wp.vec3(0.075, 0.18, 0.0),
             "piston_mass": 0.05,
+            "rigid_iterations": 4,
             "boundary_spacing": 0.05,
             "pressure_reaction_relaxation": 5.0 if pressure_relaxation is None else float(pressure_relaxation),
         }
@@ -216,7 +218,7 @@ class Example:
         )
         self.solid_solver = SolverVBD(
             self.model,
-            iterations=1,
+            iterations=int(self.config["rigid_iterations"]),
             integrate_particles=False,
             fsi_boundary_model=self.boundary_model,
         )
@@ -234,7 +236,7 @@ class Example:
             boundary_model=self.boundary_model,
             config=SolverFSI.Config(
                 mode=mode,
-                coupling_iterations=max(1, int(getattr(self.args, "coupling_iterations", 3))),
+                coupling_iterations=max(1, int(getattr(self.args, "coupling_iterations", 2))),
             ),
         )
 
