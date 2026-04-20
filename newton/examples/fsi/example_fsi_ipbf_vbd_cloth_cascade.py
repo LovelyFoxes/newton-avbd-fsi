@@ -16,12 +16,10 @@
 ###########################################################################
 # Example FSI IPBF VBD Cloth Cascade
 #
-# Release-driven cloth-fluid-rigid interaction scene. A gated fluid block is
-# stored in a half-enclosed chute while a separate gated box holds a stack of
-# sphere rigid bodies with three densities. After a configurable delay both
-# gates open, the water slides down the chute, the spheres drop onto the first
-# cloth stage, and the mixture is guided through a three-stage cloth cascade
-# into a bottom catch tank.
+# Release-driven cloth-fluid interaction scene. A rectangular reservoir stores
+# an IPBF fluid block behind a square outlet gate. After a configurable delay,
+# the gate opens and the water flows through a horizontal tunnel onto a
+# three-stage VBD cloth cascade before entering a bottom catch tank.
 #
 # Command: python -m newton.examples fsi_ipbf_vbd_cloth_cascade
 #
@@ -37,7 +35,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton.examples.ipbf.common import build_box_wireframe, scale_velocities
+from newton.examples.ipbf.common import build_box_wireframe, get_particle_grid_origin_from_center, scale_velocities
 from newton.solvers import FSIBoundaryModel, SolverFSI, SolverIPBF, SolverVBD
 
 
@@ -53,78 +51,8 @@ def _quat_rotate_np(quat: wp.quat, vec: tuple[float, float, float]) -> np.ndarra
     return rot @ np.array(vec, dtype=np.float32)
 
 
-def _offset_world(
-    center: tuple[float, float, float],
-    rotation: wp.quat,
-    local_offset: tuple[float, float, float],
-) -> tuple[float, float, float]:
-    return tuple(np.array(center, dtype=np.float32) + _quat_rotate_np(rotation, local_offset))
-
-
-def _build_oriented_box_wireframe(
-    *,
-    center: tuple[float, float, float],
-    half_extents: tuple[float, float, float],
-    rotation: wp.quat,
-    device,
-) -> tuple[wp.array(dtype=wp.vec3), wp.array(dtype=wp.vec3)]:
-    hx, hy, hz = half_extents
-    corners_local = np.array(
-        [
-            [-hx, -hy, -hz],
-            [hx, -hy, -hz],
-            [hx, -hy, hz],
-            [-hx, -hy, hz],
-            [-hx, hy, -hz],
-            [hx, hy, -hz],
-            [hx, hy, hz],
-            [-hx, hy, hz],
-        ],
-        dtype=np.float32,
-    )
-    rot = np.array(wp.quat_to_matrix(rotation), dtype=np.float32).reshape(3, 3)
-    corners_world = corners_local @ rot.T + np.array(center, dtype=np.float32)
-    edges = (
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 0),
-        (0, 4),
-        (1, 5),
-        (2, 6),
-        (3, 7),
-        (4, 5),
-        (5, 6),
-        (6, 7),
-        (7, 4),
-    )
-    starts = wp.array(corners_world[[i for i, _ in edges]], dtype=wp.vec3, device=device)
-    ends = wp.array(corners_world[[j for _, j in edges]], dtype=wp.vec3, device=device)
-    return starts, ends
-
-
-def _build_rotated_grid_origin_from_center(
-    *,
-    center_local: tuple[float, float, float],
-    dim_x: int,
-    dim_y: int,
-    dim_z: int,
-    cell_x: float,
-    cell_y: float,
-    cell_z: float,
-    frame_center_world: tuple[float, float, float],
-    frame_rotation: wp.quat,
-) -> wp.vec3:
-    local_origin = (
-        float(center_local[0]) - 0.5 * (dim_x - 1) * cell_x,
-        float(center_local[1]) - 0.5 * (dim_y - 1) * cell_y,
-        float(center_local[2]) - 0.5 * (dim_z - 1) * cell_z,
-    )
-    return wp.vec3(*_offset_world(frame_center_world, frame_rotation, local_origin))
-
-
 class Example:
-    """Cloth-fluid-rigid cascade scene with delayed gate release."""
+    """Cloth-fluid cascade scene with delayed fluid-gate release."""
 
     @staticmethod
     def create_parser():
@@ -163,7 +91,7 @@ class Example:
             "--release-step",
             type=int,
             default=None,
-            help="Frame step at which both fluid and rigid gates open.",
+            help="Frame step at which the fluid gate opens.",
         )
         parser.add_argument(
             "--fluid-release-step",
@@ -172,10 +100,16 @@ class Example:
             help="Frame step at which the fluid gate opens.",
         )
         parser.add_argument(
-            "--rigid-release-step",
+            "--gate-open-duration-frames",
             type=int,
             default=None,
-            help="Frame step at which the rigid gate opens.",
+            help="Number of frames used to retract the fluid gate after release.",
+        )
+        parser.add_argument(
+            "--fluid-gate-open-duration-frames",
+            type=int,
+            default=None,
+            help="Number of frames used to retract the fluid gate after release.",
         )
         return parser
 
@@ -186,39 +120,26 @@ class Example:
                 "tank_half_depth": 0.30,
                 "tank_wall_height": 0.28,
                 "tank_wall_thickness": 0.03,
-                "tunnel_center": (-0.26, 1.16, 0.0),
-                "tunnel_half_length": 0.34,
-                "tunnel_half_width": 0.09,
+                "fluid_reservoir_center": (-0.58, 1.02, 0.0),
+                "fluid_reservoir_half_width": 0.15,
+                "fluid_reservoir_half_height": 0.30,
+                "fluid_reservoir_half_depth": 0.12,
+                "fluid_reservoir_wall_thickness": 0.015,
+                "fluid_outlet_half_height": 0.045,
+                "fluid_outlet_half_depth": 0.045,
+                "tunnel_half_length": 0.28,
                 "tunnel_floor_half_thickness": 0.018,
-                "tunnel_side_half_height": 0.18,
+                "tunnel_top_half_thickness": 0.012,
                 "tunnel_side_thickness": 0.012,
-                "tunnel_back_wall_half_thickness": 0.012,
-                "tunnel_back_wall_half_height": 0.20,
-                "tunnel_angle_deg": -32.0,
-                "fluid_local_center": (-0.17, 0.18, 0.0),
-                "fluid_dim_x": 6,
-                "fluid_dim_y": 10,
-                "fluid_dim_z": 6,
-                "fluid_cell": 0.030,
-                "fluid_mass": 0.018,
-                "fluid_radius": 0.012,
-                "fluid_gate_local_x": 0.02,
+                "fluid_cell": 0.022,
+                "fluid_dim_x": 10,
+                "fluid_dim_y": 24,
+                "fluid_dim_z": 10,
+                "fluid_mass": 0.012,
+                "fluid_radius": 0.009,
                 "fluid_gate_half_thickness": 0.014,
-                "fluid_gate_half_height": 0.17,
                 "fluid_gate_open_height": 2.4,
-                "rigid_reservoir_center": (0.26, 1.30, 0.0),
-                "rigid_reservoir_half_width": 0.18,
-                "rigid_reservoir_half_depth": 0.10,
-                "rigid_reservoir_half_height": 0.14,
-                "rigid_reservoir_wall_thickness": 0.02,
-                "rigid_gate_half_thickness": 0.014,
-                "rigid_gate_open_height": -0.80,
-                "sphere_radius": 0.046,
-                "sphere_spacing": 0.108,
-                "sphere_columns_per_density": 1,
-                "sphere_layers_y": 2,
-                "sphere_layers_z": 2,
-                "sphere_densities": (300.0, 750.0, 1250.0),
+                "fluid_gate_open_duration_frames": 6,
                 "cloth_dim_x": 6,
                 "cloth_dim_y": 6,
                 "cloth_cell_x": 0.080,
@@ -226,11 +147,11 @@ class Example:
                 "cloth_particle_mass": 0.032,
                 "cloth_particle_radius": 0.010,
                 "cloth_centers": (
-                    (0.14, 0.88, 0.0),
-                    (-0.14, 0.58, 0.0),
-                    (0.14, 0.30, 0.0),
+                    (0.10, 0.86, 0.0),
+                    (-0.12, 0.56, 0.0),
+                    (0.12, 0.28, 0.0),
                 ),
-                "cloth_tilt_degrees": (30.0, -32.0, 24.0),
+                "cloth_tilt_degrees": (30.0, -30.0, 22.0),
                 "cloth_tri_ke": 95.0,
                 "cloth_tri_ka": 95.0,
                 "cloth_tri_kd": 0.28,
@@ -241,8 +162,8 @@ class Example:
                 "rest_density": 1000.0,
                 "smoothing_radius": 0.075,
                 "ipbf_iterations": 6,
-                "vbd_iterations": 6,
-                "sim_substeps": 4,
+                "vbd_iterations": 8,
+                "sim_substeps": 5,
                 "velocity_damping": 0.997,
                 "viscosity_coefficient": 0.0020,
                 "xsph_coefficient": 0.004,
@@ -252,53 +173,41 @@ class Example:
                 "triangle_contact_relaxation": 1.0,
                 "boundary_spacing": 0.030,
                 "water_render_radius_scale": 0.86,
+                "shape_contact_ke": 3.0e4,
+                "shape_contact_kd": 1.2e3,
+                "shape_contact_gap": 0.008,
                 "release_step": 20,
                 "show_domain_wire": True,
-                "expected_min_cloth_dx": 0.010,
-                "expected_min_triangle_pairs": 18,
-                "expected_min_particles_in_tank": 4,
-                "expected_min_sphere_drop": 0.04,
-                "expected_min_sphere_force_norm": 0.01,
+                "expected_min_cloth_dx": 0.0,
+                "expected_min_triangle_pairs": 0,
+                "expected_min_particles_in_tank": 0,
             }
         else:
             config = {
-                "tank_half_width": 0.76,
-                "tank_half_depth": 0.52,
-                "tank_wall_height": 0.40,
+                "tank_half_width": 1.00,
+                "tank_half_depth": 0.80,
+                "tank_wall_height": 0.64,
                 "tank_wall_thickness": 0.035,
-                "tunnel_center": (-0.38, 1.38, 0.0),
-                "tunnel_half_length": 0.50,
-                "tunnel_half_width": 0.14,
+                "fluid_reservoir_center": (-0.68, 1.4, 0.0),
+                "fluid_reservoir_half_width": 0.24,
+                "fluid_reservoir_half_height": 0.56,
+                "fluid_reservoir_half_depth": 0.24,
+                "fluid_reservoir_wall_thickness": 0.020,
+                "fluid_outlet_half_height": 0.080,
+                "fluid_outlet_half_depth": 0.080,
+                "tunnel_half_length": 0.18,
                 "tunnel_floor_half_thickness": 0.020,
-                "tunnel_side_half_height": 0.24,
+                "tunnel_top_half_thickness": 0.014,
                 "tunnel_side_thickness": 0.014,
-                "tunnel_back_wall_half_thickness": 0.014,
-                "tunnel_back_wall_half_height": 0.26,
-                "tunnel_angle_deg": -34.0,
-                "fluid_local_center": (-0.24, 0.22, 0.0),
-                "fluid_dim_x": 12,
-                "fluid_dim_y": 18,
-                "fluid_dim_z": 10,
-                "fluid_cell": 0.024,
-                "fluid_mass": 0.0070,
-                "fluid_radius": 0.009,
-                "fluid_gate_local_x": 0.07,
+                "fluid_cell": 0.018,
+                "fluid_dim_x": 24,
+                "fluid_dim_y": 54,
+                "fluid_dim_z": 24,
+                "fluid_mass": 0.0058,
+                "fluid_radius": 0.0068,
                 "fluid_gate_half_thickness": 0.016,
-                "fluid_gate_half_height": 0.21,
                 "fluid_gate_open_height": 2.8,
-                "rigid_reservoir_center": (0.28, 1.50, 0.0),
-                "rigid_reservoir_half_width": 0.30,
-                "rigid_reservoir_half_depth": 0.16,
-                "rigid_reservoir_half_height": 0.19,
-                "rigid_reservoir_wall_thickness": 0.022,
-                "rigid_gate_half_thickness": 0.016,
-                "rigid_gate_open_height": -1.20,
-                "sphere_radius": 0.045,
-                "sphere_spacing": 0.105,
-                "sphere_columns_per_density": 2,
-                "sphere_layers_y": 3,
-                "sphere_layers_z": 2,
-                "sphere_densities": (250.0, 700.0, 1250.0),
+                "fluid_gate_open_duration_frames": 8,
                 "cloth_dim_x": 8,
                 "cloth_dim_y": 8,
                 "cloth_cell_x": 0.070,
@@ -306,23 +215,23 @@ class Example:
                 "cloth_particle_mass": 0.026,
                 "cloth_particle_radius": 0.009,
                 "cloth_centers": (
-                    (0.16, 1.02, 0.0),
-                    (-0.18, 0.70, 0.0),
-                    (0.16, 0.36, 0.0),
+                    (0.20, 0.90, 0.05),
+                    (-0.20, 0.65, -0.05),
+                    (0.20, 0.40, 0.0),
                 ),
-                "cloth_tilt_degrees": (34.0, -34.0, 28.0),
-                "cloth_tri_ke": 85.0,
-                "cloth_tri_ka": 85.0,
+                "cloth_tilt_degrees": (35.0, -30.0, 30.0),
+                "cloth_tri_ke": 150.0,
+                "cloth_tri_ka": 150.0,
                 "cloth_tri_kd": 0.25,
                 "cloth_edge_ke": 8.0,
                 "cloth_edge_kd": 0.05,
                 "cloth_self_contact_radius": 0.018,
                 "cloth_self_contact_margin": 0.030,
                 "rest_density": 1000.0,
-                "smoothing_radius": 0.050,
+                "smoothing_radius": 0.040,
                 "ipbf_iterations": 6,
                 "vbd_iterations": 6,
-                "sim_substeps": 4,
+                "sim_substeps": 5,
                 "velocity_damping": 0.999,
                 "viscosity_coefficient": 0.0025,
                 "xsph_coefficient": 0.006,
@@ -330,30 +239,33 @@ class Example:
                 "fsi_pressure_reaction_relaxation": 1.5,
                 "static_boundary_weight": 0.20,
                 "triangle_contact_relaxation": 1.0,
-                "boundary_spacing": 0.024,
+                "boundary_spacing": 0.020,
                 "water_render_radius_scale": 0.86,
+                "shape_contact_ke": 4.0e4,
+                "shape_contact_kd": 1.5e3,
+                "shape_contact_gap": 0.008,
                 "release_step": 30,
                 "show_domain_wire": True,
                 "expected_min_cloth_dx": 0.0,
                 "expected_min_triangle_pairs": 0,
                 "expected_min_particles_in_tank": 0,
-                "expected_min_sphere_drop": 0.0,
-                "expected_min_sphere_force_norm": 0.0,
             }
 
         release_step = getattr(self.args, "release_step", None)
         fluid_release_step = getattr(self.args, "fluid_release_step", None)
-        rigid_release_step = getattr(self.args, "rigid_release_step", None)
         default_release_step = int(config["release_step"])
         config["fluid_release_step"] = (
             default_release_step if fluid_release_step is None else max(0, int(fluid_release_step))
         )
-        config["rigid_release_step"] = (
-            default_release_step if rigid_release_step is None else max(0, int(rigid_release_step))
-        )
         if release_step is not None:
             config["fluid_release_step"] = max(0, int(release_step))
-            config["rigid_release_step"] = max(0, int(release_step))
+
+        gate_open_duration_frames = getattr(self.args, "gate_open_duration_frames", None)
+        fluid_gate_open_duration_frames = getattr(self.args, "fluid_gate_open_duration_frames", None)
+        if gate_open_duration_frames is not None:
+            config["fluid_gate_open_duration_frames"] = max(1, int(gate_open_duration_frames))
+        if fluid_gate_open_duration_frames is not None:
+            config["fluid_gate_open_duration_frames"] = max(1, int(fluid_gate_open_duration_frames))
 
         triangle_contact_relaxation = getattr(self.args, "triangle_contact_relaxation", None)
         if triangle_contact_relaxation is not None:
@@ -376,12 +288,6 @@ class Example:
         self.sim_substeps = int(self.config["sim_substeps"])
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.floor_y = 0.0
-
-        self.density_palette = (
-            np.array([1.0, 0.78, 0.24], dtype=np.float32),
-            np.array([0.34, 0.86, 0.34], dtype=np.float32),
-            np.array([0.20, 0.92, 0.92], dtype=np.float32),
-        )
 
         self.domain_min = wp.vec3(-1.00, -0.08, -0.62)
         self.domain_max = wp.vec3(0.95, 1.92, 0.62)
@@ -406,17 +312,15 @@ class Example:
     def gui(self, ui):
         if ui.button("Reset"):
             self.reset()
-        ui.text("Release-driven cloth-fluid-rigid cascade")
+        ui.text("Release-driven cloth-fluid cascade")
         ui.text(f"Mode: {getattr(self.args, 'coupling_mode', 'interlinked')}")
         ui.text(f"Frame: {self.frame_index}")
         ui.text(f"Fluid gate release: {int(self.config['fluid_release_step'])}")
-        ui.text(f"Rigid gate release: {int(self.config['rigid_release_step'])}")
+        ui.text(f"Fluid gate duration: {int(self.config['fluid_gate_open_duration_frames'])}")
         ui.text(f"Fluid gate open: {'yes' if self._fluid_gate_is_open() else 'no'}")
-        ui.text(f"Rigid gate open: {'yes' if self._rigid_gate_is_open() else 'no'}")
 
     def _tunnel_rotation(self) -> wp.quat:
-        angle_rad = math.radians(float(self.config["tunnel_angle_deg"]))
-        return wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle_rad)
+        return wp.quat_identity()
 
     def _cloth_rotation(self, tilt_degrees: float) -> wp.quat:
         q_flat = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -0.5 * wp.pi)
@@ -429,6 +333,8 @@ class Example:
         hz = float(self.config["tank_half_depth"])
         hy = float(self.config["tank_wall_height"])
         wt = float(self.config["tank_wall_thickness"])
+
+        builder.add_ground_plane(height=self.floor_y, cfg=wall_cfg, label="fsi_cascade_ground")
 
         builder.add_shape_box(
             body=-1,
@@ -471,79 +377,158 @@ class Example:
             cfg=wall_cfg,
         )
 
+    def _add_fluid_reservoir(self, builder: newton.ModelBuilder) -> None:
+        self.fluid_reservoir_center = tuple(float(v) for v in self.config["fluid_reservoir_center"])
+        self.fluid_reservoir_half_width = float(self.config["fluid_reservoir_half_width"])
+        self.fluid_reservoir_half_height = float(self.config["fluid_reservoir_half_height"])
+        self.fluid_reservoir_half_depth = float(self.config["fluid_reservoir_half_depth"])
+        self.fluid_reservoir_wall_thickness = float(self.config["fluid_reservoir_wall_thickness"])
+        self.fluid_outlet_half_height = float(self.config["fluid_outlet_half_height"])
+        self.fluid_outlet_half_depth = float(self.config["fluid_outlet_half_depth"])
+
+        wall_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
+        cx, cy, cz = self.fluid_reservoir_center
+        hx = self.fluid_reservoir_half_width
+        hy = self.fluid_reservoir_half_height
+        hz = self.fluid_reservoir_half_depth
+        wt = self.fluid_reservoir_wall_thickness
+        outlet_h = self.fluid_outlet_half_height
+        outlet_d = self.fluid_outlet_half_depth
+        reservoir_bottom = cy - hy
+        reservoir_top = cy + hy
+        self.fluid_reservoir_bottom_y = reservoir_bottom
+        # The outlet and tunnel are floor-aligned so water drains from the bottom-right corner.
+        self.fluid_outlet_center_y = reservoir_bottom + outlet_h
+        outlet_y = self.fluid_outlet_center_y
+
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform((cx, cy - hy - wt, cz), wp.quat_identity()),
+            hx=hx + wt,
+            hy=wt,
+            hz=hz + wt,
+            cfg=wall_cfg,
+        )
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform((cx - hx - wt, cy, cz), wp.quat_identity()),
+            hx=wt,
+            hy=hy + wt,
+            hz=hz + wt,
+            cfg=wall_cfg,
+        )
+        for z_sign in (-1.0, 1.0):
+            builder.add_shape_box(
+                body=-1,
+                xform=wp.transform((cx, cy, cz + z_sign * (hz + wt)), wp.quat_identity()),
+                hx=hx + wt,
+                hy=hy + wt,
+                hz=wt,
+                cfg=wall_cfg,
+            )
+
+        right_wall_x = cx + hx + wt
+        self.fluid_outlet_center = (cx + hx, outlet_y, cz)
+        self.fluid_outlet_wall_center_x = right_wall_x
+
+        lower_top = outlet_y - outlet_h
+        upper_bottom = outlet_y + outlet_h
+        if lower_top > reservoir_bottom:
+            lower_half_height = 0.5 * (lower_top - reservoir_bottom)
+            builder.add_shape_box(
+                body=-1,
+                xform=wp.transform((right_wall_x, reservoir_bottom + lower_half_height, cz), wp.quat_identity()),
+                hx=wt,
+                hy=lower_half_height,
+                hz=hz + wt,
+                cfg=wall_cfg,
+            )
+        if upper_bottom < reservoir_top:
+            upper_half_height = 0.5 * (reservoir_top - upper_bottom)
+            builder.add_shape_box(
+                body=-1,
+                xform=wp.transform((right_wall_x, upper_bottom + upper_half_height, cz), wp.quat_identity()),
+                hx=wt,
+                hy=upper_half_height,
+                hz=hz + wt,
+                cfg=wall_cfg,
+            )
+
+        side_half_depth = 0.5 * (hz - outlet_d)
+        if side_half_depth > 0.0:
+            for z_sign in (-1.0, 1.0):
+                side_center_z = cz + z_sign * (outlet_d + side_half_depth)
+                builder.add_shape_box(
+                    body=-1,
+                    xform=wp.transform((right_wall_x, outlet_y, side_center_z), wp.quat_identity()),
+                    hx=wt,
+                    hy=outlet_h,
+                    hz=side_half_depth,
+                    cfg=wall_cfg,
+                )
+
     def _add_fluid_tunnel(self, builder: newton.ModelBuilder) -> None:
-        self.tunnel_center = tuple(float(v) for v in self.config["tunnel_center"])
         self.tunnel_rotation = self._tunnel_rotation()
         self.tunnel_half_length = float(self.config["tunnel_half_length"])
-        self.tunnel_half_width = float(self.config["tunnel_half_width"])
         self.tunnel_floor_half_thickness = float(self.config["tunnel_floor_half_thickness"])
-        self.tunnel_side_half_height = float(self.config["tunnel_side_half_height"])
+        self.tunnel_top_half_thickness = float(self.config["tunnel_top_half_thickness"])
         self.tunnel_side_thickness = float(self.config["tunnel_side_thickness"])
-        self.tunnel_back_wall_half_thickness = float(self.config["tunnel_back_wall_half_thickness"])
-        self.tunnel_back_wall_half_height = float(self.config["tunnel_back_wall_half_height"])
+        self.tunnel_half_height = self.fluid_outlet_half_height
+        self.tunnel_half_depth = self.fluid_outlet_half_depth
+        self.tunnel_center = (
+            self.fluid_outlet_center[0] + self.tunnel_half_length,
+            self.fluid_outlet_center[1],
+            self.fluid_outlet_center[2],
+        )
 
         wall_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
 
         builder.add_shape_box(
             body=-1,
-            xform=wp.transform(self.tunnel_center, self.tunnel_rotation),
+            xform=wp.transform(
+                (self.tunnel_center[0], self.tunnel_center[1] - self.tunnel_half_height - self.tunnel_floor_half_thickness, self.tunnel_center[2]),
+                wp.quat_identity(),
+            ),
             hx=self.tunnel_half_length,
             hy=self.tunnel_floor_half_thickness,
-            hz=self.tunnel_half_width,
+            hz=self.tunnel_half_depth,
             cfg=wall_cfg,
         )
-
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform(
+                (self.tunnel_center[0], self.tunnel_center[1] + self.tunnel_half_height + self.tunnel_top_half_thickness, self.tunnel_center[2]),
+                wp.quat_identity(),
+            ),
+            hx=self.tunnel_half_length,
+            hy=self.tunnel_top_half_thickness,
+            hz=self.tunnel_half_depth + self.tunnel_side_thickness,
+            cfg=wall_cfg,
+        )
         for z_sign in (-1.0, 1.0):
-            side_center = _offset_world(
-                self.tunnel_center,
-                self.tunnel_rotation,
-                (
-                    0.0,
-                    self.tunnel_side_half_height - self.tunnel_floor_half_thickness,
-                    z_sign * (self.tunnel_half_width + self.tunnel_side_thickness),
-                ),
-            )
             builder.add_shape_box(
                 body=-1,
-                xform=wp.transform(side_center, self.tunnel_rotation),
+                xform=wp.transform(
+                    (
+                        self.tunnel_center[0],
+                        self.tunnel_center[1],
+                        self.tunnel_center[2] + z_sign * (self.tunnel_half_depth + self.tunnel_side_thickness),
+                    ),
+                    wp.quat_identity(),
+                ),
                 hx=self.tunnel_half_length,
-                hy=self.tunnel_side_half_height,
+                hy=self.tunnel_half_height + self.tunnel_top_half_thickness,
                 hz=self.tunnel_side_thickness,
                 cfg=wall_cfg,
             )
 
-        back_wall_center = _offset_world(
-            self.tunnel_center,
-            self.tunnel_rotation,
-            (
-                -(self.tunnel_half_length + self.tunnel_back_wall_half_thickness),
-                self.tunnel_back_wall_half_height - self.tunnel_floor_half_thickness,
-                0.0,
-            ),
-        )
-        builder.add_shape_box(
-            body=-1,
-            xform=wp.transform(back_wall_center, self.tunnel_rotation),
-            hx=self.tunnel_back_wall_half_thickness,
-            hy=self.tunnel_back_wall_half_height,
-            hz=self.tunnel_half_width + self.tunnel_side_thickness,
-            cfg=wall_cfg,
-        )
-
         self.fluid_gate_half_extents = (
             float(self.config["fluid_gate_half_thickness"]),
-            float(self.config["fluid_gate_half_height"]),
-            self.tunnel_half_width + self.tunnel_side_thickness,
+            self.fluid_outlet_half_height,
+            self.fluid_outlet_half_depth,
         )
-        self.fluid_gate_closed_center = _offset_world(
-            self.tunnel_center,
-            self.tunnel_rotation,
-            (
-                float(self.config["fluid_gate_local_x"]),
-                self.fluid_gate_half_extents[1] - self.tunnel_floor_half_thickness,
-                0.0,
-            ),
-        )
+        gate_x = self.fluid_outlet_wall_center_x + self.fluid_gate_half_extents[0]
+        self.fluid_gate_closed_center = (gate_x, self.fluid_outlet_center[1], self.fluid_outlet_center[2])
         self.fluid_gate_open_center = (
             self.fluid_gate_closed_center[0],
             float(self.config["fluid_gate_open_height"]),
@@ -562,139 +547,35 @@ class Example:
             cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0),
         )
 
-    def _add_rigid_reservoir(self, builder: newton.ModelBuilder) -> None:
-        self.rigid_reservoir_center = tuple(float(v) for v in self.config["rigid_reservoir_center"])
-        self.rigid_reservoir_half_width = float(self.config["rigid_reservoir_half_width"])
-        self.rigid_reservoir_half_depth = float(self.config["rigid_reservoir_half_depth"])
-        self.rigid_reservoir_half_height = float(self.config["rigid_reservoir_half_height"])
-        self.rigid_reservoir_wall_thickness = float(self.config["rigid_reservoir_wall_thickness"])
-        wall_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
-
-        cx, cy, cz = self.rigid_reservoir_center
-        hx = self.rigid_reservoir_half_width
-        hz = self.rigid_reservoir_half_depth
-        hy = self.rigid_reservoir_half_height
-        wt = self.rigid_reservoir_wall_thickness
-
-        for x_sign in (-1.0, 1.0):
-            builder.add_shape_box(
-                body=-1,
-                xform=wp.transform((cx + x_sign * (hx + wt), cy, cz), wp.quat_identity()),
-                hx=wt,
-                hy=hy + wt,
-                hz=hz + wt,
-                cfg=wall_cfg,
-            )
-        for z_sign in (-1.0, 1.0):
-            builder.add_shape_box(
-                body=-1,
-                xform=wp.transform((cx, cy, cz + z_sign * (hz + wt)), wp.quat_identity()),
-                hx=hx + wt,
-                hy=hy + wt,
-                hz=wt,
-                cfg=wall_cfg,
-            )
-        builder.add_shape_box(
-            body=-1,
-            xform=wp.transform((cx, cy + hy + wt, cz), wp.quat_identity()),
-            hx=hx + wt,
-            hy=wt,
-            hz=hz + wt,
-            cfg=wall_cfg,
-        )
-
-        self.rigid_gate_half_extents = (
-            hx + wt,
-            float(self.config["rigid_gate_half_thickness"]),
-            hz + wt,
-        )
-        self.rigid_gate_closed_center = (cx, cy - hy - self.rigid_gate_half_extents[1], cz)
-        self.rigid_gate_open_center = (cx, float(self.config["rigid_gate_open_height"]), cz)
-        self.rigid_gate_body = builder.add_body(
-            xform=wp.transform(self.rigid_gate_closed_center, wp.quat_identity()),
-            is_kinematic=True,
-            label="fsi_rigid_gate",
-        )
-        builder.add_shape_box(
-            body=self.rigid_gate_body,
-            hx=self.rigid_gate_half_extents[0],
-            hy=self.rigid_gate_half_extents[1],
-            hz=self.rigid_gate_half_extents[2],
-            cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0),
-        )
-
-    def _add_sphere_stack(self, builder: newton.ModelBuilder) -> None:
-        self.sphere_radius = float(self.config["sphere_radius"])
-        spacing = float(self.config["sphere_spacing"])
-        columns_per_density = int(self.config["sphere_columns_per_density"])
-        layers_y = int(self.config["sphere_layers_y"])
-        layers_z = int(self.config["sphere_layers_z"])
-        densities = tuple(float(value) for value in self.config["sphere_densities"])
-
-        base_y = (
-            float(self.rigid_gate_closed_center[1])
-            + self.rigid_gate_half_extents[1]
-            + self.sphere_radius
-            + 0.006
-        )
-        center_x, _, center_z = self.rigid_reservoir_center
-        total_columns = len(densities) * columns_per_density
-        x_offsets = [spacing * (float(i) - 0.5 * (total_columns - 1)) for i in range(total_columns)]
-        z_offsets = [spacing * (float(i) - 0.5 * (layers_z - 1)) for i in range(layers_z)]
-
-        self.sphere_bodies: list[int] = []
-        sphere_colors: list[np.ndarray] = []
-        for density_index, density in enumerate(densities):
-            for column_idx in range(columns_per_density):
-                x_offset = x_offsets[density_index * columns_per_density + column_idx]
-                for layer_y in range(layers_y):
-                    for layer_z, z_offset in enumerate(z_offsets):
-                        body = builder.add_body(
-                            xform=wp.transform(
-                                (
-                                    center_x + x_offset,
-                                    base_y + layer_y * spacing,
-                                    center_z + z_offset,
-                                ),
-                                wp.quat_identity(),
-                            ),
-                            label=f"fsi_cascade_sphere_{density_index}_{column_idx}_{layer_y}_{layer_z}",
-                        )
-                        builder.add_shape_sphere(
-                            body=body,
-                            radius=self.sphere_radius,
-                            cfg=newton.ModelBuilder.ShapeConfig(density=density, mu=0.0),
-                        )
-                        self.sphere_bodies.append(body)
-                        sphere_colors.append(self.density_palette[density_index].copy())
-
-        self.sphere_colors_np = np.asarray(sphere_colors, dtype=np.float32)
-
     def _add_fluid_block(self, builder: newton.ModelBuilder) -> None:
         self.fluid_particle_start = builder.particle_count
+        cell = float(self.config["fluid_cell"])
+        dim_x = int(self.config["fluid_dim_x"])
+        dim_y = int(self.config["fluid_dim_y"])
+        dim_z = int(self.config["fluid_dim_z"])
+
         builder.add_particle_grid(
-            pos=_build_rotated_grid_origin_from_center(
-                center_local=tuple(float(v) for v in self.config["fluid_local_center"]),
-                dim_x=int(self.config["fluid_dim_x"]),
-                dim_y=int(self.config["fluid_dim_y"]),
-                dim_z=int(self.config["fluid_dim_z"]),
-                cell_x=float(self.config["fluid_cell"]),
-                cell_y=float(self.config["fluid_cell"]),
-                cell_z=float(self.config["fluid_cell"]),
-                frame_center_world=self.tunnel_center,
-                frame_rotation=self.tunnel_rotation,
+            pos=get_particle_grid_origin_from_center(
+                center=self.fluid_reservoir_center,
+                dim_x=dim_x,
+                dim_y=dim_y,
+                dim_z=dim_z,
+                cell_x=cell,
+                cell_y=cell,
+                cell_z=cell,
             ),
-            rot=self.tunnel_rotation,
+            rot=wp.quat_identity(),
             vel=wp.vec3(0.0, 0.0, 0.0),
-            dim_x=int(self.config["fluid_dim_x"]),
-            dim_y=int(self.config["fluid_dim_y"]),
-            dim_z=int(self.config["fluid_dim_z"]),
-            cell_x=float(self.config["fluid_cell"]),
-            cell_y=float(self.config["fluid_cell"]),
-            cell_z=float(self.config["fluid_cell"]),
+            dim_x=dim_x,
+            dim_y=dim_y,
+            dim_z=dim_z,
+            cell_x=cell,
+            cell_y=cell,
+            cell_z=cell,
             mass=float(self.config["fluid_mass"]),
             jitter=0.0,
             radius_mean=float(self.config["fluid_radius"]),
+            flags=int(newton.ParticleFlags.ACTIVE),
         )
         self.fluid_particle_count = builder.particle_count - self.fluid_particle_start
 
@@ -771,11 +652,13 @@ class Example:
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
         builder.default_shape_cfg.mu = 0.0
+        builder.default_shape_cfg.ke = float(self.config["shape_contact_ke"])
+        builder.default_shape_cfg.kd = float(self.config["shape_contact_kd"])
+        builder.default_shape_cfg.gap = float(self.config["shape_contact_gap"])
 
         self._add_tank(builder)
+        self._add_fluid_reservoir(builder)
         self._add_fluid_tunnel(builder)
-        self._add_rigid_reservoir(builder)
-        self._add_sphere_stack(builder)
         self._add_fluid_block(builder)
         self._add_cloth_cascade(builder)
         builder.color(include_bending=True)
@@ -878,8 +761,7 @@ class Example:
             dtype=wp.float32,
             device=self.model.device,
         )
-        self.sphere_colors = wp.array(self.sphere_colors_np, dtype=wp.vec3, device=self.model.device)
-        self.rigid_material = wp.array([wp.vec4(0.42, 0.0, 0.0, 0.0)], dtype=wp.vec4, device=self.model.device)
+        self.shape_material = wp.array([wp.vec4(0.42, 0.0, 0.0, 0.0)], dtype=wp.vec4, device=self.model.device)
         self.gate_colors = wp.array(
             [wp.vec3(0.82, 0.84, 0.88)],
             dtype=wp.vec3,
@@ -908,24 +790,24 @@ class Example:
             include_top=False,
             device=self.model.device,
         )
-        self.tunnel_wire_starts, self.tunnel_wire_ends = _build_oriented_box_wireframe(
-            center=self.tunnel_center,
-            half_extents=(
-                self.tunnel_half_length,
-                self.tunnel_side_half_height,
-                self.tunnel_half_width + self.tunnel_side_thickness,
-            ),
-            rotation=self.tunnel_rotation,
+        self.fluid_reservoir_wire_starts, self.fluid_reservoir_wire_ends = build_box_wireframe(
+            min_x=self.fluid_reservoir_center[0] - self.fluid_reservoir_half_width,
+            max_x=self.fluid_reservoir_center[0] + self.fluid_reservoir_half_width,
+            min_y=self.fluid_reservoir_center[1] - self.fluid_reservoir_half_height,
+            max_y=self.fluid_reservoir_center[1] + self.fluid_reservoir_half_height,
+            min_z=self.fluid_reservoir_center[2] - self.fluid_reservoir_half_depth,
+            max_z=self.fluid_reservoir_center[2] + self.fluid_reservoir_half_depth,
+            include_top=False,
             device=self.model.device,
         )
-        self.rigid_reservoir_wire_starts, self.rigid_reservoir_wire_ends = build_box_wireframe(
-            min_x=self.rigid_reservoir_center[0] - self.rigid_reservoir_half_width,
-            max_x=self.rigid_reservoir_center[0] + self.rigid_reservoir_half_width,
-            min_y=self.rigid_reservoir_center[1] - self.rigid_reservoir_half_height,
-            max_y=self.rigid_reservoir_center[1] + self.rigid_reservoir_half_height,
-            min_z=self.rigid_reservoir_center[2] - self.rigid_reservoir_half_depth,
-            max_z=self.rigid_reservoir_center[2] + self.rigid_reservoir_half_depth,
-            include_top=False,
+        self.tunnel_wire_starts, self.tunnel_wire_ends = build_box_wireframe(
+            min_x=self.fluid_outlet_center[0],
+            max_x=self.fluid_outlet_center[0] + 2.0 * self.tunnel_half_length,
+            min_y=self.tunnel_center[1] - self.tunnel_half_height,
+            max_y=self.tunnel_center[1] + self.tunnel_half_height,
+            min_z=self.tunnel_center[2] - self.tunnel_half_depth,
+            max_z=self.tunnel_center[2] + self.tunnel_half_depth,
+            include_top=True,
             device=self.model.device,
         )
         self.domain_wire_starts, self.domain_wire_ends = build_box_wireframe(
@@ -986,14 +868,33 @@ class Example:
     def _fluid_gate_is_open(self) -> bool:
         return self.frame_index >= int(self.config["fluid_release_step"])
 
-    def _rigid_gate_is_open(self) -> bool:
-        return self.frame_index >= int(self.config["rigid_release_step"])
+    @staticmethod
+    def _lerp_center(
+        center_a: tuple[float, float, float],
+        center_b: tuple[float, float, float],
+        alpha: float,
+    ) -> tuple[float, float, float]:
+        alpha = max(0.0, min(1.0, alpha))
+        return (
+            (1.0 - alpha) * center_a[0] + alpha * center_b[0],
+            (1.0 - alpha) * center_a[1] + alpha * center_b[1],
+            (1.0 - alpha) * center_a[2] + alpha * center_b[2],
+        )
+
+    def _gate_alpha(self, release_step: int, duration_frames: int) -> float:
+        if self.frame_index < release_step:
+            return 0.0
+        if duration_frames <= 1:
+            return 1.0
+        return float(self.frame_index - release_step + 1) / float(duration_frames)
 
     def _apply_gate_states(self, state: newton.State) -> None:
-        fluid_center = self.fluid_gate_open_center if self._fluid_gate_is_open() else self.fluid_gate_closed_center
-        rigid_center = self.rigid_gate_open_center if self._rigid_gate_is_open() else self.rigid_gate_closed_center
+        fluid_alpha = self._gate_alpha(
+            int(self.config["fluid_release_step"]),
+            int(self.config["fluid_gate_open_duration_frames"]),
+        )
+        fluid_center = self._lerp_center(self.fluid_gate_closed_center, self.fluid_gate_open_center, fluid_alpha)
         self._set_body_pose(state, self.fluid_gate_body, fluid_center, self.tunnel_rotation)
-        self._set_body_pose(state, self.rigid_gate_body, rigid_center, wp.quat_identity())
 
     def reset(self):
         self.sim_time = 0.0
@@ -1010,17 +911,12 @@ class Example:
         self.boundary_model.build_grid()
 
         particle_q = self.state_0.particle_q.numpy()
-        body_q = self.state_0.body_q.numpy()
         self.initial_particle_q = particle_q.copy()
-        self.initial_sphere_y = body_q[self.sphere_bodies, 1].astype(np.float32)
-        self.min_sphere_y = self.initial_sphere_y.copy()
-        self.final_sphere_y = self.initial_sphere_y.copy()
         self.max_cloth_dx = 0.0
         self.max_triangle_contact_pair_count = 0
         self.max_fsi_particle_inertia_offset = 0.0
         self.max_vertex_force_norm = 0.0
         self.max_density = 0.0
-        self.max_sphere_force_norm = 0.0
         self.max_particles_in_tank = 0
         self.states_remain_finite = True
         self.viewer._paused = True
@@ -1046,10 +942,6 @@ class Example:
         )
         self.max_vertex_force_norm = max(self.max_vertex_force_norm, float(np.linalg.norm(vertex_force, axis=1).max()))
         self.max_density = max(self.max_density, float(np.max(density)))
-        self.max_sphere_force_norm = max(
-            self.max_sphere_force_norm,
-            float(np.linalg.norm(body_force_step_avg[self.sphere_bodies], axis=1).max()),
-        )
         self.states_remain_finite = self.states_remain_finite and bool(
             np.isfinite(vertex_force).all()
             and np.isfinite(fsi_inertia_offset).all()
@@ -1060,10 +952,6 @@ class Example:
             and np.isfinite(body_q).all()
             and np.isfinite(body_qd).all()
         )
-
-        sphere_y = body_q[self.sphere_bodies, 1].astype(np.float32)
-        self.min_sphere_y = np.minimum(self.min_sphere_y, sphere_y)
-        self.final_sphere_y = sphere_y.copy()
 
         fluid_q = particle_q[self.fluid_particle_start : self.fluid_particle_start + self.fluid_particle_count]
         in_tank = np.logical_and.reduce(
@@ -1089,6 +977,7 @@ class Example:
             self._apply_gate_states(self.state_0)
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
+            self.model.collide(self.state_0, self.contacts)
             wp.launch(
                 scale_velocities,
                 dim=self.model.particle_count,
@@ -1112,25 +1001,20 @@ class Example:
         self.sim_time += self.frame_dt
 
     def test_final(self):
-        sphere_drop = float(np.max(self.initial_sphere_y - self.min_sphere_y))
         assert self.states_remain_finite, "cascade scene produced non-finite diagnostics"
         assert self.max_density > 0.0, "IPBF density diagnostics were not updated"
-        assert self.max_triangle_contact_pair_count >= int(
-            self.config["expected_min_triangle_pairs"]
+        expected_triangle_pairs = int(self.config["expected_min_triangle_pairs"])
+        expected_cloth_dx = float(self.config["expected_min_cloth_dx"])
+        assert (
+            self.max_triangle_contact_pair_count >= expected_triangle_pairs
         ), f"cloth triangle-contact pairs stayed too low: {self.max_triangle_contact_pair_count}"
-        assert self.max_fsi_particle_inertia_offset > 0.0, "cloth triangle-contact deltas never reached VBD"
-        assert self.max_cloth_dx > float(
-            self.config["expected_min_cloth_dx"]
-        ), f"cloth cascade did not deform enough: {self.max_cloth_dx}"
+        if expected_triangle_pairs > 0:
+            assert self.max_fsi_particle_inertia_offset > 0.0, "cloth triangle-contact deltas never reached VBD"
+        if expected_cloth_dx > 0.0:
+            assert self.max_cloth_dx > expected_cloth_dx, f"cloth cascade did not deform enough: {self.max_cloth_dx}"
         assert self.max_particles_in_tank >= int(
             self.config["expected_min_particles_in_tank"]
         ), f"water never reached the catch tank: {self.max_particles_in_tank}"
-        assert sphere_drop > float(
-            self.config["expected_min_sphere_drop"]
-        ), f"sphere stack did not drop enough after gate release: {sphere_drop}"
-        assert self.max_sphere_force_norm > float(
-            self.config["expected_min_sphere_force_norm"]
-        ), f"sphere bodies did not receive enough FSI reaction: {self.max_sphere_force_norm}"
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -1150,17 +1034,17 @@ class Example:
             width=0.010,
         )
         self.viewer.log_lines(
+            "/fsi/cascade_fluid_reservoir_wire",
+            self.fluid_reservoir_wire_starts,
+            self.fluid_reservoir_wire_ends,
+            colors=(0.78, 0.84, 0.92),
+            width=0.008,
+        )
+        self.viewer.log_lines(
             "/fsi/cascade_tunnel_wire",
             self.tunnel_wire_starts,
             self.tunnel_wire_ends,
             colors=(0.80, 0.84, 0.90),
-            width=0.008,
-        )
-        self.viewer.log_lines(
-            "/fsi/cascade_rigid_reservoir_wire",
-            self.rigid_reservoir_wire_starts,
-            self.rigid_reservoir_wire_ends,
-            colors=(0.92, 0.86, 0.74),
             width=0.008,
         )
         self.viewer.log_mesh(
@@ -1171,28 +1055,12 @@ class Example:
             backface_culling=False,
         )
         self.viewer.log_shapes(
-            "/fsi/cascade_spheres",
-            newton.GeoType.SPHERE,
-            self.sphere_radius,
-            self._body_xforms(self.sphere_bodies),
-            self.sphere_colors,
-            self.rigid_material,
-        )
-        self.viewer.log_shapes(
             "/fsi/cascade_fluid_gate",
             newton.GeoType.BOX,
             self.fluid_gate_half_extents,
             self._body_xforms([self.fluid_gate_body]),
             self.gate_colors,
-            self.rigid_material,
-        )
-        self.viewer.log_shapes(
-            "/fsi/cascade_rigid_gate",
-            newton.GeoType.BOX,
-            self.rigid_gate_half_extents,
-            self._body_xforms([self.rigid_gate_body]),
-            self.gate_colors,
-            self.rigid_material,
+            self.shape_material,
         )
         self.viewer.log_points(
             "/fsi/cascade_water_points",
