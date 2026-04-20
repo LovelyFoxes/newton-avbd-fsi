@@ -646,6 +646,14 @@ add_example_test(
     use_viewer=True,
 )
 
+add_example_test(
+    TestFSIExamples,
+    name="fsi.example_fsi_ipbf_vbd_cloth_cascade",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 100},
+    use_viewer=True,
+)
+
 
 class TestSensorExamples(unittest.TestCase):
     pass
