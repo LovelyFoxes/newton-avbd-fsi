@@ -118,6 +118,7 @@ class Example:
                 "radius_mean": 0.011,
                 "smoothing_radius": 0.060,
                 "gate_half_thickness": 0.018,
+                "gate_seal_overlap": 0.006,
                 "gate_open_height": 1.60,
                 "gate_open_duration_frames": 6,
                 "release_step": 20,
@@ -156,8 +157,8 @@ class Example:
             config = {
                 "container_half_width": 1.20,
                 "container_half_depth": 0.30,
-                "wall_half_height": 1.25,
-                "wall_thickness": 0.200,
+                "wall_half_height": 1.00,
+                "wall_thickness": 0.600,
                 "fluid_bottom_clearance": 0.04,
                 "fluid_dim_x": 40,
                 "fluid_dim_y": 90,
@@ -167,6 +168,7 @@ class Example:
                 "radius_mean": 0.0075,
                 "smoothing_radius": 0.040,
                 "gate_half_thickness": 0.020,
+                "gate_seal_overlap": 0.006,
                 "gate_open_height": 2.40,
                 "gate_open_duration_frames": 8,
                 "release_step": 30,
@@ -179,7 +181,7 @@ class Example:
                 "box_layers_x": 2,
                 "box_layers_y": 6,
                 "box_columns_z": 6,
-                "box_densities": (250.0, 700.0, 1250.0),
+                "box_densities": (250.0, 900.0, 1800.0),
                 "box_mu": 0.15,
                 "rest_density": 1000.0,
                 "ipbf_iterations": 6,
@@ -350,7 +352,7 @@ class Example:
             min_z=-self.container_half_depth,
             max_z=self.container_half_depth,
             device=self.model.device,
-            include_top=False,
+            include_top=True,
         )
 
         self.initial_box_x = np.zeros(len(self.wall_box_bodies), dtype=np.float32)
@@ -388,7 +390,7 @@ class Example:
         return 0.0
 
     def _wall_plane_x(self) -> float:
-        return 0.5 * self.container_half_width
+        return 0.25 * self.container_half_width
 
     def _compute_fluid_center(self) -> tuple[float, float, float]:
         half_span_x, half_span_y, _ = get_particle_grid_half_span(
@@ -399,7 +401,7 @@ class Example:
             cell_y=float(self.config["cell"]),
             cell_z=float(self.config["cell"]),
         )
-        section_min_x = -self.container_half_width + self.wall_thickness + half_span_x
+        section_min_x = -self.container_half_width + half_span_x
         section_max_x = self._left_gate_x() - float(self.config["gate_half_thickness"]) - half_span_x
         center_x = 0.5 * (section_min_x + section_max_x)
         center_y = self.floor_y + float(self.config["fluid_bottom_clearance"]) + half_span_y
@@ -461,13 +463,22 @@ class Example:
             hz=wt,
             cfg=wall_cfg,
         )
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform((0.0, self.top_y + wt, 0.0), wp.quat_identity()),
+            hx=hx + wt,
+            hy=wt,
+            hz=hz + wt,
+            cfg=wall_cfg,
+        )
 
     def _add_fluid_gate(self, builder: newton.ModelBuilder) -> None:
         gate_half_thickness = float(self.config["gate_half_thickness"])
+        gate_seal_overlap = float(self.config["gate_seal_overlap"])
         self.gate_half_extents = (
             gate_half_thickness,
-            self.wall_half_height + self.wall_thickness,
-            self.container_half_depth + self.wall_thickness,
+            self.wall_half_height + gate_seal_overlap,
+            self.container_half_depth + gate_seal_overlap,
         )
         self.gate_closed_center = (self._left_gate_x(), self.wall_half_height, 0.0)
         self.gate_open_center = (
