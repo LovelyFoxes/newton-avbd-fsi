@@ -73,3 +73,7 @@ docs/_static/viser/
 
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
+/.analysis
+/.blender
+/.notes
+/.warp-cache
