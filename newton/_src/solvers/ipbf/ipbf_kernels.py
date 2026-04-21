@@ -255,6 +255,22 @@ def boundary_density_pressure_weight(boundary_flag: int, static_boundary_weight:
     return 1.0
 
 
+@wp.func
+def boundary_triangle_shell_weight(
+    boundary_triangle: int,
+    boundary_normal: wp.vec3,
+    displacement: wp.vec3,
+) -> float:
+    """Return one-sided shell support weight for deformable triangle samples."""
+    if boundary_triangle < 0:
+        return 1.0
+
+    if wp.dot(displacement, boundary_normal) >= 0.0:
+        return 1.0
+
+    return 0.0
+
+
 @wp.kernel
 def mask_ipbf_particle_flags(
     particle_flags: wp.array(dtype=wp.int32),
@@ -372,6 +388,8 @@ def initialize_density_and_neighbor_count_with_boundary(
     particle_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
     static_boundary_weight: float,
@@ -410,6 +428,9 @@ def initialize_density_and_neighbor_count_with_boundary(
             continue
 
         dist = xi - boundary_x[index]
+        weight = weight * boundary_triangle_shell_weight(boundary_triangle[index], boundary_normal[index], dist)
+        if weight == 0.0:
+            continue
         dist2 = wp.dot(dist, dist)
         kernel = kernel_value(dist2, support_radius, kernel_family)
         if kernel <= 0.0:
@@ -455,6 +476,8 @@ def initialize_constraint_and_gradient_with_boundary(
     particle_q: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
     static_boundary_weight: float,
@@ -495,6 +518,9 @@ def initialize_constraint_and_gradient_with_boundary(
             continue
 
         displacement = xi - boundary_x[index]
+        weight = weight * boundary_triangle_shell_weight(boundary_triangle[index], boundary_normal[index], displacement)
+        if weight == 0.0:
+            continue
         grad += (
             weight
             * rest_density
@@ -565,6 +591,8 @@ def compute_density_and_neighbor_count_with_boundary(
     particle_flags: wp.array(dtype=wp.int32),
     particle_world: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
     static_boundary_weight: float,
@@ -626,6 +654,13 @@ def compute_density_and_neighbor_count_with_boundary(
             continue
 
         dist = xi - boundary_x[boundary_index]
+        weight = weight * boundary_triangle_shell_weight(
+            boundary_triangle[boundary_index],
+            boundary_normal[boundary_index],
+            dist,
+        )
+        if weight == 0.0:
+            continue
         dist2 = wp.dot(dist, dist)
         kernel = kernel_value(dist2, support_radius, kernel_family)
         if kernel <= 0.0:
@@ -700,6 +735,8 @@ def compute_constraint_and_gradient_with_boundary(
     particle_flags: wp.array(dtype=wp.int32),
     particle_world: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
     static_boundary_weight: float,
@@ -755,6 +792,13 @@ def compute_constraint_and_gradient_with_boundary(
             continue
 
         displacement = xi - boundary_x[boundary_index]
+        weight = weight * boundary_triangle_shell_weight(
+            boundary_triangle[boundary_index],
+            boundary_normal[boundary_index],
+            displacement,
+        )
+        if weight == 0.0:
+            continue
         grad += (
             weight
             * rest_density
@@ -980,6 +1024,7 @@ def accumulate_boundary_pressure_reaction(
     boundary_x: wp.array(dtype=wp.vec3),
     boundary_body: wp.array(dtype=wp.int32),
     boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
     boundary_vertex0: wp.array(dtype=wp.int32),
     boundary_vertex1: wp.array(dtype=wp.int32),
     boundary_vertex2: wp.array(dtype=wp.int32),
@@ -1025,6 +1070,13 @@ def accumulate_boundary_pressure_reaction(
             continue
 
         displacement = xi - boundary_x[boundary_index]
+        weight = weight * boundary_triangle_shell_weight(
+            boundary_triangle[boundary_index],
+            boundary_normal[boundary_index],
+            displacement,
+        )
+        if weight == 0.0:
+            continue
         boundary_grad = (
             weight * boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
         )

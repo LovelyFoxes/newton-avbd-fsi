@@ -164,6 +164,7 @@ class FSIBoundaryModel:
             triangle_sample_shape,
             triangle_sample_x_local,
             triangle_sample_normal_local,
+            triangle_sample_offset_distance,
             triangle_sample_area_patch,
             triangle_sample_volume_quadrature,
         ) = self._sample_model_triangles(
@@ -179,6 +180,8 @@ class FSIBoundaryModel:
         sample_shape.extend(triangle_sample_shape)
         sample_x_local.extend(triangle_sample_x_local)
         sample_normal_local.extend(triangle_sample_normal_local)
+        sample_offset_distance = [0.0 for _ in range(shape_sample_count_total)]
+        sample_offset_distance.extend(triangle_sample_offset_distance)
         sample_area_patch.extend(triangle_sample_area_patch)
         sample_volume_quadrature.extend(triangle_sample_volume_quadrature)
 
@@ -255,6 +258,7 @@ class FSIBoundaryModel:
 
         self.sample_x_local = wp.array(sample_x_local, dtype=wp.vec3, device=self.device)
         self.sample_normal_local = wp.array(sample_normal_local, dtype=wp.vec3, device=self.device)
+        self.sample_offset_distance = wp.array(sample_offset_distance, dtype=float, device=self.device)
         self.sample_volume = wp.array(sample_volume, dtype=float, device=self.device)
         self.sample_area_patch = wp.array(sample_area_patch, dtype=float, device=self.device)
         self.sample_volume_quadrature = wp.array(sample_volume_quadrature, dtype=float, device=self.device)
@@ -372,6 +376,7 @@ class FSIBoundaryModel:
                     self.sample_vertex1,
                     self.sample_vertex2,
                     self.sample_barycentric,
+                    self.sample_offset_distance,
                     state.particle_q,
                     state.particle_qd,
                 ],
@@ -630,6 +635,7 @@ class FSIBoundaryModel:
         list[tuple[float, float, float]],
         list[float],
         list[float],
+        list[float],
     ]:
         if not include_triangles or model.tri_count == 0:
             return [], [], [], [], [], [], [], [], [], [], []
@@ -653,6 +659,7 @@ class FSIBoundaryModel:
         sample_shape: list[int] = []
         sample_x_local: list[tuple[float, float, float]] = []
         sample_normal_local: list[tuple[float, float, float]] = []
+        sample_offset_distance: list[float] = []
         sample_area_patch: list[float] = []
         sample_volume_quadrature: list[float] = []
 
@@ -673,23 +680,33 @@ class FSIBoundaryModel:
             normal = normal / normal_norm
             barycentric_samples = cls._triangle_barycentric_samples(area, spacing)
             patch_area = area / len(barycentric_samples)
-            sample_volume = patch_area * thickness
+            sample_volume = 0.5 * patch_area * thickness
+            shell_offset = 0.5 * thickness * normal
 
             for barycentric in barycentric_samples:
                 bary = np.asarray(barycentric, dtype=np.float32)
-                point = bary[0] * p0 + bary[1] * p1 + bary[2] * p2
+                mid_point = bary[0] * p0 + bary[1] * p1 + bary[2] * p2
 
-                sample_triangle.append(int(triangle_index))
-                sample_vertex0.append(int(vertices[0]))
-                sample_vertex1.append(int(vertices[1]))
-                sample_vertex2.append(int(vertices[2]))
-                sample_barycentric.append(tuple(float(value) for value in barycentric))
-                sample_body.append(-1)
-                sample_shape.append(-1)
-                sample_x_local.append(tuple(float(value) for value in point))
-                sample_normal_local.append(tuple(float(value) for value in normal))
-                sample_area_patch.append(float(patch_area))
-                sample_volume_quadrature.append(float(sample_volume))
+                # Represent deformable cloth as a thin shell with two offset
+                # surfaces instead of a single mid-surface point sample.
+                # This gives IPBF a wetted-side boundary sample before the
+                # cloth mid-surface has already deeply penetrated the fluid.
+                for side in (-1.0, 1.0):
+                    point = mid_point + side * shell_offset
+                    normal_side = side * normal
+
+                    sample_triangle.append(int(triangle_index))
+                    sample_vertex0.append(int(vertices[0]))
+                    sample_vertex1.append(int(vertices[1]))
+                    sample_vertex2.append(int(vertices[2]))
+                    sample_barycentric.append(tuple(float(value) for value in barycentric))
+                    sample_body.append(-1)
+                    sample_shape.append(-1)
+                    sample_x_local.append(tuple(float(value) for value in point))
+                    sample_normal_local.append(tuple(float(value) for value in normal_side))
+                    sample_offset_distance.append(float(side * 0.5 * thickness))
+                    sample_area_patch.append(float(patch_area))
+                    sample_volume_quadrature.append(float(sample_volume))
 
         return (
             sample_triangle,
@@ -701,6 +718,7 @@ class FSIBoundaryModel:
             sample_shape,
             sample_x_local,
             sample_normal_local,
+            sample_offset_distance,
             sample_area_patch,
             sample_volume_quadrature,
         )

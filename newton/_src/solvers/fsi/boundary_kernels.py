@@ -108,6 +108,7 @@ def update_deformable_boundary_sample_world_kinematics(
     sample_vertex1: wp.array(dtype=wp.int32),
     sample_vertex2: wp.array(dtype=wp.int32),
     sample_barycentric: wp.array(dtype=wp.vec3),
+    sample_offset_distance: wp.array(dtype=float),
     particle_q: wp.array(dtype=wp.vec3),
     particle_qd: wp.array(dtype=wp.vec3),
     sample_x_world: wp.array(dtype=wp.vec3),
@@ -129,14 +130,21 @@ def update_deformable_boundary_sample_world_kinematics(
     x1 = particle_q[v1]
     x2 = particle_q[v2]
 
-    sample_x_world[tid] = b[0] * x0 + b[1] * x1 + b[2] * x2
+    x_center = b[0] * x0 + b[1] * x1 + b[2] * x2
     sample_v_world[tid] = b[0] * particle_qd[v0] + b[1] * particle_qd[v1] + b[2] * particle_qd[v2]
 
     normal = wp.cross(x1 - x0, x2 - x0)
     normal_norm = wp.length(normal)
     if normal_norm > 0.0:
-        sample_normal_world[tid] = normal / normal_norm
+        normal = normal / normal_norm
+        offset = sample_offset_distance[tid]
+        sample_x_world[tid] = x_center + offset * normal
+        if offset < 0.0:
+            sample_normal_world[tid] = -normal
+        else:
+            sample_normal_world[tid] = normal
     else:
+        sample_x_world[tid] = x_center
         sample_normal_world[tid] = wp.vec3(0.0)
 
 

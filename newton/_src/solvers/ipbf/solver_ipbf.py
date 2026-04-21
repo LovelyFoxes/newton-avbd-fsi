@@ -767,6 +767,9 @@ class SolverIPBF(SolverBase):
 
             self._triangle_contact_particle_delta.zero_()
             self._triangle_contact_vertex_delta.zero_()
+            triangle_contact_margin = float(self.fsi_triangle_contact_margin)
+            if triangle_contact_margin == 0.0:
+                triangle_contact_margin = 0.5 * float(getattr(boundary_model, "deformable_sample_thickness", 0.0))
 
             if (
                 self.fsi_triangle_contact_use_bvh
@@ -911,7 +914,7 @@ class SolverIPBF(SolverBase):
                         state.particle_q,
                         model.particle_radius,
                         self._ipbf_particle_flags,
-                        self.fsi_triangle_contact_margin,
+                        triangle_contact_margin,
                         self._triangle_contact_pair_cache_reuse,
                         self.fsi_triangle_contact_pair_cache_skin,
                         self.fsi_triangle_contact_pair_capacity,
@@ -978,7 +981,7 @@ class SolverIPBF(SolverBase):
                         model.particle_inv_mass,
                         model.particle_radius,
                         model.tri_indices,
-                        self.fsi_triangle_contact_margin,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
@@ -1005,7 +1008,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.triangle_indices,
                         boundary_model.triangle_count,
                         self._triangle_contact_pair_overflow,
-                        self.fsi_triangle_contact_margin,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
@@ -1026,7 +1029,7 @@ class SolverIPBF(SolverBase):
                     self.fsi_triangle_contact_search_radius,
                     float(getattr(boundary_model, "triangle_contact_radius_max", 0.0))
                     + self._max_particle_radius
-                    + self.fsi_triangle_contact_margin,
+                    + triangle_contact_margin,
                 )
                 wp.launch(
                     accumulate_particle_triangle_contact_corrections_from_grid,
@@ -1043,7 +1046,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.triangle_indices,
                         boundary_model.triangle_contact_proxy_motion_max,
                         contact_search_radius,
-                        self.fsi_triangle_contact_margin,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
@@ -1070,7 +1073,7 @@ class SolverIPBF(SolverBase):
                         model.tri_indices,
                         boundary_model.triangle_indices,
                         boundary_model.triangle_count,
-                        self.fsi_triangle_contact_margin,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
@@ -1436,6 +1439,8 @@ class SolverIPBF(SolverBase):
                         self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1463,6 +1468,8 @@ class SolverIPBF(SolverBase):
                         self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1521,6 +1528,8 @@ class SolverIPBF(SolverBase):
                         model.particle_mass,
                         self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1545,6 +1554,8 @@ class SolverIPBF(SolverBase):
                         particle_q,
                         self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1901,6 +1912,7 @@ class SolverIPBF(SolverBase):
                 boundary_model.sample_x_world,
                 boundary_model.sample_body,
                 boundary_model.sample_triangle,
+                boundary_model.sample_normal_world,
                 boundary_model.sample_vertex0,
                 boundary_model.sample_vertex1,
                 boundary_model.sample_vertex2,
