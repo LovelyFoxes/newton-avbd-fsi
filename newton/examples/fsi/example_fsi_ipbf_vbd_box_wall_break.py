@@ -16,9 +16,9 @@
 ###########################################################################
 # Example FSI IPBF VBD Box Wall Break
 #
-# Large-tank AVBD/IPBF scene where a gated fluid block in the left third of the
-# tank is released to impact a brick-stacked wall of many dynamic rigid boxes
-# near the middle/right partition. The box wall cycles three densities and uses
+# Large-tank AVBD/IPBF scene where a gated fluid block in the left half of the
+# tank is released to impact a stacked wall of many dynamic rigid boxes near the
+# middle of the right half. The box wall cycles three densities and uses
 # interlinked fluid-solid iterations by default.
 #
 # Command: python -m newton.examples fsi_ipbf_vbd_box_wall_break
@@ -110,26 +110,26 @@ class Example:
                 "wall_half_height": 0.44,
                 "wall_thickness": 0.035,
                 "fluid_bottom_clearance": 0.03,
-                "fluid_dim_x": 14,
-                "fluid_dim_y": 16,
-                "fluid_dim_z": 10,
-                "cell": 0.032,
-                "mass": 0.032768,
-                "radius_mean": 0.012,
-                "smoothing_radius": 0.075,
+                "fluid_dim_x": 18,
+                "fluid_dim_y": 18,
+                "fluid_dim_z": 12,
+                "cell": 0.030,
+                "mass": 0.027,
+                "radius_mean": 0.011,
+                "smoothing_radius": 0.060,
                 "gate_half_thickness": 0.018,
                 "gate_open_height": 1.60,
                 "gate_open_duration_frames": 6,
                 "release_step": 20,
                 "interlinked_switch_delay_frames": 8,
-                "box_half_extents": (0.040, 0.040, 0.040),
+                "box_half_extents": (0.032, 0.032, 0.032),
                 "box_gap_x": 0.006,
                 "box_gap_y": 0.006,
                 "box_gap_z": 0.006,
                 "box_floor_clearance": 0.003,
                 "box_layers_x": 1,
-                "box_layers_y": 5,
-                "box_columns_z": 5,
+                "box_layers_y": 6,
+                "box_columns_z": 6,
                 "box_densities": (300.0, 700.0, 1100.0),
                 "box_mu": 0.15,
                 "rest_density": 1000.0,
@@ -154,31 +154,31 @@ class Example:
             }
         else:
             config = {
-                "container_half_width": 1.15,
-                "container_half_depth": 0.50,
-                "wall_half_height": 0.70,
-                "wall_thickness": 0.040,
+                "container_half_width": 1.20,
+                "container_half_depth": 0.30,
+                "wall_half_height": 1.25,
+                "wall_thickness": 0.200,
                 "fluid_bottom_clearance": 0.04,
-                "fluid_dim_x": 28,
-                "fluid_dim_y": 28,
-                "fluid_dim_z": 18,
-                "cell": 0.022,
-                "mass": 0.010648,
-                "radius_mean": 0.0082,
+                "fluid_dim_x": 40,
+                "fluid_dim_y": 90,
+                "fluid_dim_z": 25,
+                "cell": 0.020,
+                "mass": 0.008,
+                "radius_mean": 0.0075,
                 "smoothing_radius": 0.040,
                 "gate_half_thickness": 0.020,
                 "gate_open_height": 2.40,
                 "gate_open_duration_frames": 8,
                 "release_step": 30,
                 "interlinked_switch_delay_frames": 20,
-                "box_half_extents": (0.038, 0.038, 0.038),
+                "box_half_extents": (0.036, 0.036, 0.036),
                 "box_gap_x": 0.006,
                 "box_gap_y": 0.006,
                 "box_gap_z": 0.006,
                 "box_floor_clearance": 0.003,
                 "box_layers_x": 2,
-                "box_layers_y": 7,
-                "box_columns_z": 7,
+                "box_layers_y": 6,
+                "box_columns_z": 6,
                 "box_densities": (250.0, 700.0, 1250.0),
                 "box_mu": 0.15,
                 "rest_density": 1000.0,
@@ -385,10 +385,10 @@ class Example:
         return wp.array(body_q, dtype=wp.transform, device=self.model.device)
 
     def _left_gate_x(self) -> float:
-        return -self.container_half_width / 3.0
+        return 0.0
 
     def _wall_plane_x(self) -> float:
-        return self.container_half_width / 3.0
+        return 0.5 * self.container_half_width
 
     def _compute_fluid_center(self) -> tuple[float, float, float]:
         half_span_x, half_span_y, _ = get_particle_grid_half_span(
@@ -488,11 +488,9 @@ class Example:
             cfg=self._contact_shape_cfg(density=0.0, mu=0.0),
         )
 
-    def _box_layer_z_positions(self, layer_y: int) -> list[float]:
+    def _box_layer_z_positions(self) -> list[float]:
         spacing_z = 2.0 * self.box_half_extents[2] + float(self.config["box_gap_z"])
-        base_count = int(self.config["box_columns_z"])
-        count = base_count if layer_y % 2 == 0 else max(1, base_count - 1)
-        return _centered_line_positions(count, spacing_z)
+        return _centered_line_positions(int(self.config["box_columns_z"]), spacing_z)
 
     def _add_box_wall(self, builder: newton.ModelBuilder) -> list[int]:
         spacing_x = 2.0 * self.box_half_extents[0] + float(self.config["box_gap_x"])
@@ -509,7 +507,7 @@ class Example:
             center_x = wall_x + x_offset
             for layer_y in range(int(self.config["box_layers_y"])):
                 center_y = base_y + float(layer_y) * spacing_y
-                for column_z, center_z in enumerate(self._box_layer_z_positions(layer_y)):
+                for column_z, center_z in enumerate(self._box_layer_z_positions()):
                     density_index = (layer_x + layer_y + column_z) % len(densities)
                     body = builder.add_body(
                         xform=wp.transform((center_x, center_y, center_z), wp.quat_identity()),
