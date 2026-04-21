@@ -133,6 +133,18 @@ class Example:
             help="Override the IPBF cloth triangle-contact relaxation.",
         )
         parser.add_argument(
+            "--disable-triangle-contact",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Disable cloth triangle-contact and keep only boundary-sample coupling.",
+        )
+        parser.add_argument(
+            "--disable-cloth-pressure-samples",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Disable cloth triangle boundary samples in IPBF density/pressure paths.",
+        )
+        parser.add_argument(
             "--cloth-support-mode",
             choices=["off", "light-buoyancy"],
             default="off",
@@ -292,6 +304,10 @@ class Example:
         if triangle_contact_relaxation is not None:
             config["triangle_contact_relaxation"] = float(triangle_contact_relaxation)
 
+        config["triangle_contact_enabled"] = not bool(getattr(self.args, "disable_triangle_contact", False))
+        config["cloth_pressure_samples_enabled"] = not bool(
+            getattr(self.args, "disable_cloth_pressure_samples", False)
+        )
         cloth_support_mode = getattr(self.args, "cloth_support_mode", None)
         if cloth_support_mode is not None:
             config["cloth_support_mode"] = str(cloth_support_mode)
@@ -574,6 +590,8 @@ class Example:
             deformable_sample_thickness=float(self.config["cloth_sample_thickness"]),
             device=self.model.device,
         )
+        if not bool(self.config["cloth_pressure_samples_enabled"]):
+            self.boundary_model.set_triangle_boundary_samples_active(False)
         self.fluid_solver = SolverIPBF(
             self.model,
             SolverIPBF.Config(
@@ -587,7 +605,7 @@ class Example:
                 boundary_velocity_damping=float(self.config["boundary_velocity_damping"]),
                 fsi_pressure_reaction_relaxation=float(self.config["fsi_pressure_reaction_relaxation"]),
                 fsi_static_boundary_weight=float(self.config["static_boundary_weight"]),
-                fsi_triangle_contact_enabled=True,
+                fsi_triangle_contact_enabled=bool(self.config["triangle_contact_enabled"]),
                 fsi_triangle_contact_margin=0.0,
                 fsi_triangle_contact_relaxation=float(self.config["triangle_contact_relaxation"]),
                 fluid_particle_start=self.fluid_particle_start,
@@ -765,6 +783,8 @@ class Example:
         ui.text(f"Sphere release: {int(self.config['sphere_release_step'])}")
         ui.text(f"Shelf full thickness: {2.0 * float(self.config['shelf_half_thickness']):.3f} m")
         ui.text(f"Cloth support: {self.config['cloth_support_mode']}")
+        ui.text(f"Pressure samples: {'on' if self.config['cloth_pressure_samples_enabled'] else 'off'}")
+        ui.text(f"Triangle contact: {'on' if self.config['triangle_contact_enabled'] else 'off'}")
         ui.text(f"Fluid particles: {self.fluid_particle_count}")
         ui.text(f"Cloth particles: {self.cloth_particle_count}")
         ui.text(f"Show boundary samples: {'on' if self.show_boundary_samples else 'off'}")
@@ -880,9 +900,11 @@ class Example:
             cloth_drop = self.initial_cloth_mean_y - self.min_cloth_mean_y
             assert cloth_drop > float(self.config["expected_min_cloth_drop"]), f"cloth did not drop enough: {cloth_drop}"
             if str(self.config["cloth_support_mode"]) == "off":
-                assert self.max_triangle_contact_pair_count > 0, "cloth-fluid triangle contacts were never collected"
-                assert self.max_fsi_particle_inertia_offset > 0.0, "cloth triangle-contact deltas never reached VBD"
-                assert self.max_vertex_force_norm > 0.0, "cloth pressure/contact reaction never reached VBD"
+                if bool(self.config["triangle_contact_enabled"]):
+                    assert self.max_triangle_contact_pair_count > 0, "cloth-fluid triangle contacts were never collected"
+                    assert self.max_fsi_particle_inertia_offset > 0.0, "cloth triangle-contact deltas never reached VBD"
+                if bool(self.config["cloth_pressure_samples_enabled"]) or bool(self.config["triangle_contact_enabled"]):
+                    assert self.max_vertex_force_norm > 0.0, "cloth pressure/contact reaction never reached VBD"
             else:
                 assert self.min_cloth_mean_y > float(self.config["expected_min_cloth_mean_y"]), (
                     f"cloth sank too deep: min_mean_y={self.min_cloth_mean_y}"

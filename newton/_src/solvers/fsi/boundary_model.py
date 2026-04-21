@@ -333,6 +333,20 @@ class FSIBoundaryModel:
         self.triangle_contact_proxy_motion_max.zero_()
         self._triangle_contact_history_initialized = False
 
+    def set_triangle_boundary_samples_active(self, active: bool) -> None:
+        """Enable or disable deformable triangle boundary samples in density/pressure paths."""
+        if self.triangle_sample_count == 0:
+            return
+
+        flags = self.sample_flags.numpy()
+        triangle_mask = self.sample_triangle.numpy() >= 0
+        if active:
+            flags[triangle_mask] |= int(BoundarySampleFlags.ACTIVE)
+        else:
+            flags[triangle_mask] &= ~int(BoundarySampleFlags.ACTIVE)
+
+        self.sample_flags = wp.array(flags, dtype=wp.int32, device=self.device)
+
     def update_world_kinematics(self, state: State) -> None:
         """Update sample positions [m], velocities [m/s], and normals."""
         if self.sample_count == 0:
