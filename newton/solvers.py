@@ -401,9 +401,13 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
 
 # solver types
 from ._src.solvers import (
+    BoundarySampleFlags,
+    FSIBoundaryModel,
     SolverBase,
     SolverFeatherstone,
+    SolverFSI,
     SolverImplicitMPM,
+    SolverIPBF,
     SolverKamino,
     SolverMuJoCo,
     SolverSemiImplicit,
@@ -417,8 +421,12 @@ from ._src.solvers import (
 from ._src.solvers.flags import SolverNotifyFlags
 
 __all__ = [
+    "BoundarySampleFlags",
+    "FSIBoundaryModel",
     "SolverBase",
+    "SolverFSI",
     "SolverFeatherstone",
+    "SolverIPBF",
     "SolverImplicitMPM",
     "SolverKamino",
     "SolverMuJoCo",
