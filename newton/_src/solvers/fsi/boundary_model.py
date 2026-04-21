@@ -285,6 +285,7 @@ class FSIBoundaryModel:
         self.triangle_contact_proxy_motion_max = wp.zeros(1, dtype=float, device=self.device)
         self.sample_force = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.vertex_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.vertex_pressure_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         self.vertex_contact_delta = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
 
         body_count = int(getattr(model, "body_count", 0))
@@ -481,6 +482,7 @@ class FSIBoundaryModel:
         self.vertex_contact_delta_generation += 1
         self.sample_force.zero_()
         self.vertex_force.zero_()
+        self.vertex_pressure_force.zero_()
         self.vertex_contact_delta.zero_()
         self.body_force.zero_()
         self.body_torque.zero_()

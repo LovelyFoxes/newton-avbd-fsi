@@ -133,6 +133,12 @@ class Example:
             help="Override the IPBF cloth triangle-contact relaxation.",
         )
         parser.add_argument(
+            "--pressure-reaction-relaxation",
+            type=float,
+            default=None,
+            help="Override the IPBF cloth pressure-reaction relaxation.",
+        )
+        parser.add_argument(
             "--disable-triangle-contact",
             action=argparse.BooleanOptionalAction,
             default=False,
@@ -303,6 +309,9 @@ class Example:
         triangle_contact_relaxation = getattr(self.args, "triangle_contact_relaxation", None)
         if triangle_contact_relaxation is not None:
             config["triangle_contact_relaxation"] = float(triangle_contact_relaxation)
+        pressure_reaction_relaxation = getattr(self.args, "pressure_reaction_relaxation", None)
+        if pressure_reaction_relaxation is not None:
+            config["fsi_pressure_reaction_relaxation"] = float(pressure_reaction_relaxation)
 
         config["triangle_contact_enabled"] = not bool(getattr(self.args, "disable_triangle_contact", False))
         config["cloth_pressure_samples_enabled"] = not bool(

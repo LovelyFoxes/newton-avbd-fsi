@@ -1929,8 +1929,10 @@ class SolverIPBF(SolverBase):
                 self.fsi_pressure_reaction_relaxation,
             ],
             outputs=[
+                boundary_model.vertex_contact_delta,
                 boundary_model.sample_force,
                 boundary_model.vertex_force,
+                boundary_model.vertex_pressure_force,
                 boundary_model.body_force,
                 boundary_model.body_torque,
             ],

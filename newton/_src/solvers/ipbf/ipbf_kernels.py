@@ -1039,8 +1039,10 @@ def accumulate_boundary_pressure_reaction(
     dt: float,
     solve_relaxation: float,
     reaction_relaxation: float,
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
     sample_force: wp.array(dtype=wp.vec3),
     vertex_force: wp.array(dtype=wp.vec3),
+    vertex_pressure_force: wp.array(dtype=wp.vec3),
     body_force: wp.array(dtype=wp.vec3),
     body_torque: wp.array(dtype=wp.vec3),
 ):
@@ -1098,9 +1100,37 @@ def accumulate_boundary_pressure_reaction(
 
         if boundary_triangle[boundary_index] >= 0:
             barycentric = boundary_barycentric[boundary_index]
+            denom = (
+                barycentric[0] * barycentric[0]
+                + barycentric[1] * barycentric[1]
+                + barycentric[2] * barycentric[2]
+            )
+            if denom > 0.0:
+                sample_delta = -reaction_relaxation * pressure_delta
+                vertex_delta0 = (barycentric[0] / denom) * sample_delta
+                vertex_delta1 = (barycentric[1] / denom) * sample_delta
+                vertex_delta2 = (barycentric[2] / denom) * sample_delta
+                wp.atomic_add(vertex_contact_delta, boundary_vertex0[boundary_index], vertex_delta0)
+                wp.atomic_add(vertex_contact_delta, boundary_vertex1[boundary_index], vertex_delta1)
+                wp.atomic_add(vertex_contact_delta, boundary_vertex2[boundary_index], vertex_delta2)
             wp.atomic_add(vertex_force, boundary_vertex0[boundary_index], barycentric[0] * force_on_boundary)
             wp.atomic_add(vertex_force, boundary_vertex1[boundary_index], barycentric[1] * force_on_boundary)
             wp.atomic_add(vertex_force, boundary_vertex2[boundary_index], barycentric[2] * force_on_boundary)
+            wp.atomic_add(
+                vertex_pressure_force,
+                boundary_vertex0[boundary_index],
+                barycentric[0] * force_on_boundary,
+            )
+            wp.atomic_add(
+                vertex_pressure_force,
+                boundary_vertex1[boundary_index],
+                barycentric[1] * force_on_boundary,
+            )
+            wp.atomic_add(
+                vertex_pressure_force,
+                boundary_vertex2[boundary_index],
+                barycentric[2] * force_on_boundary,
+            )
 
         body_index = boundary_body[boundary_index]
         if body_index < 0:
