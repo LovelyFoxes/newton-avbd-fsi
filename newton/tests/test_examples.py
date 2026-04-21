@@ -735,6 +735,74 @@ add_example_test(
 )
 
 
+class TestIPBFExamples(unittest.TestCase):
+    pass
+
+
+add_example_test(
+    TestIPBFExamples,
+    name="ipbf.example_ipbf_double_dam_break",
+    devices=test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+add_example_test(
+    TestIPBFExamples,
+    name="ipbf.example_ipbf_block_flop",
+    devices=test_devices,
+    test_options={"num-frames": 120},
+    use_viewer=True,
+)
+add_example_test(
+    TestIPBFExamples,
+    name="ipbf.example_ipbf_3d_compression",
+    devices=test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+
+
+class TestFSIExamples(unittest.TestCase):
+    pass
+
+
+add_example_test(
+    TestFSIExamples,
+    name="fsi.example_fsi_ipbf_vbd_moving_wall_float_box",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+add_example_test(
+    TestFSIExamples,
+    name="fsi.example_fsi_ipbf_vbd_three_sphere_buoys",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+add_example_test(
+    TestFSIExamples,
+    name="fsi.example_fsi_ipbf_vbd_cloth_patch",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 80},
+    use_viewer=True,
+)
+add_example_test(
+    TestFSIExamples,
+    name="fsi.example_fsi_ipbf_vbd_cloth_cascade",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 100},
+    use_viewer=True,
+)
+add_example_test(
+    TestFSIExamples,
+    name="fsi.example_fsi_ipbf_vbd_box_wall_break",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 90},
+    use_viewer=True,
+)
+
+
 class TestMultiphysicsExamples(unittest.TestCase):
     pass
 
