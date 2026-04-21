@@ -2491,6 +2491,23 @@ def accumulate_body_particle_contacts_per_body(
 
 
 @wp.kernel
+def add_fsi_wrenches_to_body_accumulators(
+    body_ids_in_color: wp.array[wp.int32],
+    fsi_body_force: wp.array[wp.vec3],
+    fsi_body_torque: wp.array[wp.vec3],
+    force_relaxation: float,
+    body_forces: wp.array[wp.vec3],
+    body_torques: wp.array[wp.vec3],
+):
+    """Add fluid-solid interface body wrenches to VBD rigid accumulators."""
+    tid = wp.tid()
+    body_index = body_ids_in_color[tid]
+
+    body_forces[body_index] = body_forces[body_index] + force_relaxation * fsi_body_force[body_index]
+    body_torques[body_index] = body_torques[body_index] + force_relaxation * fsi_body_torque[body_index]
+
+
+@wp.kernel
 def solve_rigid_body(
     dt: float,
     body_ids_in_color: wp.array[wp.int32],

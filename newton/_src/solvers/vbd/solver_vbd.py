@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import warp as wp
@@ -37,6 +37,8 @@ from .particle_vbd_kernels import (
     accumulate_particle_body_contact_force_and_hessian,
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
+    add_fsi_vertex_deltas_to_particle_inertia,
+    add_fsi_vertex_forces_to_particle_accumulators,
     # Planar DAT (Divide and Truncate) kernels
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
@@ -44,6 +46,8 @@ from .particle_vbd_kernels import (
     build_vertex_n_ring_tris_collision_filter,
     # Solver kernels (particle VBD)
     forward_step,
+    mask_vbd_particle_flags,
+    restore_non_vbd_particle_state,
     set_to_csr,
     solve_elasticity,
     solve_elasticity_tile,
@@ -55,9 +59,10 @@ from .rigid_vbd_kernels import (
     # Adjacency building kernels
     _count_num_adjacent_joints,
     _fill_adjacent_joints,
-    # Iteration kernels
     accumulate_body_body_contacts_per_body,  # Body-body (rigid-rigid) contacts (Gauss-Seidel mode)
     accumulate_body_particle_contacts_per_body,  # Body-particle soft contacts (two-way coupling)
+    # Iteration kernels
+    add_fsi_wrenches_to_body_accumulators,
     build_body_body_contact_lists,  # Body-body (rigid-rigid) contact adjacency
     build_body_particle_contact_lists,  # Body-particle (rigid-particle) soft-contact adjacency
     compute_cable_dahl_parameters,  # Cable bending plasticity
@@ -80,6 +85,9 @@ from .tri_mesh_collision import (
     TriMeshCollisionDetector,
     TriMeshCollisionInfo,
 )
+
+if TYPE_CHECKING:
+    from ..fsi import FSIBoundaryModel
 
 # Export accumulate_contact_force_and_hessian for legacy collision_legacy.py compatibility
 __all__ = ["SolverVBD"]
@@ -163,6 +171,7 @@ class SolverVBD(SolverBase):
         iterations: int = 10,
         friction_epsilon: float = 1e-2,
         integrate_with_external_rigid_solver: bool = False,
+        integrate_particles: bool = True,
         # Particle parameters
         particle_enable_self_contact: bool = False,
         particle_self_contact_radius: float = 0.2,
@@ -171,6 +180,8 @@ class SolverVBD(SolverBase):
         particle_vertex_contact_buffer_size: int = 32,
         particle_edge_contact_buffer_size: int = 64,
         particle_collision_detection_interval: int = 0,
+        particle_start: int = 0,
+        particle_count: int | None = None,
         particle_edge_parallel_epsilon: float = 1e-5,
         particle_enable_tile_solve: bool = True,
         particle_topological_contact_filter_threshold: int = 2,
@@ -190,6 +201,8 @@ class SolverVBD(SolverBase):
         rigid_body_contact_buffer_size: int = 64,
         rigid_body_particle_contact_buffer_size: int = 256,
         rigid_enable_dahl_friction: bool = False,  # Cable bending plasticity/hysteresis
+        fsi_boundary_model: FSIBoundaryModel | None = None,
+        fsi_force_relaxation: float = 1.0,
     ):
         """
         Args:
@@ -201,6 +214,8 @@ class SolverVBD(SolverBase):
             iterations: Number of VBD iterations per step.
             friction_epsilon: Threshold to smooth small relative velocities in friction computation (used for both particle
                 and rigid body contacts).
+            integrate_particles: Whether SolverVBD integrates model particles. Set to ``False`` for rigid-only
+                AVBD when another solver owns particles in the same model.
 
             Particle parameters:
 
@@ -220,6 +235,9 @@ class SolverVBD(SolverBase):
                 initialization step. If set to 0, collision detection is applied twice: once before and once immediately
                 after initialization. If set to a value `n` >= 1, collision detection is applied before every `n` VBD
                 iterations.
+            particle_start: First particle index solved by VBD.
+            particle_count: Number of consecutive particles solved by VBD. If ``None``, all particles from
+                ``particle_start`` to the end of the model are solved.
             particle_edge_parallel_epsilon: Threshold to detect near-parallel edges in edge-edge collision handling.
             particle_enable_tile_solve: Whether to accelerate the particle solver using tile API.
             particle_topological_contact_filter_threshold: Maximum topological distance (measured in rings) under which candidate
@@ -261,6 +279,10 @@ class SolverVBD(SolverBase):
             rigid_enable_dahl_friction: Enable Dahl hysteresis friction model for cable bending (default: False).
                 Configure per-joint Dahl parameters via the solver-registered custom model attributes
                 ``model.vbd.dahl_eps_max`` and ``model.vbd.dahl_tau``.
+            fsi_boundary_model: Optional FSI boundary model whose body force, body torque, vertex force,
+                and vertex contact delta buffers are injected into AVBD/VBD iterations.
+            fsi_force_relaxation: Unitless multiplier applied to injected FSI body forces, torques, and
+                vertex-side reactions.
 
         Note:
             - The `integrate_with_external_rigid_solver` argument enables one-way coupling between rigid body and soft body
@@ -284,24 +306,33 @@ class SolverVBD(SolverBase):
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
+        self.integrate_particles = bool(integrate_particles)
+        self.particle_start, self.particle_count = self._validate_particle_range(particle_start, particle_count)
+        self._uses_particle_subset = self.particle_start != 0 or self.particle_count != self.model.particle_count
+        self.fsi_boundary_model = None
+        self.fsi_force_relaxation = float(fsi_force_relaxation)
+        self._fsi_vertex_delta_generation_consumed = -1
+        self._step_control: Control | None = None
+        self.set_fsi_boundary_model(fsi_boundary_model)
 
         # Initialize particle system
-        self._init_particle_system(
-            model,
-            particle_enable_self_contact,
-            particle_self_contact_radius,
-            particle_self_contact_margin,
-            particle_conservative_bound_relaxation,
-            particle_vertex_contact_buffer_size,
-            particle_edge_contact_buffer_size,
-            particle_collision_detection_interval,
-            particle_edge_parallel_epsilon,
-            particle_enable_tile_solve,
-            particle_topological_contact_filter_threshold,
-            particle_rest_shape_contact_exclusion_radius,
-            particle_external_vertex_contact_filtering_map,
-            particle_external_edge_contact_filtering_map,
-        )
+        if self.integrate_particles:
+            self._init_particle_system(
+                model,
+                particle_enable_self_contact,
+                particle_self_contact_radius,
+                particle_self_contact_margin,
+                particle_conservative_bound_relaxation,
+                particle_vertex_contact_buffer_size,
+                particle_edge_contact_buffer_size,
+                particle_collision_detection_interval,
+                particle_edge_parallel_epsilon,
+                particle_enable_tile_solve,
+                particle_topological_contact_filter_threshold,
+                particle_rest_shape_contact_exclusion_radius,
+                particle_external_vertex_contact_filtering_map,
+                particle_external_edge_contact_filtering_map,
+            )
 
         # Initialize rigid body system and rigid-particle (body-particle) interaction state
         self._init_rigid_system(
@@ -331,6 +362,120 @@ class SolverVBD(SolverBase):
 
         # Cached empty arrays for kernels that require wp.array arguments even when counts are zero.
         self._empty_body_q = wp.empty(0, dtype=wp.transform, device=self.device)
+
+    def _validate_particle_range(self, particle_start: int, particle_count: int | None) -> tuple[int, int]:
+        """Return the validated consecutive particle range solved by VBD."""
+        model_particle_count = int(self.model.particle_count)
+        start = int(particle_start)
+        if start < 0 or start > model_particle_count:
+            raise ValueError("VBD particle start must be within the model particle range.")
+
+        if particle_count is None:
+            count = model_particle_count - start
+        else:
+            count = int(particle_count)
+
+        if count < 0 or start + count > model_particle_count:
+            raise ValueError("VBD particle count must fit inside the model particle range.")
+
+        return start, count
+
+    def _refresh_particle_flags(self) -> None:
+        """Refresh solver-local flags that mark only the VBD particle range active."""
+        if self.model.particle_count == 0:
+            return
+
+        wp.launch(
+            kernel=mask_vbd_particle_flags,
+            dim=self.model.particle_count,
+            inputs=[
+                self.model.particle_flags,
+                self.particle_start,
+                self.particle_count,
+            ],
+            outputs=[self._vbd_particle_flags],
+            device=self.device,
+        )
+
+    def set_fsi_boundary_model(self, fsi_boundary_model: FSIBoundaryModel | None) -> None:
+        """Set the optional FSI boundary model used as a solid reaction source."""
+        if fsi_boundary_model is not None:
+            if getattr(fsi_boundary_model, "model", self.model) is not self.model:
+                raise ValueError("SolverVBD FSI boundary model must be built from this solver's model.")
+            if getattr(fsi_boundary_model, "device", self.device) != self.device:
+                raise ValueError("SolverVBD FSI boundary model device must match the solver model device.")
+            if getattr(fsi_boundary_model, "body_force", None) is None or getattr(
+                fsi_boundary_model, "body_torque", None
+            ) is None:
+                raise ValueError("SolverVBD FSI boundary model must provide body_force and body_torque buffers.")
+            if self.integrate_particles and (
+                getattr(fsi_boundary_model, "vertex_force", None) is None
+                or getattr(fsi_boundary_model, "vertex_contact_delta", None) is None
+            ):
+                raise ValueError(
+                    "SolverVBD FSI boundary model must provide vertex_force and vertex_contact_delta buffers."
+                )
+
+        self.fsi_boundary_model = fsi_boundary_model
+
+    def reset(self, state: State | None = None) -> None:
+        """Reset VBD-owned warm-start history."""
+        if self.model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+            body_q = self.model.body_q if state is None else state.body_q
+            if body_q is None:
+                raise ValueError("SolverVBD.reset() requires body poses when the model has bodies.")
+
+            if hasattr(self, "body_q_prev"):
+                self.body_q_prev.assign(body_q)
+            if hasattr(self, "body_inertia_q"):
+                self.body_inertia_q.assign(body_q)
+
+            for name in (
+                "body_forces",
+                "body_torques",
+                "body_hessian_aa",
+                "body_hessian_al",
+                "body_hessian_ll",
+                "body_body_contact_counts",
+                "body_body_contact_indices",
+                "body_particle_contact_counts",
+                "body_particle_contact_indices",
+                "joint_sigma_prev",
+                "joint_kappa_prev",
+                "joint_dkappa_prev",
+                "joint_sigma_start",
+                "joint_C_fric",
+            ):
+                array = getattr(self, name, None)
+                if array is not None:
+                    array.zero_()
+
+            penalty = getattr(self, "body_body_contact_penalty_k", None)
+            if penalty is not None:
+                penalty.fill_(self.k_start_body_contact)
+
+            joint_penalty = getattr(self, "joint_penalty_k", None)
+            if joint_penalty is not None:
+                joint_penalty.fill_(0.0)
+
+        if self.integrate_particles and self.model.particle_count > 0:
+            self._refresh_particle_flags()
+
+        body_particle_penalty = getattr(self, "body_particle_contact_penalty_k", None)
+        if body_particle_penalty is not None:
+            body_particle_penalty.fill_(self.k_start_body_contact)
+
+        for name in (
+            "body_particle_contact_material_ke",
+            "body_particle_contact_material_kd",
+            "body_particle_contact_material_mu",
+            "body_body_contact_material_ke",
+            "body_body_contact_material_kd",
+            "body_body_contact_material_mu",
+        ):
+            array = getattr(self, name, None)
+            if array is not None:
+                array.zero_()
 
     def _init_particle_system(
         self,
@@ -362,7 +507,11 @@ class SolverVBD(SolverBase):
         self.particle_q_prev = wp.zeros_like(
             model.particle_q, device=self.device
         )  # per-substep previous q (for velocity)
+        self.inertia_base = wp.zeros_like(model.particle_q, device=self.device)
         self.inertia = wp.zeros_like(model.particle_q, device=self.device)  # inertial target positions
+        self.fsi_particle_inertia_offset = wp.zeros_like(model.particle_q, device=self.device)
+        self._vbd_particle_flags = wp.empty(model.particle_count, dtype=wp.int32, device=self.device)
+        self._refresh_particle_flags()
 
         # Particle adjacency info
         self.particle_adjacency = self._compute_particle_force_element_adjacency().to(self.device)
@@ -1363,22 +1512,65 @@ class SolverVBD(SolverBase):
                 depend on this argument.
             dt: Time step size.
         """
+        self._begin_step(state_in, state_out, contacts, dt, control=control)
+
+        for iter_num in range(self.iterations):
+            self._solve_iteration(state_in, state_out, contacts, dt, iter_num)
+
+        self._finalize_step(state_in, state_out, dt)
+
+    def _begin_step(
+        self,
+        state_in: State,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+        control: Control | None = None,
+    ) -> None:
+        """Prepare VBD/AVBD state for one timestep."""
+        self._fsi_vertex_delta_generation_consumed = -1
+
         # Use and reset the rigid history update flag (warmstarts).
         update_rigid_history = self.update_rigid_history
         self.update_rigid_history = True
 
         if control is None:
             control = self.model.control(clone_variables=False)
+        self._step_control = control
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid_history)
-        self._initialize_particles(state_in, state_out, dt)
+        if self.integrate_particles:
+            self._initialize_particles(state_in, state_out, dt)
+        else:
+            self._copy_external_particle_state(state_in, state_out)
 
-        for iter_num in range(self.iterations):
-            self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+    def _solve_iteration(
+        self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int
+    ) -> None:
+        """Run one interleaved AVBD rigid and VBD particle iteration."""
+        self._solve_rigid_body_iteration(state_in, state_out, self._step_control, contacts, dt)
+        if self.integrate_particles:
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
 
+    def _finalize_step(self, state_in: State, state_out: State, dt: float) -> None:
+        """Finalize velocities after VBD/AVBD iterations."""
         self._finalize_rigid_bodies(state_out, dt)
-        self._finalize_particles(state_out, dt)
+        if self.integrate_particles:
+            self._finalize_particles(state_in, state_out, dt)
+        else:
+            self._copy_external_particle_state(state_in, state_out)
+
+    def _copy_external_particle_state(self, state_in: State, state_out: State) -> None:
+        """Preserve particle state when another solver owns model particles."""
+        if self.model.particle_count == 0:
+            return
+
+        if state_in.particle_q is not None and state_out.particle_q is not None:
+            state_out.particle_q.assign(state_in.particle_q)
+        if state_in.particle_qd is not None and state_out.particle_qd is not None:
+            state_out.particle_qd.assign(state_in.particle_qd)
+        if state_in.particle_f is not None and state_out.particle_f is not None:
+            state_out.particle_f.assign(state_in.particle_f)
 
     def _penetration_free_truncation(self, particle_q_out=None):
         """
@@ -1450,6 +1642,8 @@ class SolverVBD(SolverBase):
         if model.particle_count == 0:
             return
 
+        self._refresh_particle_flags()
+
         # Collision detection before initialization to compute conservative bounds
         if self.particle_enable_self_contact:
             self._collision_detection_penetration_free(state_in)
@@ -1469,7 +1663,7 @@ class SolverVBD(SolverBase):
                 state_in.particle_qd,
                 self.model.particle_inv_mass,
                 state_in.particle_f,
-                self.model.particle_flags,
+                self._vbd_particle_flags,
             ],
             outputs=[
                 self.inertia,
@@ -1478,6 +1672,8 @@ class SolverVBD(SolverBase):
             dim=self.model.particle_count,
             device=self.device,
         )
+        self.inertia_base.assign(self.inertia)
+        self.fsi_particle_inertia_offset.zero_()
 
         self._penetration_free_truncation(state_in.particle_q)
 
@@ -1651,7 +1847,7 @@ class SolverVBD(SolverBase):
         # ---------------------------
         # Body-particle interaction
         # ---------------------------
-        if model.particle_count > 0 and update_rigid_history and contacts is not None:
+        if self.integrate_particles and model.particle_count > 0 and update_rigid_history and contacts is not None:
             # Build body-particle (rigid-particle) contact lists only when SolverVBD
             # is integrating rigid bodies itself; the external rigid solver path
             # does not use these per-body adjacency structures. Also skip if there
@@ -1735,6 +1931,56 @@ class SolverVBD(SolverBase):
         # Zero out forces and hessians
         self.particle_forces.zero_()
         self.particle_hessians.zero_()
+        self.inertia.assign(self.inertia_base)
+
+        if self.fsi_boundary_model is not None and self.fsi_force_relaxation != 0.0:
+            current_generation = int(getattr(self.fsi_boundary_model, "vertex_contact_delta_generation", -1))
+            has_vertex_delta = getattr(self.fsi_boundary_model, "vertex_contact_delta", None) is not None
+            use_vertex_delta = has_vertex_delta and current_generation >= 0
+            if use_vertex_delta and current_generation != self._fsi_vertex_delta_generation_consumed:
+                wp.launch(
+                    kernel=add_fsi_vertex_deltas_to_particle_inertia,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.fsi_boundary_model.vertex_contact_delta,
+                        self.fsi_force_relaxation,
+                        self._vbd_particle_flags,
+                    ],
+                    outputs=[
+                        self.fsi_particle_inertia_offset,
+                    ],
+                    device=self.device,
+                )
+                self._fsi_vertex_delta_generation_consumed = current_generation
+
+            if use_vertex_delta:
+                wp.launch(
+                    kernel=add_fsi_vertex_deltas_to_particle_inertia,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.fsi_particle_inertia_offset,
+                        1.0,
+                        self._vbd_particle_flags,
+                    ],
+                    outputs=[
+                        self.inertia,
+                    ],
+                    device=self.device,
+                )
+            elif getattr(self.fsi_boundary_model, "vertex_force", None) is not None:
+                wp.launch(
+                    kernel=add_fsi_vertex_forces_to_particle_accumulators,
+                    dim=model.particle_count,
+                    inputs=[
+                        self.fsi_boundary_model.vertex_force,
+                        self.fsi_force_relaxation,
+                        self._vbd_particle_flags,
+                    ],
+                    outputs=[
+                        self.particle_forces,
+                    ],
+                    device=self.device,
+                )
 
         # Iterate over color groups
         for color in range(len(self.model.particle_color_groups)):
@@ -1832,7 +2078,7 @@ class SolverVBD(SolverBase):
                         state_in.particle_q,
                         self.model.particle_mass,
                         self.inertia,
-                        self.model.particle_flags,
+                        self._vbd_particle_flags,
                         self.model.tri_indices,
                         self.model.tri_poses,
                         self.model.tri_materials,
@@ -1864,7 +2110,7 @@ class SolverVBD(SolverBase):
                         state_in.particle_q,
                         self.model.particle_mass,
                         self.inertia,
-                        self.model.particle_flags,
+                        self._vbd_particle_flags,
                         self.model.tri_indices,
                         self.model.tri_poses,
                         self.model.tri_materials,
@@ -1890,7 +2136,7 @@ class SolverVBD(SolverBase):
         wp.copy(state_out.particle_q, state_in.particle_q)
 
     def _solve_rigid_body_iteration(
-        self, state_in: State, state_out: State, control: Control, contacts: Contacts | None, dt: float
+        self, state_in: State, state_out: State, control: Control | None, contacts: Contacts | None, dt: float
     ):
         """Solve one AVBD iteration for rigid bodies (per-iteration phase).
 
@@ -1898,6 +2144,8 @@ class SolverVBD(SolverBase):
         and updates AVBD penalty parameters (dual update).
         """
         model = self.model
+        if control is None:
+            control = self.model.control(clone_variables=False)
 
         # Early-return path:
         # - If rigid bodies are integrated by an external solver, skip the AVBD rigid-body solve but still
@@ -1908,7 +2156,7 @@ class SolverVBD(SolverBase):
         #   ground plane where shape_body == -1).
         skip_rigid_solve = self.integrate_with_external_rigid_solver or model.body_count == 0
         if skip_rigid_solve:
-            if model.particle_count > 0 and contacts is not None:
+            if self.integrate_particles and model.particle_count > 0 and contacts is not None:
                 # Use external rigid poses when enabled; otherwise use the current VBD poses.
                 body_q = state_out.body_q if self.integrate_with_external_rigid_solver else state_in.body_q
 
@@ -1954,7 +2202,7 @@ class SolverVBD(SolverBase):
 
             # Gauss-Seidel contact accumulation: evaluate contacts for bodies in this color
             # Accumulate body-particle forces and Hessians on bodies (per-body, per-color)
-            if model.particle_count > 0 and contacts is not None:
+            if self.integrate_particles and model.particle_count > 0 and contacts is not None:
                 wp.launch(
                     kernel=accumulate_body_particle_contacts_per_body,
                     dim=color_group.size * _NUM_CONTACT_THREADS_PER_BODY,
@@ -2036,6 +2284,23 @@ class SolverVBD(SolverBase):
                         self.body_hessian_ll,
                         self.body_hessian_al,
                         self.body_hessian_aa,
+                    ],
+                    device=self.device,
+                )
+
+            if self.fsi_boundary_model is not None and self.fsi_force_relaxation != 0.0:
+                wp.launch(
+                    kernel=add_fsi_wrenches_to_body_accumulators,
+                    dim=color_group.size,
+                    inputs=[
+                        color_group,
+                        self.fsi_boundary_model.body_force,
+                        self.fsi_boundary_model.body_torque,
+                        self.fsi_force_relaxation,
+                    ],
+                    outputs=[
+                        self.body_forces,
+                        self.body_torques,
                     ],
                     device=self.device,
                 )
@@ -2126,7 +2391,7 @@ class SolverVBD(SolverBase):
             )
 
             # Update body-particle contact penalties
-            if model.particle_count > 0:
+            if self.integrate_particles and model.particle_count > 0:
                 soft_contact_launch_dim = contacts.soft_contact_max
                 wp.launch(
                     kernel=update_duals_body_particle_contacts,
@@ -2308,7 +2573,7 @@ class SolverVBD(SolverBase):
             contacts.rigid_contact_count,
         )
 
-    def _finalize_particles(self, state_out: State, dt: float):
+    def _finalize_particles(self, state_in: State, state_out: State, dt: float):
         """Finalize particle velocities after VBD iterations."""
         # Early exit if no particles
         if self.model.particle_count == 0:
@@ -2320,6 +2585,20 @@ class SolverVBD(SolverBase):
             dim=self.model.particle_count,
             device=self.device,
         )
+
+        if self._uses_particle_subset:
+            wp.launch(
+                kernel=restore_non_vbd_particle_state,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.particle_q_prev,
+                    state_in.particle_qd,
+                    self.particle_start,
+                    self.particle_count,
+                ],
+                outputs=[state_out.particle_q, state_out.particle_qd],
+                device=self.device,
+            )
 
     def _finalize_rigid_bodies(self, state_out: State, dt: float):
         """Finalize rigid body velocities and Dahl friction state after AVBD iterations (post-iteration phase).

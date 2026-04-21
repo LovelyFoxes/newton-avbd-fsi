@@ -293,7 +293,7 @@ class FSIBoundaryModel:
         self.body_force_step_max_norm = wp.zeros(body_count, dtype=float, device=self.device)
         self.body_torque_step_max_norm = wp.zeros(body_count, dtype=float, device=self.device)
         self.body_force_step_count = wp.zeros(1, dtype=wp.int32, device=self.device)
-        self.vertex_contact_delta_generation = 0
+        self.vertex_contact_delta_generation = -1
 
         self.boundary_grid = wp.HashGrid(128, 128, 128, device=self.device) if self.sample_count > 0 else None
         self.triangle_contact_grid = wp.HashGrid(128, 128, 128, device=self.device) if self.triangle_count > 0 else None
