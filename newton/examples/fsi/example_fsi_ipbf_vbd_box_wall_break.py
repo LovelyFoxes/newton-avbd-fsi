@@ -80,6 +80,15 @@ class Example:
             help="Number of frames used to retract the fluid gate after release.",
         )
         parser.add_argument(
+            "--interlinked-switch-delay-frames",
+            type=int,
+            default=None,
+            help=(
+                "Delay after gate release before switching from loose settling to interlinked coupling. "
+                "Only used when --coupling-mode interlinked."
+            ),
+        )
+        parser.add_argument(
             "--show-boundary-samples",
             action=argparse.BooleanOptionalAction,
             default=False,
@@ -112,10 +121,12 @@ class Example:
                 "gate_open_height": 1.60,
                 "gate_open_duration_frames": 6,
                 "release_step": 20,
+                "interlinked_switch_delay_frames": 8,
                 "box_half_extents": (0.040, 0.040, 0.040),
-                "box_gap_x": 0.004,
-                "box_gap_y": 0.004,
-                "box_gap_z": 0.004,
+                "box_gap_x": 0.006,
+                "box_gap_y": 0.006,
+                "box_gap_z": 0.006,
+                "box_floor_clearance": 0.003,
                 "box_layers_x": 1,
                 "box_layers_y": 5,
                 "box_columns_z": 5,
@@ -135,8 +146,8 @@ class Example:
                 "water_render_radius_scale": 0.48,
                 "boundary_render_radius_scale": 0.30,
                 "shape_contact_ke": 3.0e4,
-                "shape_contact_kd": 1.2e3,
-                "shape_contact_gap": 0.008,
+                "shape_contact_kd": 0.1,
+                "shape_contact_gap": 0.002,
                 "expected_min_box_dx": 0.004,
                 "expected_min_body_force_norm": 0.01,
                 "expected_min_fluid_front_x": -0.02,
@@ -159,10 +170,12 @@ class Example:
                 "gate_open_height": 2.40,
                 "gate_open_duration_frames": 8,
                 "release_step": 30,
+                "interlinked_switch_delay_frames": 20,
                 "box_half_extents": (0.038, 0.038, 0.038),
-                "box_gap_x": 0.004,
-                "box_gap_y": 0.004,
-                "box_gap_z": 0.003,
+                "box_gap_x": 0.006,
+                "box_gap_y": 0.006,
+                "box_gap_z": 0.006,
+                "box_floor_clearance": 0.003,
                 "box_layers_x": 2,
                 "box_layers_y": 7,
                 "box_columns_z": 7,
@@ -182,8 +195,8 @@ class Example:
                 "water_render_radius_scale": 0.48,
                 "boundary_render_radius_scale": 0.30,
                 "shape_contact_ke": 4.0e4,
-                "shape_contact_kd": 1.5e3,
-                "shape_contact_gap": 0.008,
+                "shape_contact_kd": 0.1,
+                "shape_contact_gap": 0.002,
                 "expected_min_box_dx": 0.0,
                 "expected_min_body_force_norm": 0.0,
                 "expected_min_fluid_front_x": 0.0,
@@ -196,6 +209,10 @@ class Example:
         gate_open_duration_frames = getattr(self.args, "gate_open_duration_frames", None)
         if gate_open_duration_frames is not None:
             config["gate_open_duration_frames"] = max(1, int(gate_open_duration_frames))
+
+        interlinked_switch_delay_frames = getattr(self.args, "interlinked_switch_delay_frames", None)
+        if interlinked_switch_delay_frames is not None:
+            config["interlinked_switch_delay_frames"] = max(0, int(interlinked_switch_delay_frames))
 
         return config
 
@@ -232,6 +249,7 @@ class Example:
 
         builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
         SolverIPBF.register_custom_attributes(builder)
+        builder.rigid_gap = float(self.config["shape_contact_gap"])
         builder.default_shape_cfg.mu = 0.0
         builder.default_shape_cfg.ke = float(self.config["shape_contact_ke"])
         builder.default_shape_cfg.kd = float(self.config["shape_contact_kd"])
@@ -387,8 +405,17 @@ class Example:
         center_y = self.floor_y + float(self.config["fluid_bottom_clearance"]) + half_span_y
         return (center_x, center_y, 0.0)
 
+    def _contact_shape_cfg(self, *, density: float, mu: float) -> newton.ModelBuilder.ShapeConfig:
+        return newton.ModelBuilder.ShapeConfig(
+            density=density,
+            ke=float(self.config["shape_contact_ke"]),
+            kd=float(self.config["shape_contact_kd"]),
+            mu=mu,
+            gap=float(self.config["shape_contact_gap"]),
+        )
+
     def _add_container(self, builder: newton.ModelBuilder) -> None:
-        wall_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
+        wall_cfg = self._contact_shape_cfg(density=0.0, mu=0.0)
         hx = self.container_half_width
         hz = self.container_half_depth
         hy = self.wall_half_height
@@ -458,7 +485,7 @@ class Example:
             hx=self.gate_half_extents[0],
             hy=self.gate_half_extents[1],
             hz=self.gate_half_extents[2],
-            cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0),
+            cfg=self._contact_shape_cfg(density=0.0, mu=0.0),
         )
 
     def _box_layer_z_positions(self, layer_y: int) -> list[float]:
@@ -473,7 +500,7 @@ class Example:
         x_positions = _centered_line_positions(int(self.config["box_layers_x"]), spacing_x)
         densities = tuple(float(v) for v in self.config["box_densities"])
         wall_x = self._wall_plane_x()
-        base_y = self.floor_y + self.box_half_extents[1]
+        base_y = self.floor_y + self.box_half_extents[1] + float(self.config["box_floor_clearance"])
 
         self.box_colors_np = np.zeros((0, 3), dtype=np.float32)
         bodies: list[int] = []
@@ -493,10 +520,7 @@ class Example:
                         hx=self.box_half_extents[0],
                         hy=self.box_half_extents[1],
                         hz=self.box_half_extents[2],
-                        cfg=newton.ModelBuilder.ShapeConfig(
-                            density=densities[density_index],
-                            mu=float(self.config["box_mu"]),
-                        ),
+                        cfg=self._contact_shape_cfg(density=densities[density_index], mu=float(self.config["box_mu"])),
                     )
                     bodies.append(body)
                     colors.append(self.box_palette[density_index].copy())
@@ -538,6 +562,7 @@ class Example:
         ui.text(f"Frame: {self.frame_index}")
         ui.text(f"Gate release: {int(self.config['release_step'])}")
         ui.text(f"Gate duration: {int(self.config['gate_open_duration_frames'])}")
+        ui.text(f"Interlinked switch delay: {int(self.config['interlinked_switch_delay_frames'])}")
         ui.text(f"Box count: {len(self.wall_box_bodies)}")
         ui.text(f"Boundary samples: {'on' if self.show_boundary_samples else 'off'}")
 
@@ -584,6 +609,18 @@ class Example:
     def _apply_gate_state(self, state: newton.State) -> None:
         center = self._lerp_center(self.gate_closed_center, self.gate_open_center, self._gate_alpha())
         self._set_body_pose(state, self.gate_body, center, wp.quat_identity())
+
+    def _update_solver_coupling_mode(self) -> None:
+        if getattr(self.args, "coupling_mode", "interlinked") != "interlinked":
+            self.solver.config.mode = SolverFSI.Config.CouplingMode.LOOSE
+            return
+
+        switch_step = int(self.config["release_step"]) + int(self.config["interlinked_switch_delay_frames"])
+        self.solver.config.mode = (
+            SolverFSI.Config.CouplingMode.LOOSE
+            if self.frame_index < switch_step
+            else SolverFSI.Config.CouplingMode.INTERLINKED
+        )
 
     def reset(self):
         self.sim_time = 0.0
@@ -671,6 +708,7 @@ class Example:
 
     def simulate(self):
         for _ in range(self.sim_substeps):
+            self._update_solver_coupling_mode()
             self._apply_gate_state(self.state_0)
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
@@ -702,15 +740,15 @@ class Example:
             self._record_diagnostics()
         assert self.states_remain_finite, "box-wall scene produced non-finite diagnostics"
         assert self.max_density > 0.0, "IPBF density diagnostics were not updated"
-        assert self.max_box_positive_dx > float(
-            self.config["expected_min_box_dx"]
-        ), f"box wall did not move enough: {self.max_box_positive_dx}"
+        assert self.max_box_positive_dx > float(self.config["expected_min_box_dx"]), (
+            f"box wall did not move enough: {self.max_box_positive_dx}"
+        )
         assert max(self.max_body_force_norm, self.max_body_step_avg_force_norm) > float(
             self.config["expected_min_body_force_norm"]
         ), "FSI body reaction stayed too small"
-        assert self.max_fluid_front_x > float(
-            self.config["expected_min_fluid_front_x"]
-        ), f"released fluid front did not advance enough: {self.max_fluid_front_x}"
+        assert self.max_fluid_front_x > float(self.config["expected_min_fluid_front_x"]), (
+            f"released fluid front did not advance enough: {self.max_fluid_front_x}"
+        )
 
     def render(self):
         self.viewer.begin_frame(self.sim_time)
@@ -740,7 +778,9 @@ class Example:
         self.viewer.log_points(
             "/fsi/box_wall_break_water_points",
             points=wp.array(
-                self.state_0.particle_q.numpy()[self.fluid_particle_start : self.fluid_particle_start + self.fluid_particle_count],
+                self.state_0.particle_q.numpy()[
+                    self.fluid_particle_start : self.fluid_particle_start + self.fluid_particle_count
+                ],
                 dtype=wp.vec3,
                 device=self.model.device,
             ),

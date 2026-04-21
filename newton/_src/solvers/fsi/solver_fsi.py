@@ -203,7 +203,10 @@ class SolverFSI(SolverBase):
                 self._refresh_boundary(state_out)
             return
 
-        self.solid_solver._begin_step(self._fluid_state, state_out, solid_contacts, dt)
+        refresh_solid_contacts = getattr(self.solid_solver, "_refresh_contact_history", None)
+        solid_begin_contacts = None if callable(refresh_solid_contacts) else solid_contacts
+        self.solid_solver._begin_step(self._fluid_state, state_out, solid_begin_contacts, dt)
+        solid_contacts_refreshed = False
 
         coupling_iterations = self._coupling_iteration_count()
         fluid_iterations = max(0, int(getattr(self.fluid_solver, "iterations", coupling_iterations)))
@@ -244,6 +247,10 @@ class SolverFSI(SolverBase):
 
                 if ran_fluid_chunk:
                     self.boundary_model.accumulate_step_diagnostics()
+
+                if callable(refresh_solid_contacts):
+                    refresh_solid_contacts(solid_contacts, reset_penalties=not solid_contacts_refreshed)
+                    solid_contacts_refreshed = True
 
                 for solid_iteration in self._iteration_chunk(solid_iterations, coupling_iteration, coupling_iterations):
                     self.solid_solver._solve_iteration(

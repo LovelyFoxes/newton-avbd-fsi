@@ -404,9 +404,10 @@ class SolverVBD(SolverBase):
                 raise ValueError("SolverVBD FSI boundary model must be built from this solver's model.")
             if getattr(fsi_boundary_model, "device", self.device) != self.device:
                 raise ValueError("SolverVBD FSI boundary model device must match the solver model device.")
-            if getattr(fsi_boundary_model, "body_force", None) is None or getattr(
-                fsi_boundary_model, "body_torque", None
-            ) is None:
+            if (
+                getattr(fsi_boundary_model, "body_force", None) is None
+                or getattr(fsi_boundary_model, "body_torque", None) is None
+            ):
                 raise ValueError("SolverVBD FSI boundary model must provide body_force and body_torque buffers.")
             if self.integrate_particles and (
                 getattr(fsi_boundary_model, "vertex_force", None) is None
@@ -1544,6 +1545,106 @@ class SolverVBD(SolverBase):
         else:
             self._copy_external_particle_state(state_in, state_out)
 
+    def _refresh_contact_history(self, contacts: Contacts | None, *, reset_penalties: bool = True) -> None:
+        """Refresh VBD contact adjacency and AVBD contact warmstarts.
+
+        Interlinked FSI schedules may update the shared ``contacts`` buffer
+        after :meth:`_begin_step` via fluid-side boundary projection. This hook
+        lets the wrapper rebuild SolverVBD's per-body contact lists so the
+        solver never consumes stale contact indices with refreshed contact data.
+        """
+        if contacts is None:
+            return
+
+        model = self.model
+
+        if model.body_count > 0 and not self.integrate_with_external_rigid_solver:
+            contact_launch_dim = contacts.rigid_contact_max
+
+            self.body_body_contact_counts.zero_()
+            wp.launch(
+                kernel=build_body_body_contact_lists,
+                dim=contact_launch_dim,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    model.shape_body,
+                    self.body_body_contact_buffer_pre_alloc,
+                ],
+                outputs=[
+                    self.body_body_contact_counts,
+                    self.body_body_contact_indices,
+                ],
+                device=self.device,
+            )
+
+            wp.launch(
+                kernel=warmstart_body_body_contacts,
+                inputs=[
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    model.shape_material_ke,
+                    model.shape_material_kd,
+                    model.shape_material_mu,
+                    self.k_start_body_contact,
+                    int(reset_penalties),
+                ],
+                outputs=[
+                    self.body_body_contact_penalty_k,
+                    self.body_body_contact_material_ke,
+                    self.body_body_contact_material_kd,
+                    self.body_body_contact_material_mu,
+                ],
+                dim=contact_launch_dim,
+                device=self.device,
+            )
+
+        if self.integrate_particles and model.particle_count > 0:
+            if not self.integrate_with_external_rigid_solver and model.body_count > 0:
+                self.body_particle_contact_counts.zero_()
+                wp.launch(
+                    kernel=build_body_particle_contact_lists,
+                    dim=contacts.soft_contact_max,
+                    inputs=[
+                        contacts.soft_contact_count,
+                        contacts.soft_contact_shape,
+                        model.shape_body,
+                        self.body_particle_contact_buffer_pre_alloc,
+                    ],
+                    outputs=[
+                        self.body_particle_contact_counts,
+                        self.body_particle_contact_indices,
+                    ],
+                    device=self.device,
+                )
+
+            soft_contact_launch_dim = contacts.soft_contact_max
+            wp.launch(
+                kernel=warmstart_body_particle_contacts,
+                inputs=[
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_shape,
+                    model.soft_contact_ke,
+                    model.soft_contact_kd,
+                    model.soft_contact_mu,
+                    model.shape_material_ke,
+                    model.shape_material_kd,
+                    model.shape_material_mu,
+                    self.k_start_body_contact,
+                    int(reset_penalties),
+                ],
+                outputs=[
+                    self.body_particle_contact_penalty_k,
+                    self.body_particle_contact_material_ke,
+                    self.body_particle_contact_material_kd,
+                    self.body_particle_contact_material_mu,
+                ],
+                dim=soft_contact_launch_dim,
+                device=self.device,
+            )
+
     def _solve_iteration(
         self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int
     ) -> None:
@@ -1755,50 +1856,7 @@ class SolverVBD(SolverBase):
             if update_rigid_history:
                 # Contact warmstarts / adjacency are optional: skip completely if contacts=None.
                 if contacts is not None:
-                    # Use the Contacts buffer capacity as launch dimension
-                    contact_launch_dim = contacts.rigid_contact_max
-
-                    # Build per-body contact lists once per step
-                    # Build body-body (rigid-rigid) contact lists
-                    self.body_body_contact_counts.zero_()
-                    wp.launch(
-                        kernel=build_body_body_contact_lists,
-                        dim=contact_launch_dim,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            contacts.rigid_contact_shape0,
-                            contacts.rigid_contact_shape1,
-                            model.shape_body,
-                            self.body_body_contact_buffer_pre_alloc,
-                        ],
-                        outputs=[
-                            self.body_body_contact_counts,
-                            self.body_body_contact_indices,
-                        ],
-                        device=self.device,
-                    )
-
-                    # Warmstart AVBD body-body contact penalties and pre-compute material properties
-                    wp.launch(
-                        kernel=warmstart_body_body_contacts,
-                        inputs=[
-                            contacts.rigid_contact_count,
-                            contacts.rigid_contact_shape0,
-                            contacts.rigid_contact_shape1,
-                            model.shape_material_ke,
-                            model.shape_material_kd,
-                            model.shape_material_mu,
-                            self.k_start_body_contact,
-                        ],
-                        outputs=[
-                            self.body_body_contact_penalty_k,
-                            self.body_body_contact_material_ke,
-                            self.body_body_contact_material_kd,
-                            self.body_body_contact_material_mu,
-                        ],
-                        dim=contact_launch_dim,
-                        device=self.device,
-                    )
+                    self._refresh_contact_history(contacts)
 
                 # Warmstart AVBD penalty parameters for joints using the same cadence
                 # as rigid history updates.
@@ -1847,55 +1905,14 @@ class SolverVBD(SolverBase):
         # ---------------------------
         # Body-particle interaction
         # ---------------------------
-        if self.integrate_particles and model.particle_count > 0 and update_rigid_history and contacts is not None:
-            # Build body-particle (rigid-particle) contact lists only when SolverVBD
-            # is integrating rigid bodies itself; the external rigid solver path
-            # does not use these per-body adjacency structures. Also skip if there
-            # are no rigid bodies in the model.
-            if not self.integrate_with_external_rigid_solver and model.body_count > 0:
-                self.body_particle_contact_counts.zero_()
-                wp.launch(
-                    kernel=build_body_particle_contact_lists,
-                    dim=contacts.soft_contact_max,
-                    inputs=[
-                        contacts.soft_contact_count,
-                        contacts.soft_contact_shape,
-                        model.shape_body,
-                        self.body_particle_contact_buffer_pre_alloc,
-                    ],
-                    outputs=[
-                        self.body_particle_contact_counts,
-                        self.body_particle_contact_indices,
-                    ],
-                    device=self.device,
-                )
-
-            # Warmstart AVBD body-particle contact penalties and pre-compute material properties.
-            # This is useful both when SolverVBD integrates rigid bodies and when an external
-            # rigid solver is used, since cloth-rigid soft contacts still rely on these penalties.
-            soft_contact_launch_dim = contacts.soft_contact_max
-            wp.launch(
-                kernel=warmstart_body_particle_contacts,
-                inputs=[
-                    contacts.soft_contact_count,
-                    contacts.soft_contact_shape,
-                    model.soft_contact_ke,
-                    model.soft_contact_kd,
-                    model.soft_contact_mu,
-                    model.shape_material_ke,
-                    model.shape_material_kd,
-                    model.shape_material_mu,
-                    self.k_start_body_contact,
-                ],
-                outputs=[
-                    self.body_particle_contact_penalty_k,
-                    self.body_particle_contact_material_ke,
-                    self.body_particle_contact_material_kd,
-                    self.body_particle_contact_material_mu,
-                ],
-                dim=soft_contact_launch_dim,
-                device=self.device,
-            )
+        if (
+            self.integrate_particles
+            and model.particle_count > 0
+            and update_rigid_history
+            and contacts is not None
+            and (model.body_count == 0 or self.integrate_with_external_rigid_solver)
+        ):
+            self._refresh_contact_history(contacts)
 
     def _solve_particle_iteration(
         self, state_in: State, state_out: State, contacts: Contacts | None, dt: float, iter_num: int

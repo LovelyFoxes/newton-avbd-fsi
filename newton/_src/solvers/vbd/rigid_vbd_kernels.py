@@ -1857,6 +1857,7 @@ def warmstart_body_body_contacts(
     shape_material_kd: wp.array[float],
     shape_material_mu: wp.array[float],
     k_start_body_contact: float,
+    reset_penalty: int,
     # Outputs
     contact_penalty_k: wp.array[float],
     contact_material_ke: wp.array[float],
@@ -1887,9 +1888,11 @@ def warmstart_body_body_contacts(
     contact_material_kd[i] = avg_kd
     contact_material_mu[i] = avg_mu
 
-    # Reset contact penalty to k_start every frame because contact indices are not persistent across frames.
-    k_new = wp.min(k_start_body_contact, avg_ke)
-    contact_penalty_k[i] = k_new
+    if reset_penalty != 0:
+        # Reset contact penalty to k_start when contact indices are rebuilt
+        # for a new physical step.
+        k_new = wp.min(k_start_body_contact, avg_ke)
+        contact_penalty_k[i] = k_new
 
 
 @wp.kernel
@@ -1903,6 +1906,7 @@ def warmstart_body_particle_contacts(
     shape_material_kd: wp.array[float],
     shape_material_mu: wp.array[float],
     k_start_body_contact: float,
+    reset_penalty: int,
     # Outputs
     body_particle_contact_penalty_k: wp.array[float],
     body_particle_contact_material_ke: wp.array[float],
@@ -1935,9 +1939,11 @@ def warmstart_body_particle_contacts(
     body_particle_contact_material_kd[i] = avg_kd
     body_particle_contact_material_mu[i] = avg_mu
 
-    # Reset contact penalty to k_start every frame because contact indices are not persistent across frames.
-    k_new = wp.min(k_start_body_contact, avg_ke)
-    body_particle_contact_penalty_k[i] = k_new
+    if reset_penalty != 0:
+        # Reset contact penalty to k_start when contact indices are rebuilt
+        # for a new physical step.
+        k_new = wp.min(k_start_body_contact, avg_ke)
+        body_particle_contact_penalty_k[i] = k_new
 
 
 @wp.kernel
