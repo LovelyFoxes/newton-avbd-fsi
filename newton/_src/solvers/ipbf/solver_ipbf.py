@@ -83,6 +83,7 @@ from .ipbf_kernels import (
     project_particle_shape_contacts_with_reaction,
     restore_non_fluid_particle_state,
     solve_local_system,
+    update_boundary_triangle_wet_weights,
     update_triangle_contact_pair_cache_snapshot_for_sampled_triangles,
     update_triangle_contact_pair_cache_snapshot_if_active,
     update_velocity_from_positions,
@@ -1429,6 +1430,23 @@ class SolverIPBF(SolverBase):
 
             if has_boundary:
                 wp.launch(
+                    update_boundary_triangle_wet_weights,
+                    dim=boundary_model.sample_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        particle_q,
+                        self._ipbf_particle_flags,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
+                        self.smoothing_radius,
+                    ],
+                    outputs=[boundary_model.sample_wet_weight],
+                    device=model.device,
+                )
+
+            if has_boundary:
+                wp.launch(
                     compute_density_and_neighbor_count_with_boundary,
                     dim=model.particle_count,
                     inputs=[
@@ -1441,6 +1459,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1470,6 +1489,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1530,6 +1550,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1556,6 +1577,7 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1913,6 +1935,7 @@ class SolverIPBF(SolverBase):
                 boundary_model.sample_body,
                 boundary_model.sample_triangle,
                 boundary_model.sample_normal_world,
+                boundary_model.sample_wet_weight,
                 boundary_model.sample_vertex0,
                 boundary_model.sample_vertex1,
                 boundary_model.sample_vertex2,

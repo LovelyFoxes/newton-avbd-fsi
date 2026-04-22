@@ -149,6 +149,50 @@ def update_deformable_boundary_sample_world_kinematics(
 
 
 @wp.kernel
+def update_deformable_boundary_sample_hydrostatic_state(
+    sample_triangle: wp.array(dtype=wp.int32),
+    sample_vertex0: wp.array(dtype=wp.int32),
+    sample_vertex1: wp.array(dtype=wp.int32),
+    sample_vertex2: wp.array(dtype=wp.int32),
+    particle_q: wp.array(dtype=wp.vec3),
+    sample_triangle_rest_area: wp.array(dtype=float),
+    sample_area_patch_rest: wp.array(dtype=float),
+    sample_volume_rest: wp.array(dtype=float),
+    sample_volume_quadrature_rest: wp.array(dtype=float),
+    sample_volume_hydrostatic_rest: wp.array(dtype=float),
+    sample_area_patch: wp.array(dtype=float),
+    sample_volume: wp.array(dtype=float),
+    sample_volume_quadrature: wp.array(dtype=float),
+    sample_volume_hydrostatic: wp.array(dtype=float),
+):
+    """Update deformable shell sample measures from the current triangle area."""
+    tid = wp.tid()
+
+    if sample_triangle[tid] < 0:
+        return
+
+    v0 = sample_vertex0[tid]
+    v1 = sample_vertex1[tid]
+    v2 = sample_vertex2[tid]
+
+    x0 = particle_q[v0]
+    x1 = particle_q[v1]
+    x2 = particle_q[v2]
+
+    current_normal = wp.cross(x1 - x0, x2 - x0)
+    current_area = 0.5 * wp.length(current_normal)
+    rest_area = sample_triangle_rest_area[tid]
+    scale = 0.0
+    if rest_area > 0.0:
+        scale = current_area / rest_area
+
+    sample_area_patch[tid] = sample_area_patch_rest[tid] * scale
+    sample_volume[tid] = sample_volume_rest[tid] * scale
+    sample_volume_quadrature[tid] = sample_volume_quadrature_rest[tid] * scale
+    sample_volume_hydrostatic[tid] = sample_volume_hydrostatic_rest[tid] * scale
+
+
+@wp.kernel
 def update_deformable_triangle_contact_proxy_world_kinematics(
     contact_triangle_indices: wp.array(dtype=wp.int32),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
