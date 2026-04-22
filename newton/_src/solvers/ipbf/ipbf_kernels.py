@@ -1228,6 +1228,7 @@ def accumulate_boundary_pressure_reaction(
     boundary_grid: wp.uint64,
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     density: wp.array(dtype=float),
     constraint: wp.array(dtype=float),
@@ -1251,6 +1252,7 @@ def accumulate_boundary_pressure_reaction(
     support_radius: float,
     kernel_family: int,
     static_boundary_weight: float,
+    triangle_contact_margin: float,
     dt: float,
     solve_relaxation: float,
     reaction_relaxation: float,
@@ -1327,6 +1329,11 @@ def accumulate_boundary_pressure_reaction(
                 + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
             )
             contact_support = wp.dot(contact_delta_prev, normal)
+            # Direct overlaps are handled by the triangle-contact path; do not
+            # also inject pressure reaction for the same local pair.
+            contact_distance = particle_radius[tid] + triangle_contact_margin
+            if contact_distance > 0.0 and wp.dot(displacement, displacement) <= contact_distance * contact_distance:
+                continue
         else:
             normal = wp.vec3(0.0)
 

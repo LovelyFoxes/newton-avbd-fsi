@@ -1992,6 +1992,9 @@ class SolverIPBF(SolverBase):
             return
 
         model = self.model
+        triangle_contact_margin = float(self.fsi_triangle_contact_margin)
+        if triangle_contact_margin == 0.0:
+            triangle_contact_margin = 0.5 * float(getattr(boundary_model, "deformable_sample_thickness", 0.0))
         wp.launch(
             accumulate_boundary_pressure_reaction,
             dim=model.particle_count,
@@ -1999,6 +2002,7 @@ class SolverIPBF(SolverBase):
                 boundary_model.boundary_grid.id,
                 particle_q,
                 model.particle_mass,
+                model.particle_radius,
                 self._ipbf_particle_flags,
                 state.ipbf.density,
                 state.ipbf.constraint,
@@ -2022,6 +2026,7 @@ class SolverIPBF(SolverBase):
                 self.smoothing_radius,
                 self.kernel_family,
                 self.fsi_static_boundary_weight,
+                triangle_contact_margin,
                 dt,
                 self.relaxation,
                 self.fsi_pressure_reaction_relaxation,

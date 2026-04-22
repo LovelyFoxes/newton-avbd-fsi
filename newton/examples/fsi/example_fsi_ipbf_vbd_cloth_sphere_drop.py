@@ -226,7 +226,7 @@ class Example:
                 "viscosity_coefficient": 0.0020,
                 "xsph_coefficient": 0.004,
                 "boundary_velocity_damping": 0.99,
-                "fsi_pressure_reaction_relaxation": 1.5,
+                "fsi_pressure_reaction_relaxation": 1.0,
                 "triangle_hydrostatic_support_scale": 0.0,
                 "triangle_reconstructed_support_depth_scale": 0.0,
                 "static_boundary_weight": 0.5,
@@ -293,7 +293,7 @@ class Example:
                 "viscosity_coefficient": 0.0025,
                 "xsph_coefficient": 0.006,
                 "boundary_velocity_damping": 0.97,
-                "fsi_pressure_reaction_relaxation": 1.5,
+                "fsi_pressure_reaction_relaxation": 1.0,
                 "triangle_hydrostatic_support_scale": 0.0,
                 "triangle_reconstructed_support_depth_scale": 0.0,
                 "static_boundary_weight": 0.20,
@@ -393,6 +393,7 @@ class Example:
         self._build_model()
         self._build_solvers()
         self._build_visualization_data()
+        self._cloth_fsi_activation_state = (None, None)
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
@@ -800,6 +801,18 @@ class Example:
         self._set_body_pose(state, self.cloth_shelf_body, cloth_center, cloth_velocity)
         self._set_body_pose(state, self.sphere_shelf_body, sphere_center, sphere_velocity)
 
+    def _sync_cloth_fsi_activation(self) -> None:
+        fluid_can_reach_cloth = self.frame_index >= int(self.config["cloth_release_step"])
+        pressure_samples_active = bool(self.config["cloth_pressure_samples_enabled"]) and fluid_can_reach_cloth
+        triangle_contact_active = bool(self.config["triangle_contact_enabled"]) and fluid_can_reach_cloth
+        activation_state = (pressure_samples_active, triangle_contact_active)
+        if activation_state == self._cloth_fsi_activation_state:
+            return
+
+        self.boundary_model.set_triangle_boundary_samples_active(pressure_samples_active)
+        self.fluid_solver.fsi_triangle_contact_enabled = triangle_contact_active
+        self._cloth_fsi_activation_state = activation_state
+
     def _apply_cloth_buoyancy(self, state: newton.State) -> None:
         if str(self.config["cloth_support_mode"]) == "off":
             return
@@ -832,6 +845,7 @@ class Example:
         ui.text(f"Sphere release: {int(self.config['sphere_release_step'])}")
         ui.text(f"Shelf full thickness: {2.0 * float(self.config['shelf_half_thickness']):.3f} m")
         ui.text(f"Cloth support: {self.config['cloth_support_mode']}")
+        ui.text(f"Cloth FSI active: {'yes' if self.frame_index >= int(self.config['cloth_release_step']) else 'no'}")
         ui.text(f"Pressure samples: {'on' if self.config['cloth_pressure_samples_enabled'] else 'off'}")
         ui.text(f"Decoupled cloth pressure: {'on' if self.config['decouple_cloth_boundary_density'] else 'off'}")
         ui.text(f"Hydrostatic support scale: {float(self.config['triangle_hydrostatic_support_scale']):.3f}")
@@ -850,8 +864,10 @@ class Example:
         self.fluid_solver.reset(self.state_1)
         self.solid_solver.reset(self.state_0)
         self.solid_solver.reset(self.state_1)
+        self._cloth_fsi_activation_state = (None, None)
         self._apply_shelf_states(self.state_0)
         self._apply_shelf_states(self.state_1)
+        self._sync_cloth_fsi_activation()
         self.contacts.clear()
         self.boundary_model.clear_forces()
         self.boundary_model.update_world_kinematics(self.state_0)
@@ -916,6 +932,7 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self._apply_shelf_states(self.state_0)
+            self._sync_cloth_fsi_activation()
             self.state_0.clear_forces()
             self._apply_cloth_buoyancy(self.state_0)
             self.viewer.apply_forces(self.state_0)

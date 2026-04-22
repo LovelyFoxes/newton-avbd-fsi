@@ -88,6 +88,12 @@ class Example:
             help="Override the IPBF cloth triangle-contact relaxation.",
         )
         parser.add_argument(
+            "--pressure-reaction-relaxation",
+            type=float,
+            default=None,
+            help="Override the IPBF cloth pressure-reaction relaxation.",
+        )
+        parser.add_argument(
             "--release-step",
             type=int,
             default=None,
@@ -236,7 +242,7 @@ class Example:
                 "viscosity_coefficient": 0.0025,
                 "xsph_coefficient": 0.006,
                 "boundary_velocity_damping": 0.97,
-                "fsi_pressure_reaction_relaxation": 1.5,
+                "fsi_pressure_reaction_relaxation": 1.0,
                 "static_boundary_weight": 0.20,
                 "triangle_contact_relaxation": 1.0,
                 "boundary_spacing": 0.020,
@@ -270,6 +276,9 @@ class Example:
         triangle_contact_relaxation = getattr(self.args, "triangle_contact_relaxation", None)
         if triangle_contact_relaxation is not None:
             config["triangle_contact_relaxation"] = float(triangle_contact_relaxation)
+        pressure_reaction_relaxation = getattr(self.args, "pressure_reaction_relaxation", None)
+        if pressure_reaction_relaxation is not None:
+            config["fsi_pressure_reaction_relaxation"] = float(pressure_reaction_relaxation)
 
         config["cloth_self_contact_enabled"] = bool(getattr(self.args, "cloth_self_contact", False))
         return config
@@ -318,6 +327,7 @@ class Example:
         ui.text(f"Fluid gate release: {int(self.config['fluid_release_step'])}")
         ui.text(f"Fluid gate duration: {int(self.config['fluid_gate_open_duration_frames'])}")
         ui.text(f"Fluid gate open: {'yes' if self._fluid_gate_is_open() else 'no'}")
+        ui.text(f"Pressure reaction: {float(self.config['fsi_pressure_reaction_relaxation']):.2f}")
 
     def _tunnel_rotation(self) -> wp.quat:
         return wp.quat_identity()
