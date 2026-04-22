@@ -442,6 +442,7 @@ def initialize_density_and_neighbor_count_with_boundary(
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
     density_boundary: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     boundary_neighbor_count: wp.array(dtype=wp.int32),
 ):
     """Initialize density including boundary samples when no particle grid exists."""
@@ -451,12 +452,14 @@ def initialize_density_and_neighbor_count_with_boundary(
         density[tid] = 0.0
         neighbor_count[tid] = 0
         density_boundary[tid] = 0.0
+        density_triangle_boundary[tid] = 0.0
         boundary_neighbor_count[tid] = 0
         return
 
     xi = particle_q[tid]
     rho = particle_mass[tid] * kernel_value(0.0, support_radius, kernel_family)
     rho_boundary = float(0.0)
+    rho_triangle_boundary = float(0.0)
     boundary_count = int(0)
 
     query = wp.hash_grid_query(boundary_grid, xi, support_radius)
@@ -481,12 +484,16 @@ def initialize_density_and_neighbor_count_with_boundary(
         if kernel <= 0.0:
             continue
 
-        rho_boundary += weight * rest_density * boundary_volume[index] * kernel
+        boundary_density = weight * rest_density * boundary_volume[index] * kernel
+        rho_boundary += boundary_density
+        if boundary_triangle[index] >= 0:
+            rho_triangle_boundary += boundary_density
         boundary_count += 1
 
     density[tid] = rho + rho_boundary
     neighbor_count[tid] = boundary_count
     density_boundary[tid] = rho_boundary
+    density_triangle_boundary[tid] = rho_triangle_boundary
     boundary_neighbor_count[tid] = boundary_count
 
 
@@ -528,10 +535,12 @@ def initialize_constraint_and_gradient_with_boundary(
     boundary_flags: wp.array(dtype=wp.int32),
     static_boundary_weight: float,
     density: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     rest_density: float,
     support_radius: float,
     kernel_family: int,
     use_constraint_clamp: int,
+    decouple_triangle_boundary_density: int,
     constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
 ):
@@ -543,7 +552,11 @@ def initialize_constraint_and_gradient_with_boundary(
         constraint_gradient[tid] = wp.vec3(0.0)
         return
 
-    c = density[tid] / rest_density - 1.0
+    c_density = density[tid]
+    if decouple_triangle_boundary_density != 0:
+        c_density = c_density - density_triangle_boundary[tid]
+
+    c = c_density / rest_density - 1.0
     if use_constraint_clamp != 0 and c < 0.0:
         constraint[tid] = 0.0
         constraint_gradient[tid] = wp.vec3(0.0)
@@ -571,6 +584,8 @@ def initialize_constraint_and_gradient_with_boundary(
             boundary_wet_weight[index],
         )
         if weight == 0.0:
+            continue
+        if decouple_triangle_boundary_density != 0 and boundary_triangle[index] >= 0:
             continue
         grad += (
             weight
@@ -654,6 +669,7 @@ def compute_density_and_neighbor_count_with_boundary(
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
     density_boundary: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     boundary_neighbor_count: wp.array(dtype=wp.int32),
 ):
     """Compute SPH density estimates with Akinci-style boundary samples."""
@@ -663,6 +679,7 @@ def compute_density_and_neighbor_count_with_boundary(
         density[tid] = 0.0
         neighbor_count[tid] = 0
         density_boundary[tid] = 0.0
+        density_triangle_boundary[tid] = 0.0
         boundary_neighbor_count[tid] = 0
         return
 
@@ -693,6 +710,7 @@ def compute_density_and_neighbor_count_with_boundary(
             fluid_count += 1
 
     rho_boundary = float(0.0)
+    rho_triangle_boundary = float(0.0)
     boundary_count = int(0)
     boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
     boundary_index = int(0)
@@ -719,12 +737,16 @@ def compute_density_and_neighbor_count_with_boundary(
         if kernel <= 0.0:
             continue
 
-        rho_boundary += weight * rest_density * boundary_volume[boundary_index] * kernel
+        boundary_density = weight * rest_density * boundary_volume[boundary_index] * kernel
+        rho_boundary += boundary_density
+        if boundary_triangle[boundary_index] >= 0:
+            rho_triangle_boundary += boundary_density
         boundary_count += 1
 
     density[tid] = rho + rho_boundary
     neighbor_count[tid] = fluid_count + boundary_count
     density_boundary[tid] = rho_boundary
+    density_triangle_boundary[tid] = rho_triangle_boundary
     boundary_neighbor_count[tid] = boundary_count
 
 
@@ -795,10 +817,12 @@ def compute_constraint_and_gradient_with_boundary(
     boundary_flags: wp.array(dtype=wp.int32),
     static_boundary_weight: float,
     density: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     rest_density: float,
     support_radius: float,
     kernel_family: int,
     use_constraint_clamp: int,
+    decouple_triangle_boundary_density: int,
     constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
 ):
@@ -810,7 +834,11 @@ def compute_constraint_and_gradient_with_boundary(
         constraint_gradient[tid] = wp.vec3(0.0)
         return
 
-    c = density[tid] / rest_density - 1.0
+    c_density = density[tid]
+    if decouple_triangle_boundary_density != 0:
+        c_density = c_density - density_triangle_boundary[tid]
+
+    c = c_density / rest_density - 1.0
     if use_constraint_clamp != 0 and c < 0.0:
         constraint[tid] = 0.0
         constraint_gradient[tid] = wp.vec3(0.0)
@@ -853,6 +881,8 @@ def compute_constraint_and_gradient_with_boundary(
             boundary_wet_weight[boundary_index],
         )
         if weight == 0.0:
+            continue
+        if decouple_triangle_boundary_density != 0 and boundary_triangle[boundary_index] >= 0:
             continue
         grad += (
             weight
@@ -1074,6 +1104,7 @@ def accumulate_boundary_pressure_reaction(
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    density: wp.array(dtype=float),
     constraint: wp.array(dtype=float),
     hessian: wp.array(dtype=wp.mat33),
     boundary_x: wp.array(dtype=wp.vec3),
@@ -1087,14 +1118,17 @@ def accumulate_boundary_pressure_reaction(
     boundary_barycentric: wp.array(dtype=wp.vec3),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    density_triangle_boundary: wp.array(dtype=float),
     body_q: wp.array(dtype=wp.transform),
     body_com: wp.array(dtype=wp.vec3),
+    rest_density: float,
     support_radius: float,
     kernel_family: int,
     static_boundary_weight: float,
     dt: float,
     solve_relaxation: float,
     reaction_relaxation: float,
+    decouple_triangle_boundary_density: int,
     vertex_contact_delta: wp.array(dtype=wp.vec3),
     sample_force: wp.array(dtype=wp.vec3),
     vertex_force: wp.array(dtype=wp.vec3),
@@ -1111,7 +1145,16 @@ def accumulate_boundary_pressure_reaction(
         return
 
     c = constraint[tid]
-    if c <= 0.0:
+    c_triangle = 0.0
+    if decouple_triangle_boundary_density != 0 and rest_density > 0.0:
+        c_total = density[tid] / rest_density - 1.0
+        if c_total < 0.0:
+            c_total = 0.0
+        c_triangle = c_total - c
+        if c_triangle < 0.0:
+            c_triangle = 0.0
+
+    if c <= 0.0 and c_triangle <= 0.0:
         return
 
     xi = particle_q[tid]
@@ -1136,13 +1179,18 @@ def accumulate_boundary_pressure_reaction(
         )
         if weight == 0.0:
             continue
+        c_effective = c
+        if decouple_triangle_boundary_density != 0 and boundary_triangle[boundary_index] >= 0:
+            c_effective = c_triangle
+        if c_effective <= 0.0:
+            continue
         boundary_grad = (
             weight * boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
         )
         if wp.dot(boundary_grad, boundary_grad) == 0.0:
             continue
 
-        pressure_rhs = -c * boundary_grad
+        pressure_rhs = -c_effective * boundary_grad
         pressure_delta = solve_relaxation * (inv_h * pressure_rhs)
         if wp.dot(pressure_delta, pressure_delta) == 0.0:
             continue

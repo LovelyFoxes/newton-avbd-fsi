@@ -151,6 +151,12 @@ class Example:
             help="Disable cloth triangle boundary samples in IPBF density/pressure paths.",
         )
         parser.add_argument(
+            "--decouple-cloth-boundary-density",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Use a decoupled cloth boundary density/pressure path inside IPBF.",
+        )
+        parser.add_argument(
             "--cloth-support-mode",
             choices=["off", "light-buoyancy"],
             default="off",
@@ -210,6 +216,7 @@ class Example:
                 "boundary_velocity_damping": 0.99,
                 "fsi_pressure_reaction_relaxation": 1.5,
                 "static_boundary_weight": 0.5,
+                "decouple_cloth_boundary_density": True,
                 "triangle_contact_relaxation": 1.0,
                 "boundary_spacing": 0.035,
                 "water_render_radius_scale": 0.54,
@@ -274,6 +281,7 @@ class Example:
                 "boundary_velocity_damping": 0.97,
                 "fsi_pressure_reaction_relaxation": 1.5,
                 "static_boundary_weight": 0.20,
+                "decouple_cloth_boundary_density": True,
                 "triangle_contact_relaxation": 1.0,
                 "boundary_spacing": 0.024,
                 "water_render_radius_scale": 0.54,
@@ -317,6 +325,9 @@ class Example:
         config["cloth_pressure_samples_enabled"] = not bool(
             getattr(self.args, "disable_cloth_pressure_samples", False)
         )
+        decouple_cloth_boundary_density = getattr(self.args, "decouple_cloth_boundary_density", None)
+        if decouple_cloth_boundary_density is not None:
+            config["decouple_cloth_boundary_density"] = bool(decouple_cloth_boundary_density)
         cloth_support_mode = getattr(self.args, "cloth_support_mode", None)
         if cloth_support_mode is not None:
             config["cloth_support_mode"] = str(cloth_support_mode)
@@ -614,6 +625,7 @@ class Example:
                 boundary_velocity_damping=float(self.config["boundary_velocity_damping"]),
                 fsi_pressure_reaction_relaxation=float(self.config["fsi_pressure_reaction_relaxation"]),
                 fsi_static_boundary_weight=float(self.config["static_boundary_weight"]),
+                fsi_decouple_triangle_boundary_density=bool(self.config["decouple_cloth_boundary_density"]),
                 fsi_triangle_contact_enabled=bool(self.config["triangle_contact_enabled"]),
                 fsi_triangle_contact_margin=0.0,
                 fsi_triangle_contact_relaxation=float(self.config["triangle_contact_relaxation"]),
@@ -793,6 +805,7 @@ class Example:
         ui.text(f"Shelf full thickness: {2.0 * float(self.config['shelf_half_thickness']):.3f} m")
         ui.text(f"Cloth support: {self.config['cloth_support_mode']}")
         ui.text(f"Pressure samples: {'on' if self.config['cloth_pressure_samples_enabled'] else 'off'}")
+        ui.text(f"Decoupled cloth pressure: {'on' if self.config['decouple_cloth_boundary_density'] else 'off'}")
         ui.text(f"Triangle contact: {'on' if self.config['triangle_contact_enabled'] else 'off'}")
         ui.text(f"Fluid particles: {self.fluid_particle_count}")
         ui.text(f"Cloth particles: {self.cloth_particle_count}")
