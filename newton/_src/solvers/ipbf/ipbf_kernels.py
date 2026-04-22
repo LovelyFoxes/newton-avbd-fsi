@@ -1179,6 +1179,7 @@ def accumulate_boundary_pressure_reaction(
         )
         if weight == 0.0:
             continue
+
         c_effective = c
         if decouple_triangle_boundary_density != 0 and boundary_triangle[boundary_index] >= 0:
             c_effective = c_triangle
@@ -1195,12 +1196,22 @@ def accumulate_boundary_pressure_reaction(
         if wp.dot(pressure_delta, pressure_delta) == 0.0:
             continue
 
+        sample_delta = -reaction_relaxation * pressure_delta
         force_on_boundary = equivalent_force_from_position_delta(
             pressure_delta,
             particle_mass[tid],
             dt,
             reaction_relaxation,
         )
+
+        if boundary_triangle[boundary_index] >= 0:
+            normal = boundary_normal[boundary_index]
+            normal_component = wp.dot(sample_delta, normal)
+            if normal_component <= 0.0:
+                continue
+            sample_delta = normal_component * normal
+            force_on_boundary = particle_mass[tid] * sample_delta / (dt * dt)
+
         wp.atomic_add(sample_force, boundary_index, force_on_boundary)
 
         if boundary_triangle[boundary_index] >= 0:
@@ -1211,7 +1222,6 @@ def accumulate_boundary_pressure_reaction(
                 + barycentric[2] * barycentric[2]
             )
             if denom > 0.0:
-                sample_delta = -reaction_relaxation * pressure_delta
                 vertex_delta0 = (barycentric[0] / denom) * sample_delta
                 vertex_delta1 = (barycentric[1] / denom) * sample_delta
                 vertex_delta2 = (barycentric[2] / denom) * sample_delta
