@@ -139,6 +139,12 @@ class Example:
             help="Override the IPBF cloth pressure-reaction relaxation.",
         )
         parser.add_argument(
+            "--triangle-hydrostatic-support-scale",
+            type=float,
+            default=None,
+            help="Override the IPBF non-contact hydrostatic support scale for wet-side cloth samples.",
+        )
+        parser.add_argument(
             "--disable-triangle-contact",
             action=argparse.BooleanOptionalAction,
             default=False,
@@ -215,6 +221,7 @@ class Example:
                 "xsph_coefficient": 0.004,
                 "boundary_velocity_damping": 0.99,
                 "fsi_pressure_reaction_relaxation": 1.5,
+                "triangle_hydrostatic_support_scale": 0.0,
                 "static_boundary_weight": 0.5,
                 "decouple_cloth_boundary_density": True,
                 "triangle_contact_relaxation": 1.0,
@@ -280,6 +287,7 @@ class Example:
                 "xsph_coefficient": 0.006,
                 "boundary_velocity_damping": 0.97,
                 "fsi_pressure_reaction_relaxation": 1.5,
+                "triangle_hydrostatic_support_scale": 0.0,
                 "static_boundary_weight": 0.20,
                 "decouple_cloth_boundary_density": True,
                 "triangle_contact_relaxation": 1.0,
@@ -320,6 +328,9 @@ class Example:
         pressure_reaction_relaxation = getattr(self.args, "pressure_reaction_relaxation", None)
         if pressure_reaction_relaxation is not None:
             config["fsi_pressure_reaction_relaxation"] = float(pressure_reaction_relaxation)
+        triangle_hydrostatic_support_scale = getattr(self.args, "triangle_hydrostatic_support_scale", None)
+        if triangle_hydrostatic_support_scale is not None:
+            config["triangle_hydrostatic_support_scale"] = float(triangle_hydrostatic_support_scale)
 
         config["triangle_contact_enabled"] = not bool(getattr(self.args, "disable_triangle_contact", False))
         config["cloth_pressure_samples_enabled"] = not bool(
@@ -624,6 +635,7 @@ class Example:
                 xsph_coefficient=float(self.config["xsph_coefficient"]),
                 boundary_velocity_damping=float(self.config["boundary_velocity_damping"]),
                 fsi_pressure_reaction_relaxation=float(self.config["fsi_pressure_reaction_relaxation"]),
+                fsi_triangle_hydrostatic_support_scale=float(self.config["triangle_hydrostatic_support_scale"]),
                 fsi_static_boundary_weight=float(self.config["static_boundary_weight"]),
                 fsi_decouple_triangle_boundary_density=bool(self.config["decouple_cloth_boundary_density"]),
                 fsi_triangle_contact_enabled=bool(self.config["triangle_contact_enabled"]),
@@ -806,6 +818,7 @@ class Example:
         ui.text(f"Cloth support: {self.config['cloth_support_mode']}")
         ui.text(f"Pressure samples: {'on' if self.config['cloth_pressure_samples_enabled'] else 'off'}")
         ui.text(f"Decoupled cloth pressure: {'on' if self.config['decouple_cloth_boundary_density'] else 'off'}")
+        ui.text(f"Hydrostatic support scale: {float(self.config['triangle_hydrostatic_support_scale']):.3f}")
         ui.text(f"Triangle contact: {'on' if self.config['triangle_contact_enabled'] else 'off'}")
         ui.text(f"Fluid particles: {self.fluid_particle_count}")
         ui.text(f"Cloth particles: {self.cloth_particle_count}")

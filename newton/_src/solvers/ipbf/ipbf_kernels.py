@@ -1182,56 +1182,60 @@ def accumulate_boundary_pressure_reaction(
             continue
 
         c_effective = c
-        if decouple_triangle_boundary_density != 0 and boundary_triangle[boundary_index] >= 0:
+        is_triangle_sample = boundary_triangle[boundary_index] >= 0
+        if decouple_triangle_boundary_density != 0 and is_triangle_sample:
             c_effective = c_triangle
-        if c_effective <= 0.0:
-            continue
-        boundary_grad = (
-            weight * boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
-        )
-        if wp.dot(boundary_grad, boundary_grad) == 0.0:
-            continue
 
-        pressure_rhs = -c_effective * boundary_grad
-        pressure_delta = solve_relaxation * (inv_h * pressure_rhs)
-        if wp.dot(pressure_delta, pressure_delta) == 0.0:
-            continue
+        sample_delta = wp.vec3(0.0)
+        force_on_boundary = wp.vec3(0.0)
 
-        sample_delta = -reaction_relaxation * pressure_delta
-        force_on_boundary = equivalent_force_from_position_delta(
-            pressure_delta,
-            particle_mass[tid],
-            dt,
-            reaction_relaxation,
-        )
-
-        if boundary_triangle[boundary_index] >= 0:
-            normal = boundary_normal[boundary_index]
-            normal_component = wp.dot(sample_delta, normal)
-            if normal_component <= 0.0:
-                continue
-
-            # Gate cloth pressure support in regions already dominated by
-            # triangle-contact displacement from the previous outer / inner
-            # iteration. This resolves pressure/contact overlap earlier on the
-            # fluid-side interface path instead of trying to compensate later
-            # during VBD consumption.
+        contact_support = 0.0
+        barycentric = wp.vec3(0.0)
+        if is_triangle_sample:
             barycentric = boundary_barycentric[boundary_index]
+            normal = boundary_normal[boundary_index]
             contact_delta_prev = (
                 barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[boundary_index]]
                 + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[boundary_index]]
                 + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
             )
             contact_support = wp.dot(contact_delta_prev, normal)
-            if contact_support > 0.0:
-                continue
+        else:
+            normal = wp.vec3(0.0)
 
-            sample_delta = normal_component * normal
-            force_on_boundary = particle_mass[tid] * sample_delta / (dt * dt)
+        if c_effective > 0.0:
+            boundary_grad = (
+                weight * boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
+            )
+            if wp.dot(boundary_grad, boundary_grad) != 0.0:
+                pressure_rhs = -c_effective * boundary_grad
+                pressure_delta = solve_relaxation * (inv_h * pressure_rhs)
+                if wp.dot(pressure_delta, pressure_delta) != 0.0:
+                    pressure_sample_delta = -reaction_relaxation * pressure_delta
+                    pressure_force = equivalent_force_from_position_delta(
+                        pressure_delta,
+                        particle_mass[tid],
+                        dt,
+                        reaction_relaxation,
+                    )
+
+                    if is_triangle_sample:
+                        normal_component = wp.dot(pressure_sample_delta, normal)
+                        if normal_component > 0.0 and contact_support <= 0.0:
+                            pressure_sample_delta = normal_component * normal
+                            pressure_force = particle_mass[tid] * pressure_sample_delta / (dt * dt)
+                            sample_delta = sample_delta + pressure_sample_delta
+                            force_on_boundary = force_on_boundary + pressure_force
+                    else:
+                        sample_delta = sample_delta + pressure_sample_delta
+                        force_on_boundary = force_on_boundary + pressure_force
+
+        if wp.dot(sample_delta, sample_delta) == 0.0 or wp.dot(force_on_boundary, force_on_boundary) == 0.0:
+            continue
 
         wp.atomic_add(sample_force, boundary_index, force_on_boundary)
 
-        if boundary_triangle[boundary_index] >= 0:
+        if is_triangle_sample:
             denom = (
                 barycentric[0] * barycentric[0]
                 + barycentric[1] * barycentric[1]
@@ -1277,6 +1281,203 @@ def accumulate_boundary_pressure_reaction(
 
         wp.atomic_add(body_force, body_index, force_on_boundary)
         wp.atomic_add(body_torque, body_index, torque)
+
+
+@wp.kernel
+def accumulate_boundary_triangle_hydrostatic_state(
+    boundary_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    gravity: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    static_boundary_weight: float,
+    occupancy: wp.array(dtype=float),
+    head_sum: wp.array(dtype=float),
+):
+    """Accumulate per-sample wet occupancy and gravity-aligned head estimates."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+    if rest_density <= 0.0:
+        return
+
+    world_idx = particle_world[tid]
+    world_gravity = gravity[wp.max(world_idx, 0)]
+    gravity_magnitude = wp.length(world_gravity)
+    if gravity_magnitude <= 0.0:
+        return
+
+    gravity_up = -world_gravity / gravity_magnitude
+    xi = particle_q[tid]
+    query = wp.hash_grid_query(boundary_grid, xi, support_radius)
+    boundary_index = int(0)
+
+    while wp.hash_grid_query_next(query, boundary_index):
+        if boundary_triangle[boundary_index] < 0:
+            continue
+
+        boundary_flag = boundary_flags[boundary_index]
+        if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+            continue
+
+        weight = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+        if weight == 0.0:
+            continue
+
+        displacement = xi - boundary_x[boundary_index]
+        weight = weight * boundary_triangle_shell_weight(
+            boundary_triangle[boundary_index],
+            boundary_normal[boundary_index],
+            displacement,
+            boundary_wet_weight[boundary_index],
+        )
+        if weight == 0.0:
+            continue
+
+        head = wp.dot(boundary_x[boundary_index] - xi, gravity_up)
+        if head <= 0.0:
+            continue
+
+        pair_occupancy = weight * particle_mass[tid] * kernel_value(
+            wp.dot(displacement, displacement),
+            support_radius,
+            kernel_family,
+        ) / rest_density
+        if pair_occupancy <= 0.0:
+            continue
+
+        wp.atomic_add(occupancy, boundary_index, pair_occupancy)
+        wp.atomic_add(head_sum, boundary_index, pair_occupancy * head)
+
+
+@wp.kernel
+def apply_boundary_triangle_hydrostatic_support(
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_body: wp.array(dtype=wp.int32),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    particle_inv_mass_all: wp.array(dtype=float),
+    particle_world_all: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    gravity: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    dt: float,
+    hydrostatic_support_scale: float,
+    occupancy: wp.array(dtype=float),
+    head_sum: wp.array(dtype=float),
+    sample_force: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
+    vertex_pressure_force: wp.array(dtype=wp.vec3),
+    body_force: wp.array(dtype=wp.vec3),
+    body_torque: wp.array(dtype=wp.vec3),
+):
+    """Apply sample-level thin-shell hydrostatic support to non-contact cloth regions."""
+    tid = wp.tid()
+
+    if boundary_triangle[tid] < 0:
+        return
+    if (boundary_flags[tid] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        return
+    if boundary_wet_weight[tid] <= 0.0:
+        return
+    if rest_density <= 0.0 or dt <= 0.0 or hydrostatic_support_scale <= 0.0:
+        return
+
+    occ = occupancy[tid]
+    if occ <= 0.0:
+        return
+
+    v0 = boundary_vertex0[tid]
+    v1 = boundary_vertex1[tid]
+    v2 = boundary_vertex2[tid]
+    if v0 < 0 or v1 < 0 or v2 < 0:
+        return
+
+    world_idx = particle_world_all[v0]
+    world_gravity = gravity[wp.max(world_idx, 0)]
+    gravity_magnitude = wp.length(world_gravity)
+    if gravity_magnitude <= 0.0:
+        return
+
+    normal = boundary_normal[tid]
+    barycentric = boundary_barycentric[tid]
+    contact_delta_prev = (
+        barycentric[0] * vertex_contact_delta_prev[v0]
+        + barycentric[1] * vertex_contact_delta_prev[v1]
+        + barycentric[2] * vertex_contact_delta_prev[v2]
+    )
+    if wp.dot(contact_delta_prev, normal) > 0.0:
+        return
+
+    head = head_sum[tid] / occ
+    if head <= 0.0:
+        return
+
+    # A fully wetted thin-shell sample only sees the fluid on one side, so the
+    # local kernel occupancy corresponds to approximately half a full-space
+    # support domain. Reconstruct that one-sided occupancy into a saturating
+    # hydrostatic fill fraction before applying the sample quadrature force.
+    fill_fraction = 2.0 * occ
+    if fill_fraction > 1.0:
+        fill_fraction = 1.0
+
+    hydro_pressure = hydrostatic_support_scale * rest_density * gravity_magnitude * head * fill_fraction
+    if hydro_pressure <= 0.0:
+        return
+
+    # Boundary sample normals point toward the wetted side of the shell.
+    force_on_boundary = -hydro_pressure * boundary_area_patch[tid] * normal
+    if wp.dot(force_on_boundary, force_on_boundary) == 0.0:
+        return
+
+    vertex_delta0 = dt * dt * barycentric[0] * particle_inv_mass_all[v0] * force_on_boundary
+    vertex_delta1 = dt * dt * barycentric[1] * particle_inv_mass_all[v1] * force_on_boundary
+    vertex_delta2 = dt * dt * barycentric[2] * particle_inv_mass_all[v2] * force_on_boundary
+
+    wp.atomic_add(sample_force, tid, force_on_boundary)
+    wp.atomic_add(vertex_contact_delta, v0, vertex_delta0)
+    wp.atomic_add(vertex_contact_delta, v1, vertex_delta1)
+    wp.atomic_add(vertex_contact_delta, v2, vertex_delta2)
+    wp.atomic_add(vertex_force, v0, barycentric[0] * force_on_boundary)
+    wp.atomic_add(vertex_force, v1, barycentric[1] * force_on_boundary)
+    wp.atomic_add(vertex_force, v2, barycentric[2] * force_on_boundary)
+    wp.atomic_add(vertex_pressure_force, v0, barycentric[0] * force_on_boundary)
+    wp.atomic_add(vertex_pressure_force, v1, barycentric[1] * force_on_boundary)
+    wp.atomic_add(vertex_pressure_force, v2, barycentric[2] * force_on_boundary)
+
+    body_index = boundary_body[tid]
+    if body_index < 0:
+        return
+
+    X_wb = body_q[body_index]
+    torque = body_reaction_torque_from_world_point(
+        boundary_x[tid],
+        force_on_boundary,
+        X_wb,
+        body_com[body_index],
+    )
+    wp.atomic_add(body_force, body_index, force_on_boundary)
+    wp.atomic_add(body_torque, body_index, torque)
 
 
 @wp.kernel

@@ -35,6 +35,7 @@ from ...sim import (
 from ..solver import SolverBase
 from .ipbf_kernels import (
     accumulate_boundary_pressure_reaction,
+    accumulate_boundary_triangle_hydrostatic_state,
     accumulate_particle_shape_boundary_velocity_projection,
     accumulate_particle_shape_boundary_velocity_projection_with_reaction,
     accumulate_particle_triangle_contact_corrections,
@@ -44,6 +45,7 @@ from .ipbf_kernels import (
     accumulate_triangle_contact_pair_cache_fluid_displacement_max,
     accumulate_triangle_contact_pair_cache_triangle_displacement_max,
     apply_artificial_damping,
+    apply_boundary_triangle_hydrostatic_support,
     apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
     apply_viscosity_velocity_diffusion,
@@ -156,6 +158,10 @@ class SolverIPBF(SolverBase):
             fsi_pressure_reaction_relaxation: Unitless multiplier applied when
                 converting boundary pressure-gradient position increments into
                 FSI body reaction forces and torques.
+            fsi_triangle_hydrostatic_support_scale: Unitless multiplier used
+                to scale a supplemental non-contact hydrostatic pressure
+                support operator for wet-side triangle boundary samples. Zero
+                disables this cloth-specific thin-shell support path.
             fsi_static_boundary_weight: Unitless diagnostic multiplier applied
                 to static boundary-sample contributions in the density,
                 constraint-gradient, pressure-reaction, and boundary-aware
@@ -224,6 +230,7 @@ class SolverIPBF(SolverBase):
         fsi_projection_reaction_relaxation: float | None = None
         fsi_velocity_projection_reaction_relaxation: float | None = None
         fsi_pressure_reaction_relaxation: float = 1.0
+        fsi_triangle_hydrostatic_support_scale: float = 0.0
         fsi_static_boundary_weight: float = 1.0
         fsi_decouple_triangle_boundary_density: bool = True
         fsi_triangle_contact_enabled: bool = True
@@ -427,6 +434,9 @@ class SolverIPBF(SolverBase):
             else (legacy_reaction_relaxation if legacy_reaction_relaxation is not None else 1.0)
         )
         self.fsi_pressure_reaction_relaxation = float(self.config.fsi_pressure_reaction_relaxation)
+        self.fsi_triangle_hydrostatic_support_scale = float(self.config.fsi_triangle_hydrostatic_support_scale)
+        if self.fsi_triangle_hydrostatic_support_scale < 0.0:
+            raise ValueError("IPBF triangle hydrostatic support scale must be non-negative.")
         self.fsi_static_boundary_weight = float(self.config.fsi_static_boundary_weight)
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
@@ -502,6 +512,9 @@ class SolverIPBF(SolverBase):
             self._triangle_contact_pair_cache_displacement_max = wp.zeros(1, dtype=float)
             self._triangle_contact_pair_cache_particle_q = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_pair_cached_particle_mask = wp.zeros(model.particle_count, dtype=wp.int32)
+            boundary_sample_count = int(getattr(self.boundary_model, "sample_count", 0)) if self.boundary_model else 0
+            self._triangle_hydro_occupancy = wp.zeros(boundary_sample_count, dtype=float)
+            self._triangle_hydro_head_sum = wp.zeros(boundary_sample_count, dtype=float)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -523,6 +536,11 @@ class SolverIPBF(SolverBase):
                 raise ValueError("IPBF boundary model device must match the solver model device.")
 
         self.boundary_model = boundary_model
+        if hasattr(self, "_triangle_hydro_occupancy"):
+            boundary_sample_count = int(getattr(boundary_model, "sample_count", 0)) if boundary_model else 0
+            with wp.ScopedDevice(self.model.device):
+                self._triangle_hydro_occupancy = wp.zeros(boundary_sample_count, dtype=float)
+                self._triangle_hydro_head_sum = wp.zeros(boundary_sample_count, dtype=float)
 
     def _validate_fluid_particle_range(self) -> tuple[int, int]:
         """Return the validated consecutive particle range solved by IPBF."""
@@ -1974,6 +1992,77 @@ class SolverIPBF(SolverBase):
             outputs=[
                 boundary_model.vertex_contact_delta,
                 boundary_model.sample_force,
+                boundary_model.vertex_force,
+                boundary_model.vertex_pressure_force,
+                boundary_model.body_force,
+                boundary_model.body_torque,
+            ],
+            device=model.device,
+        )
+
+        if self.fsi_triangle_hydrostatic_support_scale == 0.0 or boundary_model.sample_count == 0:
+            return
+
+        self._triangle_hydro_occupancy.zero_()
+        self._triangle_hydro_head_sum.zero_()
+
+        wp.launch(
+            accumulate_boundary_triangle_hydrostatic_state,
+            dim=model.particle_count,
+            inputs=[
+                boundary_model.boundary_grid.id,
+                particle_q,
+                model.particle_mass,
+                self._ipbf_particle_flags,
+                model.particle_world,
+                boundary_model.sample_x_world,
+                boundary_model.sample_triangle,
+                boundary_model.sample_normal_world,
+                boundary_model.sample_wet_weight,
+                boundary_model.sample_flags,
+                model.gravity,
+                self.rest_density,
+                self.smoothing_radius,
+                self.kernel_family,
+                self.fsi_static_boundary_weight,
+            ],
+            outputs=[
+                self._triangle_hydro_occupancy,
+                self._triangle_hydro_head_sum,
+            ],
+            device=model.device,
+        )
+
+        wp.launch(
+            apply_boundary_triangle_hydrostatic_support,
+            dim=boundary_model.sample_count,
+            inputs=[
+                boundary_model.sample_x_world,
+                boundary_model.sample_body,
+                boundary_model.sample_triangle,
+                boundary_model.sample_normal_world,
+                boundary_model.sample_wet_weight,
+                boundary_model.sample_vertex0,
+                boundary_model.sample_vertex1,
+                boundary_model.sample_vertex2,
+                boundary_model.sample_barycentric,
+                boundary_model.sample_area_patch,
+                boundary_model.sample_flags,
+                model.particle_inv_mass,
+                model.particle_world,
+                self._triangle_contact_vertex_delta,
+                state.body_q if state.body_q is not None else boundary_model._empty_body_q,
+                model.body_com if model.body_com is not None else boundary_model._empty_body_com,
+                model.gravity,
+                self.rest_density,
+                dt,
+                self.fsi_triangle_hydrostatic_support_scale,
+                self._triangle_hydro_occupancy,
+                self._triangle_hydro_head_sum,
+            ],
+            outputs=[
+                boundary_model.sample_force,
+                boundary_model.vertex_contact_delta,
                 boundary_model.vertex_force,
                 boundary_model.vertex_pressure_force,
                 boundary_model.body_force,
