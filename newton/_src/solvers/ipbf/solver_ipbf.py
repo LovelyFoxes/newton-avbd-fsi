@@ -162,6 +162,10 @@ class SolverIPBF(SolverBase):
                 to scale a supplemental non-contact hydrostatic pressure
                 support operator for wet-side triangle boundary samples. Zero
                 disables this cloth-specific thin-shell support path.
+            fsi_triangle_reconstructed_support_depth_scale: Unitless
+                multiplier used to reconstruct a one-sided support volume for
+                triangle boundary samples from ``sample_area * support_radius``.
+                Zero keeps the raw sampled-shell volume.
             fsi_static_boundary_weight: Unitless diagnostic multiplier applied
                 to static boundary-sample contributions in the density,
                 constraint-gradient, pressure-reaction, and boundary-aware
@@ -231,6 +235,7 @@ class SolverIPBF(SolverBase):
         fsi_velocity_projection_reaction_relaxation: float | None = None
         fsi_pressure_reaction_relaxation: float = 1.0
         fsi_triangle_hydrostatic_support_scale: float = 0.0
+        fsi_triangle_reconstructed_support_depth_scale: float = 0.0
         fsi_static_boundary_weight: float = 1.0
         fsi_decouple_triangle_boundary_density: bool = True
         fsi_triangle_contact_enabled: bool = True
@@ -437,6 +442,11 @@ class SolverIPBF(SolverBase):
         self.fsi_triangle_hydrostatic_support_scale = float(self.config.fsi_triangle_hydrostatic_support_scale)
         if self.fsi_triangle_hydrostatic_support_scale < 0.0:
             raise ValueError("IPBF triangle hydrostatic support scale must be non-negative.")
+        self.fsi_triangle_reconstructed_support_depth_scale = float(
+            self.config.fsi_triangle_reconstructed_support_depth_scale
+        )
+        if self.fsi_triangle_reconstructed_support_depth_scale < 0.0:
+            raise ValueError("IPBF triangle reconstructed support depth scale must be non-negative.")
         self.fsi_static_boundary_weight = float(self.config.fsi_static_boundary_weight)
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
@@ -1487,12 +1497,19 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
                         boundary_model.sample_wet_weight,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[
                         state.ipbf.density,
@@ -1518,8 +1535,14 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
                         boundary_model.sample_wet_weight,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         state.ipbf.density,
                         self._triangle_boundary_density,
@@ -1528,6 +1551,7 @@ class SolverIPBF(SolverBase):
                         self.kernel_family,
                         int(self.use_constraint_clamp),
                         int(self.fsi_decouple_triangle_boundary_density),
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
                     device=model.device,
@@ -1581,12 +1605,19 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
                         boundary_model.sample_wet_weight,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[
                         state.ipbf.density,
@@ -1609,8 +1640,14 @@ class SolverIPBF(SolverBase):
                         boundary_model.sample_triangle,
                         boundary_model.sample_normal_world,
                         boundary_model.sample_wet_weight,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         state.ipbf.density,
                         self._triangle_boundary_density,
@@ -1619,6 +1656,7 @@ class SolverIPBF(SolverBase):
                         self.kernel_family,
                         int(self.use_constraint_clamp),
                         int(self.fsi_decouple_triangle_boundary_density),
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
                     device=model.device,
@@ -1974,6 +2012,7 @@ class SolverIPBF(SolverBase):
                 boundary_model.sample_vertex1,
                 boundary_model.sample_vertex2,
                 boundary_model.sample_barycentric,
+                boundary_model.sample_area_patch,
                 boundary_model.sample_volume_hydrostatic,
                 boundary_model.sample_flags,
                 self._triangle_boundary_density,
@@ -1986,6 +2025,7 @@ class SolverIPBF(SolverBase):
                 dt,
                 self.relaxation,
                 self.fsi_pressure_reaction_relaxation,
+                self.fsi_triangle_reconstructed_support_depth_scale,
                 int(self.fsi_decouple_triangle_boundary_density),
                 self._triangle_contact_vertex_delta,
             ],

@@ -275,6 +275,33 @@ def boundary_triangle_shell_weight(
     return 0.0
 
 
+@wp.func
+def boundary_triangle_reconstructed_volume(
+    boundary_triangle: int,
+    boundary_volume: float,
+    boundary_area_patch: float,
+    support_radius: float,
+    reconstructed_support_depth_scale: float,
+    contact_support: float,
+) -> float:
+    """Return optional one-sided reconstructed volume for cloth samples."""
+    if boundary_triangle < 0 or reconstructed_support_depth_scale <= 0.0:
+        return boundary_volume
+
+    reconstructed_volume = reconstructed_support_depth_scale * boundary_area_patch * support_radius
+    if reconstructed_volume <= boundary_volume:
+        return boundary_volume
+
+    extra_volume = reconstructed_volume - boundary_volume
+    if contact_support > 0.0 and support_radius > 0.0:
+        contact_ratio = contact_support / support_radius
+        if contact_ratio >= 1.0:
+            return boundary_volume
+        extra_volume = extra_volume * (1.0 - contact_ratio)
+
+    return boundary_volume + extra_volume
+
+
 @wp.kernel
 def update_boundary_triangle_wet_weights(
     grid: wp.uint64,
@@ -433,12 +460,19 @@ def initialize_density_and_neighbor_count_with_boundary(
     boundary_triangle: wp.array(dtype=wp.int32),
     boundary_normal: wp.array(dtype=wp.vec3),
     boundary_wet_weight: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     rest_density: float,
     support_radius: float,
     kernel_family: int,
+    reconstructed_support_depth_scale: float,
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
     density_boundary: wp.array(dtype=float),
@@ -484,7 +518,25 @@ def initialize_density_and_neighbor_count_with_boundary(
         if kernel <= 0.0:
             continue
 
-        boundary_density = weight * rest_density * boundary_volume[index] * kernel
+        contact_support = float(0.0)
+        if boundary_triangle[index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[index])
+
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[index],
+            boundary_volume[index],
+            boundary_area_patch[index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
+        boundary_density = weight * rest_density * effective_volume * kernel
         rho_boundary += boundary_density
         if boundary_triangle[index] >= 0:
             rho_triangle_boundary += boundary_density
@@ -531,8 +583,14 @@ def initialize_constraint_and_gradient_with_boundary(
     boundary_triangle: wp.array(dtype=wp.int32),
     boundary_normal: wp.array(dtype=wp.vec3),
     boundary_wet_weight: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     density: wp.array(dtype=float),
     density_triangle_boundary: wp.array(dtype=float),
@@ -541,6 +599,7 @@ def initialize_constraint_and_gradient_with_boundary(
     kernel_family: int,
     use_constraint_clamp: int,
     decouple_triangle_boundary_density: int,
+    reconstructed_support_depth_scale: float,
     constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
 ):
@@ -587,10 +646,27 @@ def initialize_constraint_and_gradient_with_boundary(
             continue
         if decouple_triangle_boundary_density != 0 and boundary_triangle[index] >= 0:
             continue
+        contact_support = float(0.0)
+        if boundary_triangle[index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[index])
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[index],
+            boundary_volume[index],
+            boundary_area_patch[index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
         grad += (
             weight
             * rest_density
-            * boundary_volume[index]
+            * effective_volume
             * kernel_gradient(displacement, support_radius, kernel_family)
         )
 
@@ -660,12 +736,19 @@ def compute_density_and_neighbor_count_with_boundary(
     boundary_triangle: wp.array(dtype=wp.int32),
     boundary_normal: wp.array(dtype=wp.vec3),
     boundary_wet_weight: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     rest_density: float,
     support_radius: float,
     kernel_family: int,
+    reconstructed_support_depth_scale: float,
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
     density_boundary: wp.array(dtype=float),
@@ -737,7 +820,25 @@ def compute_density_and_neighbor_count_with_boundary(
         if kernel <= 0.0:
             continue
 
-        boundary_density = weight * rest_density * boundary_volume[boundary_index] * kernel
+        contact_support = float(0.0)
+        if boundary_triangle[boundary_index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[boundary_index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[boundary_index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[boundary_index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[boundary_index])
+
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[boundary_index],
+            boundary_volume[boundary_index],
+            boundary_area_patch[boundary_index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
+        boundary_density = weight * rest_density * effective_volume * kernel
         rho_boundary += boundary_density
         if boundary_triangle[boundary_index] >= 0:
             rho_triangle_boundary += boundary_density
@@ -813,8 +914,14 @@ def compute_constraint_and_gradient_with_boundary(
     boundary_triangle: wp.array(dtype=wp.int32),
     boundary_normal: wp.array(dtype=wp.vec3),
     boundary_wet_weight: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     density: wp.array(dtype=float),
     density_triangle_boundary: wp.array(dtype=float),
@@ -823,6 +930,7 @@ def compute_constraint_and_gradient_with_boundary(
     kernel_family: int,
     use_constraint_clamp: int,
     decouple_triangle_boundary_density: int,
+    reconstructed_support_depth_scale: float,
     constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
 ):
@@ -884,10 +992,27 @@ def compute_constraint_and_gradient_with_boundary(
             continue
         if decouple_triangle_boundary_density != 0 and boundary_triangle[boundary_index] >= 0:
             continue
+        contact_support = float(0.0)
+        if boundary_triangle[boundary_index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[boundary_index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[boundary_index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[boundary_index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[boundary_index])
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[boundary_index],
+            boundary_volume[boundary_index],
+            boundary_area_patch[boundary_index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
         grad += (
             weight
             * rest_density
-            * boundary_volume[boundary_index]
+            * effective_volume
             * kernel_gradient(displacement, support_radius, kernel_family)
         )
 
@@ -1116,6 +1241,7 @@ def accumulate_boundary_pressure_reaction(
     boundary_vertex1: wp.array(dtype=wp.int32),
     boundary_vertex2: wp.array(dtype=wp.int32),
     boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
     density_triangle_boundary: wp.array(dtype=float),
@@ -1128,6 +1254,7 @@ def accumulate_boundary_pressure_reaction(
     dt: float,
     solve_relaxation: float,
     reaction_relaxation: float,
+    reconstructed_support_depth_scale: float,
     decouple_triangle_boundary_density: int,
     vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
@@ -1204,8 +1331,16 @@ def accumulate_boundary_pressure_reaction(
             normal = wp.vec3(0.0)
 
         if c_effective > 0.0:
+            effective_volume = boundary_triangle_reconstructed_volume(
+                boundary_triangle[boundary_index],
+                boundary_volume[boundary_index],
+                boundary_area_patch[boundary_index],
+                support_radius,
+                reconstructed_support_depth_scale,
+                contact_support,
+            )
             boundary_grad = (
-                weight * boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
+                weight * effective_volume * kernel_gradient(displacement, support_radius, kernel_family)
             )
             if wp.dot(boundary_grad, boundary_grad) != 0.0:
                 pressure_rhs = -c_effective * boundary_grad
@@ -1221,7 +1356,9 @@ def accumulate_boundary_pressure_reaction(
 
                     if is_triangle_sample:
                         normal_component = wp.dot(pressure_sample_delta, normal)
-                        if normal_component > 0.0 and contact_support <= 0.0:
+                        # Triangle normals define the wet side; fluid pressure
+                        # supports the shell in the opposite direction.
+                        if normal_component < 0.0 and contact_support <= 0.0:
                             pressure_sample_delta = normal_component * normal
                             pressure_force = particle_mass[tid] * pressure_sample_delta / (dt * dt)
                             sample_delta = sample_delta + pressure_sample_delta
