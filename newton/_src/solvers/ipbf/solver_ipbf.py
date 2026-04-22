@@ -1969,6 +1969,7 @@ class SolverIPBF(SolverBase):
                 self.relaxation,
                 self.fsi_pressure_reaction_relaxation,
                 int(self.fsi_decouple_triangle_boundary_density),
+                self._triangle_contact_vertex_delta,
             ],
             outputs=[
                 boundary_model.vertex_contact_delta,

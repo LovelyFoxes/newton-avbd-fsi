@@ -1129,6 +1129,7 @@ def accumulate_boundary_pressure_reaction(
     solve_relaxation: float,
     reaction_relaxation: float,
     decouple_triangle_boundary_density: int,
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
     sample_force: wp.array(dtype=wp.vec3),
     vertex_force: wp.array(dtype=wp.vec3),
@@ -1209,13 +1210,28 @@ def accumulate_boundary_pressure_reaction(
             normal_component = wp.dot(sample_delta, normal)
             if normal_component <= 0.0:
                 continue
+
+            # Gate cloth pressure support in regions already dominated by
+            # triangle-contact displacement from the previous outer / inner
+            # iteration. This resolves pressure/contact overlap earlier on the
+            # fluid-side interface path instead of trying to compensate later
+            # during VBD consumption.
+            barycentric = boundary_barycentric[boundary_index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[boundary_index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[boundary_index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, normal)
+            if contact_support > 0.0:
+                continue
+
             sample_delta = normal_component * normal
             force_on_boundary = particle_mass[tid] * sample_delta / (dt * dt)
 
         wp.atomic_add(sample_force, boundary_index, force_on_boundary)
 
         if boundary_triangle[boundary_index] >= 0:
-            barycentric = boundary_barycentric[boundary_index]
             denom = (
                 barycentric[0] * barycentric[0]
                 + barycentric[1] * barycentric[1]
