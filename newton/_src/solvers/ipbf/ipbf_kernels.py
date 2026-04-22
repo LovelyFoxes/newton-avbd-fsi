@@ -1285,7 +1285,7 @@ def accumulate_boundary_pressure_reaction(
 
 @wp.kernel
 def accumulate_boundary_triangle_hydrostatic_state(
-    boundary_grid: wp.uint64,
+    particle_grid: wp.uint64,
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
@@ -1294,6 +1294,7 @@ def accumulate_boundary_triangle_hydrostatic_state(
     boundary_triangle: wp.array(dtype=wp.int32),
     boundary_normal: wp.array(dtype=wp.vec3),
     boundary_wet_weight: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
     boundary_flags: wp.array(dtype=wp.int32),
     gravity: wp.array(dtype=wp.vec3),
     rest_density: float,
@@ -1301,63 +1302,75 @@ def accumulate_boundary_triangle_hydrostatic_state(
     kernel_family: int,
     static_boundary_weight: float,
     occupancy: wp.array(dtype=float),
-    head_sum: wp.array(dtype=float),
+    surface_height_max: wp.array(dtype=float),
 ):
-    """Accumulate per-sample wet occupancy and gravity-aligned head estimates."""
+    """Reconstruct per-sample wet occupancy and local free-surface height."""
     tid = wp.tid()
 
-    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+    if boundary_triangle[tid] < 0:
+        return
+    if (boundary_flags[tid] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        return
+    if boundary_wet_weight[tid] <= 0.0:
         return
     if rest_density <= 0.0:
         return
 
-    world_idx = particle_world[tid]
+    boundary_flag = boundary_flags[tid]
+    weight_scale = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+    if weight_scale == 0.0:
+        return
+
+    v0 = boundary_vertex0[tid]
+    if v0 < 0:
+        return
+
+    world_idx = particle_world[v0]
     world_gravity = gravity[wp.max(world_idx, 0)]
     gravity_magnitude = wp.length(world_gravity)
     if gravity_magnitude <= 0.0:
         return
 
     gravity_up = -world_gravity / gravity_magnitude
-    xi = particle_q[tid]
-    query = wp.hash_grid_query(boundary_grid, xi, support_radius)
-    boundary_index = int(0)
+    xb = boundary_x[tid]
+    sample_height = wp.dot(xb, gravity_up)
+    occ = float(0.0)
+    height_max = float(sample_height)
 
-    while wp.hash_grid_query_next(query, boundary_index):
-        if boundary_triangle[boundary_index] < 0:
+    query = wp.hash_grid_query(particle_grid, xb, support_radius)
+    particle_index = int(0)
+
+    while wp.hash_grid_query_next(query, particle_index):
+        if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+            continue
+        if particle_world[particle_index] != world_idx:
             continue
 
-        boundary_flag = boundary_flags[boundary_index]
-        if (boundary_flag & _BOUNDARY_SAMPLE_ACTIVE) == 0:
-            continue
-
-        weight = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
-        if weight == 0.0:
-            continue
-
-        displacement = xi - boundary_x[boundary_index]
-        weight = weight * boundary_triangle_shell_weight(
-            boundary_triangle[boundary_index],
-            boundary_normal[boundary_index],
+        displacement = particle_q[particle_index] - xb
+        weight = weight_scale * boundary_triangle_shell_weight(
+            boundary_triangle[tid],
+            boundary_normal[tid],
             displacement,
-            boundary_wet_weight[boundary_index],
+            boundary_wet_weight[tid],
         )
         if weight == 0.0:
             continue
 
-        head = wp.dot(boundary_x[boundary_index] - xi, gravity_up)
-        if head <= 0.0:
+        dist2 = wp.dot(displacement, displacement)
+        kernel_w = kernel_value(dist2, support_radius, kernel_family)
+        if kernel_w <= 0.0:
             continue
 
-        pair_occupancy = weight * particle_mass[tid] * kernel_value(
-            wp.dot(displacement, displacement),
-            support_radius,
-            kernel_family,
-        ) / rest_density
+        pair_occupancy = weight * particle_mass[particle_index] * kernel_w / rest_density
         if pair_occupancy <= 0.0:
             continue
 
-        wp.atomic_add(occupancy, boundary_index, pair_occupancy)
-        wp.atomic_add(head_sum, boundary_index, pair_occupancy * head)
+        occ = occ + pair_occupancy
+        particle_height = wp.dot(particle_q[particle_index], gravity_up)
+        height_max = wp.max(height_max, particle_height)
+
+    occupancy[tid] = occ
+    surface_height_max[tid] = height_max
 
 
 @wp.kernel
@@ -1383,7 +1396,7 @@ def apply_boundary_triangle_hydrostatic_support(
     dt: float,
     hydrostatic_support_scale: float,
     occupancy: wp.array(dtype=float),
-    head_sum: wp.array(dtype=float),
+    surface_height_max: wp.array(dtype=float),
     sample_force: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
     vertex_force: wp.array(dtype=wp.vec3),
@@ -1418,6 +1431,7 @@ def apply_boundary_triangle_hydrostatic_support(
     gravity_magnitude = wp.length(world_gravity)
     if gravity_magnitude <= 0.0:
         return
+    gravity_up = -world_gravity / gravity_magnitude
 
     normal = boundary_normal[tid]
     barycentric = boundary_barycentric[tid]
@@ -1429,7 +1443,8 @@ def apply_boundary_triangle_hydrostatic_support(
     if wp.dot(contact_delta_prev, normal) > 0.0:
         return
 
-    head = head_sum[tid] / occ
+    sample_height = wp.dot(boundary_x[tid], gravity_up)
+    head = surface_height_max[tid] - sample_height
     if head <= 0.0:
         return
 

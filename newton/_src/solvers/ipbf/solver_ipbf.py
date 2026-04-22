@@ -514,7 +514,7 @@ class SolverIPBF(SolverBase):
             self._triangle_contact_pair_cached_particle_mask = wp.zeros(model.particle_count, dtype=wp.int32)
             boundary_sample_count = int(getattr(self.boundary_model, "sample_count", 0)) if self.boundary_model else 0
             self._triangle_hydro_occupancy = wp.zeros(boundary_sample_count, dtype=float)
-            self._triangle_hydro_head_sum = wp.zeros(boundary_sample_count, dtype=float)
+            self._triangle_hydro_surface_height = wp.zeros(boundary_sample_count, dtype=float)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -540,7 +540,7 @@ class SolverIPBF(SolverBase):
             boundary_sample_count = int(getattr(boundary_model, "sample_count", 0)) if boundary_model else 0
             with wp.ScopedDevice(self.model.device):
                 self._triangle_hydro_occupancy = wp.zeros(boundary_sample_count, dtype=float)
-                self._triangle_hydro_head_sum = wp.zeros(boundary_sample_count, dtype=float)
+                self._triangle_hydro_surface_height = wp.zeros(boundary_sample_count, dtype=float)
 
     def _validate_fluid_particle_range(self) -> tuple[int, int]:
         """Return the validated consecutive particle range solved by IPBF."""
@@ -2000,17 +2000,21 @@ class SolverIPBF(SolverBase):
             device=model.device,
         )
 
-        if self.fsi_triangle_hydrostatic_support_scale == 0.0 or boundary_model.sample_count == 0:
+        if (
+            self.fsi_triangle_hydrostatic_support_scale == 0.0
+            or boundary_model.sample_count == 0
+            or model.particle_grid is None
+        ):
             return
 
         self._triangle_hydro_occupancy.zero_()
-        self._triangle_hydro_head_sum.zero_()
+        self._triangle_hydro_surface_height.zero_()
 
         wp.launch(
             accumulate_boundary_triangle_hydrostatic_state,
-            dim=model.particle_count,
+            dim=boundary_model.sample_count,
             inputs=[
-                boundary_model.boundary_grid.id,
+                model.particle_grid.id,
                 particle_q,
                 model.particle_mass,
                 self._ipbf_particle_flags,
@@ -2019,6 +2023,7 @@ class SolverIPBF(SolverBase):
                 boundary_model.sample_triangle,
                 boundary_model.sample_normal_world,
                 boundary_model.sample_wet_weight,
+                boundary_model.sample_vertex0,
                 boundary_model.sample_flags,
                 model.gravity,
                 self.rest_density,
@@ -2028,7 +2033,7 @@ class SolverIPBF(SolverBase):
             ],
             outputs=[
                 self._triangle_hydro_occupancy,
-                self._triangle_hydro_head_sum,
+                self._triangle_hydro_surface_height,
             ],
             device=model.device,
         )
@@ -2058,7 +2063,7 @@ class SolverIPBF(SolverBase):
                 dt,
                 self.fsi_triangle_hydrostatic_support_scale,
                 self._triangle_hydro_occupancy,
-                self._triangle_hydro_head_sum,
+                self._triangle_hydro_surface_height,
             ],
             outputs=[
                 boundary_model.sample_force,
