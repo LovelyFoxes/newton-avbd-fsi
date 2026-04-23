@@ -731,7 +731,6 @@ class Example:
             self.model,
             spacing=float(self.config["boundary_spacing"]),
             support_radius=float(self.config["smoothing_radius"]),
-            hydrostatic_volume_mode=FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_QUADRATURE,
             include_static=True,
             include_dynamic=True,
             include_triangles=True,
