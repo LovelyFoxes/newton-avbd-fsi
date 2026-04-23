@@ -88,6 +88,30 @@ class Example:
             help="Override the IPBF cloth triangle-contact relaxation.",
         )
         parser.add_argument(
+            "--pressure-reaction-relaxation",
+            type=float,
+            default=None,
+            help="Override the IPBF cloth pressure-reaction relaxation.",
+        )
+        parser.add_argument(
+            "--triangle-velocity-damping",
+            type=float,
+            default=None,
+            help="Override the cloth tangential velocity damping used by triangle velocity projection.",
+        )
+        parser.add_argument(
+            "--triangle-velocity-projection",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable a cloth tangential velocity projection / slip-no-slip path in IPBF.",
+        )
+        parser.add_argument(
+            "--cloth-pressure-samples",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Enable cloth triangle boundary samples in the IPBF density/pressure paths.",
+        )
+        parser.add_argument(
             "--release-step",
             type=int,
             default=None,
@@ -169,6 +193,9 @@ class Example:
                 "xsph_coefficient": 0.004,
                 "boundary_velocity_damping": 1.0,
                 "fsi_pressure_reaction_relaxation": 1.0,
+                "triangle_velocity_projection_enabled": True,
+                "triangle_velocity_damping": 0.50,
+                "cloth_pressure_samples_enabled": False,
                 "static_boundary_weight": 0.5,
                 "triangle_contact_relaxation": 1.0,
                 "boundary_spacing": 0.030,
@@ -184,11 +211,11 @@ class Example:
             }
         else:
             config = {
-                "tank_half_width": 1.00,
-                "tank_half_depth": 0.80,
-                "tank_wall_height": 0.64,
+                "tank_half_width": 0.54,
+                "tank_half_depth": 0.42,
+                "tank_wall_height": 0.40,
                 "tank_wall_thickness": 0.035,
-                "fluid_reservoir_center": (-0.68, 1.4, 0.0),
+                "fluid_reservoir_center": (-0.68, 1.6, 0.0),
                 "fluid_reservoir_half_width": 0.24,
                 "fluid_reservoir_half_height": 0.56,
                 "fluid_reservoir_half_depth": 0.24,
@@ -215,9 +242,9 @@ class Example:
                 "cloth_particle_mass": 0.0075,
                 "cloth_particle_radius": 0.0055,
                 "cloth_centers": (
-                    (0.20, 0.90, 0.05),
-                    (-0.20, 0.65, -0.05),
-                    (0.20, 0.40, 0.0),
+                    (0.20, 1.10, 0.05),
+                    (-0.20, 0.85, -0.05),
+                    (0.20, 0.60, 0.0),
                 ),
                 "cloth_tilt_degrees": (35.0, -30.0, 30.0),
                 "cloth_tri_ke": 240.0,
@@ -236,7 +263,10 @@ class Example:
                 "viscosity_coefficient": 0.0025,
                 "xsph_coefficient": 0.006,
                 "boundary_velocity_damping": 0.97,
-                "fsi_pressure_reaction_relaxation": 1.5,
+                "fsi_pressure_reaction_relaxation": 1.0,
+                "triangle_velocity_projection_enabled": True,
+                "triangle_velocity_damping": 0.50,
+                "cloth_pressure_samples_enabled": False,
                 "static_boundary_weight": 0.20,
                 "triangle_contact_relaxation": 1.0,
                 "boundary_spacing": 0.020,
@@ -270,6 +300,18 @@ class Example:
         triangle_contact_relaxation = getattr(self.args, "triangle_contact_relaxation", None)
         if triangle_contact_relaxation is not None:
             config["triangle_contact_relaxation"] = float(triangle_contact_relaxation)
+        pressure_reaction_relaxation = getattr(self.args, "pressure_reaction_relaxation", None)
+        if pressure_reaction_relaxation is not None:
+            config["fsi_pressure_reaction_relaxation"] = float(pressure_reaction_relaxation)
+        triangle_velocity_damping = getattr(self.args, "triangle_velocity_damping", None)
+        if triangle_velocity_damping is not None:
+            config["triangle_velocity_damping"] = float(triangle_velocity_damping)
+        triangle_velocity_projection = getattr(self.args, "triangle_velocity_projection", None)
+        if triangle_velocity_projection is not None:
+            config["triangle_velocity_projection_enabled"] = bool(triangle_velocity_projection)
+        cloth_pressure_samples = getattr(self.args, "cloth_pressure_samples", None)
+        if cloth_pressure_samples is not None:
+            config["cloth_pressure_samples_enabled"] = bool(cloth_pressure_samples)
 
         config["cloth_self_contact_enabled"] = bool(getattr(self.args, "cloth_self_contact", False))
         return config
@@ -318,6 +360,10 @@ class Example:
         ui.text(f"Fluid gate release: {int(self.config['fluid_release_step'])}")
         ui.text(f"Fluid gate duration: {int(self.config['fluid_gate_open_duration_frames'])}")
         ui.text(f"Fluid gate open: {'yes' if self._fluid_gate_is_open() else 'no'}")
+        ui.text(f"Cloth pressure samples: {'on' if self.config['cloth_pressure_samples_enabled'] else 'off'}")
+        ui.text(f"Pressure reaction: {float(self.config['fsi_pressure_reaction_relaxation']):.2f}")
+        ui.text(f"Triangle velocity projection: {'on' if self.config['triangle_velocity_projection_enabled'] else 'off'}")
+        ui.text(f"Triangle velocity damping: {float(self.config['triangle_velocity_damping']):.2f}")
 
     def _tunnel_rotation(self) -> wp.quat:
         return wp.quat_identity()
@@ -692,6 +738,8 @@ class Example:
             deformable_sample_thickness=float(self.config["fluid_radius"]) * 2.0,
             device=self.model.device,
         )
+        if not bool(self.config["cloth_pressure_samples_enabled"]):
+            self.boundary_model.set_triangle_boundary_samples_active(False)
         self.fluid_solver = SolverIPBF(
             self.model,
             SolverIPBF.Config(
@@ -704,6 +752,8 @@ class Example:
                 xsph_coefficient=float(self.config["xsph_coefficient"]),
                 boundary_velocity_damping=float(self.config["boundary_velocity_damping"]),
                 fsi_pressure_reaction_relaxation=float(self.config["fsi_pressure_reaction_relaxation"]),
+                fsi_triangle_velocity_projection_enabled=bool(self.config["triangle_velocity_projection_enabled"]),
+                fsi_triangle_velocity_damping=float(self.config["triangle_velocity_damping"]),
                 fsi_static_boundary_weight=float(self.config["static_boundary_weight"]),
                 fsi_triangle_contact_enabled=True,
                 fsi_triangle_contact_margin=0.0,

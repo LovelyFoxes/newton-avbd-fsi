@@ -255,6 +255,301 @@ def boundary_density_pressure_weight(boundary_flag: int, static_boundary_weight:
     return 1.0
 
 
+@wp.func
+def saturate_unit(value: float) -> float:
+    """Clamp a scalar to the unit interval."""
+    return wp.max(0.0, wp.min(1.0, value))
+
+
+@wp.func
+def hysteresis_blend(previous_value: float, measured_value: float, rise_rate: float, fall_rate: float) -> float:
+    """Blend a scalar toward a new measurement with separate rise/fall rates."""
+    blend = rise_rate
+    if measured_value < previous_value:
+        blend = fall_rate
+    return saturate_unit(previous_value + blend * (measured_value - previous_value))
+
+
+@wp.func
+def boundary_triangle_pressure_difference_from_wetness(
+    boundary_wet_weight_same_side: float,
+    boundary_wet_weight_opposite_side: float,
+) -> float:
+    """Return a clamped one-sided pressure-difference weight."""
+    return saturate_unit(boundary_wet_weight_same_side - boundary_wet_weight_opposite_side)
+
+
+@wp.func
+def boundary_triangle_same_side_weight(
+    boundary_triangle: int,
+    boundary_normal: wp.vec3,
+    displacement: wp.vec3,
+    boundary_wet_weight_same_side: float,
+) -> float:
+    """Return same-side support weight for deformable shell samples."""
+    if boundary_triangle < 0:
+        return 1.0
+
+    if boundary_wet_weight_same_side <= 0.0:
+        return 0.0
+
+    if wp.dot(displacement, boundary_normal) >= 0.0:
+        return boundary_wet_weight_same_side
+
+    return 0.0
+
+
+@wp.func
+def boundary_triangle_pressure_difference_weight(
+    boundary_triangle: int,
+    boundary_normal: wp.vec3,
+    displacement: wp.vec3,
+    boundary_wet_weight_same_side: float,
+    boundary_wet_weight_opposite_side: float,
+) -> float:
+    """Return one-sided shell pressure weight from the two-sided wetness state."""
+    if boundary_triangle < 0:
+        return 1.0
+
+    if wp.dot(displacement, boundary_normal) < 0.0:
+        return 0.0
+
+    pressure_difference_weight = boundary_triangle_pressure_difference_from_wetness(
+        boundary_wet_weight_same_side,
+        boundary_wet_weight_opposite_side,
+    )
+    if pressure_difference_weight <= 0.0:
+        return 0.0
+
+    return pressure_difference_weight
+
+
+@wp.func
+def boundary_triangle_velocity_side_weight(
+    signed_plane_distance: float,
+    boundary_wet_weight_same_side: float,
+    boundary_wet_weight_opposite_side: float,
+) -> float:
+    """Return the active-side wetness weight for cloth velocity coupling."""
+    if signed_plane_distance >= 0.0:
+        return saturate_unit(boundary_wet_weight_same_side)
+
+    return saturate_unit(boundary_wet_weight_opposite_side)
+
+
+@wp.func
+def opposite_side_contact_relaxation_scale(
+    side_wet_weight: float,
+    min_scale: float,
+    wetness_power: float,
+) -> float:
+    """Map opposite-side wetness into a bounded contact-relaxation scale."""
+    wetness = saturate_unit(side_wet_weight)
+    weighted_wetness = wp.pow(wetness, wetness_power)
+    return min_scale + (1.0 - min_scale) * weighted_wetness
+
+
+@wp.func
+def boundary_triangle_reconstructed_volume(
+    boundary_triangle: int,
+    boundary_volume: float,
+    boundary_area_patch: float,
+    support_radius: float,
+    reconstructed_support_depth_scale: float,
+    contact_support: float,
+) -> float:
+    """Return optional one-sided reconstructed volume for cloth samples."""
+    if boundary_triangle < 0 or reconstructed_support_depth_scale <= 0.0:
+        return boundary_volume
+
+    reconstructed_volume = reconstructed_support_depth_scale * boundary_area_patch * support_radius
+    if reconstructed_volume <= boundary_volume:
+        return boundary_volume
+
+    extra_volume = reconstructed_volume - boundary_volume
+    if contact_support > 0.0 and support_radius > 0.0:
+        contact_ratio = contact_support / support_radius
+        if contact_ratio >= 1.0:
+            return boundary_volume
+        extra_volume = extra_volume * (1.0 - contact_ratio)
+
+    return boundary_volume + extra_volume
+
+
+@wp.func
+def triangle_contact_handoff_weight(
+    displacement: wp.vec3,
+    particle_radius: float,
+    triangle_contact_margin: float,
+    triangle_pressure_contact_exclusion_scale: float,
+    contact_support: float,
+) -> float:
+    """Return a smooth pressure/contact ownership weight in ``[0, 1]``."""
+    if triangle_pressure_contact_exclusion_scale <= 0.0:
+        return 1.0
+
+    handoff_distance = triangle_pressure_contact_exclusion_scale * (particle_radius + triangle_contact_margin)
+    if handoff_distance <= 0.0:
+        return 1.0
+
+    distance = wp.sqrt(wp.dot(displacement, displacement))
+    proximity_ratio = 1.0 - saturate_unit(distance / handoff_distance)
+    support_ratio = saturate_unit(contact_support / handoff_distance)
+    return saturate_unit(1.0 - wp.max(proximity_ratio, support_ratio))
+
+
+@wp.func
+def triangle_contact_support_handoff_weight(
+    contact_support: float,
+    support_radius: float,
+    triangle_pressure_contact_exclusion_scale: float,
+) -> float:
+    """Return a sample-level hydro/contact handoff weight in ``[0, 1]``."""
+    if triangle_pressure_contact_exclusion_scale <= 0.0:
+        return 1.0
+
+    handoff_distance = triangle_pressure_contact_exclusion_scale * support_radius
+    if handoff_distance <= 0.0:
+        return 1.0
+
+    support_ratio = saturate_unit(contact_support / handoff_distance)
+    return 1.0 - support_ratio
+
+
+@wp.kernel
+def update_boundary_triangle_wet_weights(
+    grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    wetness_rise_rate: float,
+    wetness_fall_rate: float,
+    opposite_side_wetness_rise_rate: float,
+    opposite_side_wetness_fall_rate: float,
+    boundary_wet_weight_same_side_prev: wp.array(dtype=float),
+    boundary_wet_weight_opposite_side_prev: wp.array(dtype=float),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_wet_weight_opposite_side: wp.array(dtype=float),
+    boundary_wet_weight: wp.array(dtype=float),
+):
+    """Update continuous two-sided wetness estimates for deformable triangles."""
+    tid = wp.tid()
+
+    if boundary_triangle[tid] < 0:
+        boundary_wet_weight_same_side[tid] = 1.0
+        boundary_wet_weight_opposite_side[tid] = 1.0
+        boundary_wet_weight[tid] = 1.0
+        return
+    if rest_density <= 0.0:
+        boundary_wet_weight_same_side[tid] = 0.0
+        boundary_wet_weight_opposite_side[tid] = 0.0
+        boundary_wet_weight[tid] = 0.0
+        return
+
+    xi = boundary_x[tid]
+    normal = boundary_normal[tid]
+    same_side_occupancy = float(0.0)
+    opposite_side_occupancy = float(0.0)
+
+    query = wp.hash_grid_query(grid, xi, support_radius)
+    index = int(0)
+
+    while wp.hash_grid_query_next(query, index):
+        if (particle_flags[index] & ParticleFlags.ACTIVE) == 0:
+            continue
+
+        displacement = particle_q[index] - xi
+        dist2 = wp.dot(displacement, displacement)
+        kernel_w = kernel_value(dist2, support_radius, kernel_family)
+        if kernel_w <= 0.0:
+            continue
+
+        occupancy = particle_mass[index] * kernel_w / rest_density
+        if occupancy <= 0.0:
+            continue
+
+        if wp.dot(displacement, normal) >= 0.0:
+            same_side_occupancy = same_side_occupancy + occupancy
+        else:
+            opposite_side_occupancy = opposite_side_occupancy + occupancy
+
+    same_side_wet_weight_measured = saturate_unit(2.0 * same_side_occupancy)
+    opposite_side_wet_weight_measured = saturate_unit(2.0 * opposite_side_occupancy)
+    same_side_wet_weight = hysteresis_blend(
+        boundary_wet_weight_same_side_prev[tid],
+        same_side_wet_weight_measured,
+        wetness_rise_rate,
+        wetness_fall_rate,
+    )
+    opposite_side_wet_weight = hysteresis_blend(
+        boundary_wet_weight_opposite_side_prev[tid],
+        opposite_side_wet_weight_measured,
+        opposite_side_wetness_rise_rate,
+        opposite_side_wetness_fall_rate,
+    )
+    boundary_wet_weight_same_side[tid] = same_side_wet_weight
+    boundary_wet_weight_opposite_side[tid] = opposite_side_wet_weight
+    boundary_wet_weight[tid] = wp.max(same_side_wet_weight, opposite_side_wet_weight)
+
+
+@wp.kernel
+def clear_triangle_wetness_accumulators(
+    triangle_wet_weight_same_side_sum: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side_sum: wp.array(dtype=float),
+):
+    """Clear triangle-level wetness accumulation buffers."""
+    tid = wp.tid()
+    triangle_wet_weight_same_side_sum[tid] = 0.0
+    triangle_wet_weight_opposite_side_sum[tid] = 0.0
+
+
+@wp.kernel
+def accumulate_triangle_wetness_from_samples(
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_wet_weight_opposite_side: wp.array(dtype=float),
+    triangle_wet_weight_same_side_sum: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side_sum: wp.array(dtype=float),
+):
+    """Accumulate sample-level cloth wetness back onto model triangles."""
+    tid = wp.tid()
+
+    triangle_index = boundary_triangle[tid]
+    if triangle_index < 0:
+        return
+
+    wp.atomic_add(triangle_wet_weight_same_side_sum, triangle_index, boundary_wet_weight_same_side[tid])
+    wp.atomic_add(triangle_wet_weight_opposite_side_sum, triangle_index, boundary_wet_weight_opposite_side[tid])
+
+
+@wp.kernel
+def finalize_triangle_wetness(
+    triangle_sample_count: wp.array(dtype=wp.int32),
+    triangle_wet_weight_same_side_sum: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side_sum: wp.array(dtype=float),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
+):
+    """Normalize triangle-level cloth wetness from accumulated sample sums."""
+    tid = wp.tid()
+
+    sample_count = triangle_sample_count[tid]
+    if sample_count <= 0:
+        triangle_wet_weight_same_side[tid] = 1.0
+        triangle_wet_weight_opposite_side[tid] = 0.0
+        return
+
+    inv_count = 1.0 / float(sample_count)
+    triangle_wet_weight_same_side[tid] = saturate_unit(inv_count * triangle_wet_weight_same_side_sum[tid])
+    triangle_wet_weight_opposite_side[tid] = saturate_unit(inv_count * triangle_wet_weight_opposite_side_sum[tid])
+
+
 @wp.kernel
 def mask_ipbf_particle_flags(
     particle_flags: wp.array(dtype=wp.int32),
@@ -372,15 +667,26 @@ def initialize_density_and_neighbor_count_with_boundary(
     particle_mass: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     rest_density: float,
     support_radius: float,
     kernel_family: int,
+    reconstructed_support_depth_scale: float,
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
     density_boundary: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     boundary_neighbor_count: wp.array(dtype=wp.int32),
 ):
     """Initialize density including boundary samples when no particle grid exists."""
@@ -390,12 +696,14 @@ def initialize_density_and_neighbor_count_with_boundary(
         density[tid] = 0.0
         neighbor_count[tid] = 0
         density_boundary[tid] = 0.0
+        density_triangle_boundary[tid] = 0.0
         boundary_neighbor_count[tid] = 0
         return
 
     xi = particle_q[tid]
     rho = particle_mass[tid] * kernel_value(0.0, support_radius, kernel_family)
     rho_boundary = float(0.0)
+    rho_triangle_boundary = float(0.0)
     boundary_count = int(0)
 
     query = wp.hash_grid_query(boundary_grid, xi, support_radius)
@@ -410,17 +718,47 @@ def initialize_density_and_neighbor_count_with_boundary(
             continue
 
         dist = xi - boundary_x[index]
+        weight = weight * boundary_triangle_same_side_weight(
+            boundary_triangle[index],
+            boundary_normal[index],
+            dist,
+            boundary_wet_weight_same_side[index],
+        )
+        if weight == 0.0:
+            continue
         dist2 = wp.dot(dist, dist)
         kernel = kernel_value(dist2, support_radius, kernel_family)
         if kernel <= 0.0:
             continue
 
-        rho_boundary += weight * rest_density * boundary_volume[index] * kernel
+        contact_support = float(0.0)
+        if boundary_triangle[index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[index])
+
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[index],
+            boundary_volume[index],
+            boundary_area_patch[index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
+        boundary_density = weight * rest_density * effective_volume * kernel
+        rho_boundary += boundary_density
+        if boundary_triangle[index] >= 0:
+            rho_triangle_boundary += boundary_density
         boundary_count += 1
 
     density[tid] = rho + rho_boundary
     neighbor_count[tid] = boundary_count
     density_boundary[tid] = rho_boundary
+    density_triangle_boundary[tid] = rho_triangle_boundary
     boundary_neighbor_count[tid] = boundary_count
 
 
@@ -455,14 +793,26 @@ def initialize_constraint_and_gradient_with_boundary(
     particle_q: wp.array(dtype=wp.vec3),
     particle_flags: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     density: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     rest_density: float,
     support_radius: float,
     kernel_family: int,
     use_constraint_clamp: int,
+    decouple_triangle_boundary_density: int,
+    reconstructed_support_depth_scale: float,
     constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
 ):
@@ -474,7 +824,11 @@ def initialize_constraint_and_gradient_with_boundary(
         constraint_gradient[tid] = wp.vec3(0.0)
         return
 
-    c = density[tid] / rest_density - 1.0
+    c_density = density[tid]
+    if decouple_triangle_boundary_density != 0:
+        c_density = c_density - density_triangle_boundary[tid]
+
+    c = c_density / rest_density - 1.0
     if use_constraint_clamp != 0 and c < 0.0:
         constraint[tid] = 0.0
         constraint_gradient[tid] = wp.vec3(0.0)
@@ -495,10 +849,37 @@ def initialize_constraint_and_gradient_with_boundary(
             continue
 
         displacement = xi - boundary_x[index]
+        weight = weight * boundary_triangle_same_side_weight(
+            boundary_triangle[index],
+            boundary_normal[index],
+            displacement,
+            boundary_wet_weight_same_side[index],
+        )
+        if weight == 0.0:
+            continue
+        if decouple_triangle_boundary_density != 0 and boundary_triangle[index] >= 0:
+            continue
+        contact_support = float(0.0)
+        if boundary_triangle[index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[index])
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[index],
+            boundary_volume[index],
+            boundary_area_patch[index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
         grad += (
             weight
             * rest_density
-            * boundary_volume[index]
+            * effective_volume
             * kernel_gradient(displacement, support_radius, kernel_family)
         )
 
@@ -565,15 +946,26 @@ def compute_density_and_neighbor_count_with_boundary(
     particle_flags: wp.array(dtype=wp.int32),
     particle_world: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     rest_density: float,
     support_radius: float,
     kernel_family: int,
+    reconstructed_support_depth_scale: float,
     density: wp.array(dtype=float),
     neighbor_count: wp.array(dtype=wp.int32),
     density_boundary: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     boundary_neighbor_count: wp.array(dtype=wp.int32),
 ):
     """Compute SPH density estimates with Akinci-style boundary samples."""
@@ -583,6 +975,7 @@ def compute_density_and_neighbor_count_with_boundary(
         density[tid] = 0.0
         neighbor_count[tid] = 0
         density_boundary[tid] = 0.0
+        density_triangle_boundary[tid] = 0.0
         boundary_neighbor_count[tid] = 0
         return
 
@@ -613,6 +1006,7 @@ def compute_density_and_neighbor_count_with_boundary(
             fluid_count += 1
 
     rho_boundary = float(0.0)
+    rho_triangle_boundary = float(0.0)
     boundary_count = int(0)
     boundary_query = wp.hash_grid_query(boundary_grid, xi, support_radius)
     boundary_index = int(0)
@@ -626,17 +1020,47 @@ def compute_density_and_neighbor_count_with_boundary(
             continue
 
         dist = xi - boundary_x[boundary_index]
+        weight = weight * boundary_triangle_same_side_weight(
+            boundary_triangle[boundary_index],
+            boundary_normal[boundary_index],
+            dist,
+            boundary_wet_weight_same_side[boundary_index],
+        )
+        if weight == 0.0:
+            continue
         dist2 = wp.dot(dist, dist)
         kernel = kernel_value(dist2, support_radius, kernel_family)
         if kernel <= 0.0:
             continue
 
-        rho_boundary += weight * rest_density * boundary_volume[boundary_index] * kernel
+        contact_support = float(0.0)
+        if boundary_triangle[boundary_index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[boundary_index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[boundary_index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[boundary_index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[boundary_index])
+
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[boundary_index],
+            boundary_volume[boundary_index],
+            boundary_area_patch[boundary_index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
+        boundary_density = weight * rest_density * effective_volume * kernel
+        rho_boundary += boundary_density
+        if boundary_triangle[boundary_index] >= 0:
+            rho_triangle_boundary += boundary_density
         boundary_count += 1
 
     density[tid] = rho + rho_boundary
     neighbor_count[tid] = fluid_count + boundary_count
     density_boundary[tid] = rho_boundary
+    density_triangle_boundary[tid] = rho_triangle_boundary
     boundary_neighbor_count[tid] = boundary_count
 
 
@@ -700,14 +1124,26 @@ def compute_constraint_and_gradient_with_boundary(
     particle_flags: wp.array(dtype=wp.int32),
     particle_world: wp.array(dtype=wp.int32),
     boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
     static_boundary_weight: float,
     density: wp.array(dtype=float),
+    density_triangle_boundary: wp.array(dtype=float),
     rest_density: float,
     support_radius: float,
     kernel_family: int,
     use_constraint_clamp: int,
+    decouple_triangle_boundary_density: int,
+    reconstructed_support_depth_scale: float,
     constraint: wp.array(dtype=float),
     constraint_gradient: wp.array(dtype=wp.vec3),
 ):
@@ -719,7 +1155,11 @@ def compute_constraint_and_gradient_with_boundary(
         constraint_gradient[tid] = wp.vec3(0.0)
         return
 
-    c = density[tid] / rest_density - 1.0
+    c_density = density[tid]
+    if decouple_triangle_boundary_density != 0:
+        c_density = c_density - density_triangle_boundary[tid]
+
+    c = c_density / rest_density - 1.0
     if use_constraint_clamp != 0 and c < 0.0:
         constraint[tid] = 0.0
         constraint_gradient[tid] = wp.vec3(0.0)
@@ -755,10 +1195,37 @@ def compute_constraint_and_gradient_with_boundary(
             continue
 
         displacement = xi - boundary_x[boundary_index]
+        weight = weight * boundary_triangle_same_side_weight(
+            boundary_triangle[boundary_index],
+            boundary_normal[boundary_index],
+            displacement,
+            boundary_wet_weight_same_side[boundary_index],
+        )
+        if weight == 0.0:
+            continue
+        if decouple_triangle_boundary_density != 0 and boundary_triangle[boundary_index] >= 0:
+            continue
+        contact_support = float(0.0)
+        if boundary_triangle[boundary_index] >= 0 and reconstructed_support_depth_scale > 0.0:
+            barycentric = boundary_barycentric[boundary_index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[boundary_index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[boundary_index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
+            )
+            contact_support = wp.dot(contact_delta_prev, boundary_normal[boundary_index])
+        effective_volume = boundary_triangle_reconstructed_volume(
+            boundary_triangle[boundary_index],
+            boundary_volume[boundary_index],
+            boundary_area_patch[boundary_index],
+            support_radius,
+            reconstructed_support_depth_scale,
+            contact_support,
+        )
         grad += (
             weight
             * rest_density
-            * boundary_volume[boundary_index]
+            * effective_volume
             * kernel_gradient(displacement, support_radius, kernel_family)
         )
 
@@ -974,28 +1441,43 @@ def accumulate_boundary_pressure_reaction(
     boundary_grid: wp.uint64,
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    density: wp.array(dtype=float),
     constraint: wp.array(dtype=float),
     hessian: wp.array(dtype=wp.mat33),
     boundary_x: wp.array(dtype=wp.vec3),
     boundary_body: wp.array(dtype=wp.int32),
     boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_wet_weight_opposite_side: wp.array(dtype=float),
     boundary_vertex0: wp.array(dtype=wp.int32),
     boundary_vertex1: wp.array(dtype=wp.int32),
     boundary_vertex2: wp.array(dtype=wp.int32),
     boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
     boundary_volume: wp.array(dtype=float),
     boundary_flags: wp.array(dtype=wp.int32),
+    density_triangle_boundary: wp.array(dtype=float),
     body_q: wp.array(dtype=wp.transform),
     body_com: wp.array(dtype=wp.vec3),
+    rest_density: float,
     support_radius: float,
     kernel_family: int,
     static_boundary_weight: float,
+    triangle_contact_margin: float,
+    triangle_pressure_contact_exclusion_scale: float,
     dt: float,
     solve_relaxation: float,
     reaction_relaxation: float,
+    reconstructed_support_depth_scale: float,
+    decouple_triangle_boundary_density: int,
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
     sample_force: wp.array(dtype=wp.vec3),
     vertex_force: wp.array(dtype=wp.vec3),
+    vertex_pressure_force: wp.array(dtype=wp.vec3),
     body_force: wp.array(dtype=wp.vec3),
     body_torque: wp.array(dtype=wp.vec3),
 ):
@@ -1008,7 +1490,16 @@ def accumulate_boundary_pressure_reaction(
         return
 
     c = constraint[tid]
-    if c <= 0.0:
+    c_triangle = 0.0
+    if decouple_triangle_boundary_density != 0 and rest_density > 0.0:
+        c_total = density[tid] / rest_density - 1.0
+        if c_total < 0.0:
+            c_total = 0.0
+        c_triangle = c_total - c
+        if c_triangle < 0.0:
+            c_triangle = 0.0
+
+    if c <= 0.0 and c_triangle <= 0.0:
         return
 
     xi = particle_q[tid]
@@ -1025,30 +1516,122 @@ def accumulate_boundary_pressure_reaction(
             continue
 
         displacement = xi - boundary_x[boundary_index]
-        boundary_grad = (
-            weight * boundary_volume[boundary_index] * kernel_gradient(displacement, support_radius, kernel_family)
+        weight = weight * boundary_triangle_pressure_difference_weight(
+            boundary_triangle[boundary_index],
+            boundary_normal[boundary_index],
+            displacement,
+            boundary_wet_weight_same_side[boundary_index],
+            boundary_wet_weight_opposite_side[boundary_index],
         )
-        if wp.dot(boundary_grad, boundary_grad) == 0.0:
+        if weight == 0.0:
             continue
 
-        pressure_rhs = -c * boundary_grad
-        pressure_delta = solve_relaxation * (inv_h * pressure_rhs)
-        if wp.dot(pressure_delta, pressure_delta) == 0.0:
+        c_effective = c
+        is_triangle_sample = boundary_triangle[boundary_index] >= 0
+        if decouple_triangle_boundary_density != 0 and is_triangle_sample:
+            c_effective = c_triangle
+
+        sample_delta = wp.vec3(0.0)
+        force_on_boundary = wp.vec3(0.0)
+
+        contact_support = 0.0
+        barycentric = wp.vec3(0.0)
+        contact_handoff = 1.0
+        if is_triangle_sample:
+            barycentric = boundary_barycentric[boundary_index]
+            normal = boundary_normal[boundary_index]
+            contact_delta_prev = (
+                barycentric[0] * vertex_contact_delta_prev[boundary_vertex0[boundary_index]]
+                + barycentric[1] * vertex_contact_delta_prev[boundary_vertex1[boundary_index]]
+                + barycentric[2] * vertex_contact_delta_prev[boundary_vertex2[boundary_index]]
+            )
+            contact_support = wp.max(wp.dot(contact_delta_prev, normal), 0.0)
+            contact_handoff = triangle_contact_handoff_weight(
+                displacement,
+                particle_radius[tid],
+                triangle_contact_margin,
+                triangle_pressure_contact_exclusion_scale,
+                contact_support,
+            )
+            if contact_handoff <= 0.0:
+                continue
+        else:
+            normal = wp.vec3(0.0)
+
+        if c_effective > 0.0:
+            effective_volume = boundary_triangle_reconstructed_volume(
+                boundary_triangle[boundary_index],
+                boundary_volume[boundary_index],
+                boundary_area_patch[boundary_index],
+                support_radius,
+                reconstructed_support_depth_scale,
+                contact_support,
+            )
+            boundary_grad = (
+                weight * effective_volume * kernel_gradient(displacement, support_radius, kernel_family)
+            )
+            if wp.dot(boundary_grad, boundary_grad) != 0.0:
+                boundary_grad = contact_handoff * boundary_grad
+                pressure_rhs = -c_effective * boundary_grad
+                pressure_delta = solve_relaxation * (inv_h * pressure_rhs)
+                if wp.dot(pressure_delta, pressure_delta) != 0.0:
+                    pressure_sample_delta = -reaction_relaxation * pressure_delta
+                    pressure_force = equivalent_force_from_position_delta(
+                        pressure_delta,
+                        particle_mass[tid],
+                        dt,
+                        reaction_relaxation,
+                    )
+
+                    if is_triangle_sample:
+                        normal_component = wp.dot(pressure_sample_delta, normal)
+                        # Triangle normals define the wet side; fluid pressure
+                        # supports the shell in the opposite direction.
+                        if normal_component < 0.0 and contact_support <= 0.0:
+                            pressure_sample_delta = normal_component * normal
+                            pressure_force = particle_mass[tid] * pressure_sample_delta / (dt * dt)
+                            sample_delta = sample_delta + pressure_sample_delta
+                            force_on_boundary = force_on_boundary + pressure_force
+                    else:
+                        sample_delta = sample_delta + pressure_sample_delta
+                        force_on_boundary = force_on_boundary + pressure_force
+
+        if wp.dot(sample_delta, sample_delta) == 0.0 or wp.dot(force_on_boundary, force_on_boundary) == 0.0:
             continue
 
-        force_on_boundary = equivalent_force_from_position_delta(
-            pressure_delta,
-            particle_mass[tid],
-            dt,
-            reaction_relaxation,
-        )
         wp.atomic_add(sample_force, boundary_index, force_on_boundary)
 
-        if boundary_triangle[boundary_index] >= 0:
-            barycentric = boundary_barycentric[boundary_index]
+        if is_triangle_sample:
+            denom = (
+                barycentric[0] * barycentric[0]
+                + barycentric[1] * barycentric[1]
+                + barycentric[2] * barycentric[2]
+            )
+            if denom > 0.0:
+                vertex_delta0 = (barycentric[0] / denom) * sample_delta
+                vertex_delta1 = (barycentric[1] / denom) * sample_delta
+                vertex_delta2 = (barycentric[2] / denom) * sample_delta
+                wp.atomic_add(vertex_contact_delta, boundary_vertex0[boundary_index], vertex_delta0)
+                wp.atomic_add(vertex_contact_delta, boundary_vertex1[boundary_index], vertex_delta1)
+                wp.atomic_add(vertex_contact_delta, boundary_vertex2[boundary_index], vertex_delta2)
             wp.atomic_add(vertex_force, boundary_vertex0[boundary_index], barycentric[0] * force_on_boundary)
             wp.atomic_add(vertex_force, boundary_vertex1[boundary_index], barycentric[1] * force_on_boundary)
             wp.atomic_add(vertex_force, boundary_vertex2[boundary_index], barycentric[2] * force_on_boundary)
+            wp.atomic_add(
+                vertex_pressure_force,
+                boundary_vertex0[boundary_index],
+                barycentric[0] * force_on_boundary,
+            )
+            wp.atomic_add(
+                vertex_pressure_force,
+                boundary_vertex1[boundary_index],
+                barycentric[1] * force_on_boundary,
+            )
+            wp.atomic_add(
+                vertex_pressure_force,
+                boundary_vertex2[boundary_index],
+                barycentric[2] * force_on_boundary,
+            )
 
         body_index = boundary_body[boundary_index]
         if body_index < 0:
@@ -1064,6 +1647,231 @@ def accumulate_boundary_pressure_reaction(
 
         wp.atomic_add(body_force, body_index, force_on_boundary)
         wp.atomic_add(body_torque, body_index, torque)
+
+
+@wp.kernel
+def accumulate_boundary_triangle_hydrostatic_state(
+    particle_grid: wp.uint64,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    particle_world: wp.array(dtype=wp.int32),
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_flags: wp.array(dtype=wp.int32),
+    gravity: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    support_radius: float,
+    kernel_family: int,
+    static_boundary_weight: float,
+    occupancy: wp.array(dtype=float),
+    surface_height_max: wp.array(dtype=float),
+):
+    """Reconstruct per-sample wet occupancy and local free-surface height."""
+    tid = wp.tid()
+
+    if boundary_triangle[tid] < 0:
+        return
+    if (boundary_flags[tid] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        return
+    if boundary_wet_weight_same_side[tid] <= 0.0:
+        return
+    if rest_density <= 0.0:
+        return
+
+    boundary_flag = boundary_flags[tid]
+    weight_scale = boundary_density_pressure_weight(boundary_flag, static_boundary_weight)
+    if weight_scale == 0.0:
+        return
+
+    v0 = boundary_vertex0[tid]
+    if v0 < 0:
+        return
+
+    world_idx = particle_world[v0]
+    world_gravity = gravity[wp.max(world_idx, 0)]
+    gravity_magnitude = wp.length(world_gravity)
+    if gravity_magnitude <= 0.0:
+        return
+
+    gravity_up = -world_gravity / gravity_magnitude
+    xb = boundary_x[tid]
+    sample_height = wp.dot(xb, gravity_up)
+    occ = float(0.0)
+    height_max = float(sample_height)
+
+    query = wp.hash_grid_query(particle_grid, xb, support_radius)
+    particle_index = int(0)
+
+    while wp.hash_grid_query_next(query, particle_index):
+        if (particle_flags[particle_index] & ParticleFlags.ACTIVE) == 0:
+            continue
+        if particle_world[particle_index] != world_idx:
+            continue
+
+        displacement = particle_q[particle_index] - xb
+        weight = weight_scale * boundary_triangle_same_side_weight(
+            boundary_triangle[tid],
+            boundary_normal[tid],
+            displacement,
+            boundary_wet_weight_same_side[tid],
+        )
+        if weight == 0.0:
+            continue
+
+        dist2 = wp.dot(displacement, displacement)
+        kernel_w = kernel_value(dist2, support_radius, kernel_family)
+        if kernel_w <= 0.0:
+            continue
+
+        pair_occupancy = weight * particle_mass[particle_index] * kernel_w / rest_density
+        if pair_occupancy <= 0.0:
+            continue
+
+        occ = occ + pair_occupancy
+        particle_height = wp.dot(particle_q[particle_index], gravity_up)
+        height_max = wp.max(height_max, particle_height)
+
+    occupancy[tid] = occ
+    surface_height_max[tid] = height_max
+
+
+@wp.kernel
+def apply_boundary_triangle_hydrostatic_support(
+    boundary_x: wp.array(dtype=wp.vec3),
+    boundary_body: wp.array(dtype=wp.int32),
+    boundary_triangle: wp.array(dtype=wp.int32),
+    boundary_normal: wp.array(dtype=wp.vec3),
+    boundary_wet_weight_same_side: wp.array(dtype=float),
+    boundary_wet_weight_opposite_side: wp.array(dtype=float),
+    boundary_vertex0: wp.array(dtype=wp.int32),
+    boundary_vertex1: wp.array(dtype=wp.int32),
+    boundary_vertex2: wp.array(dtype=wp.int32),
+    boundary_barycentric: wp.array(dtype=wp.vec3),
+    boundary_area_patch: wp.array(dtype=float),
+    boundary_flags: wp.array(dtype=wp.int32),
+    particle_inv_mass_all: wp.array(dtype=float),
+    particle_world_all: wp.array(dtype=wp.int32),
+    vertex_contact_delta_prev: wp.array(dtype=wp.vec3),
+    body_q: wp.array(dtype=wp.transform),
+    body_com: wp.array(dtype=wp.vec3),
+    gravity: wp.array(dtype=wp.vec3),
+    rest_density: float,
+    support_radius: float,
+    dt: float,
+    hydrostatic_support_scale: float,
+    triangle_pressure_contact_exclusion_scale: float,
+    occupancy: wp.array(dtype=float),
+    surface_height_max: wp.array(dtype=float),
+    sample_force: wp.array(dtype=wp.vec3),
+    vertex_contact_delta: wp.array(dtype=wp.vec3),
+    vertex_force: wp.array(dtype=wp.vec3),
+    vertex_pressure_force: wp.array(dtype=wp.vec3),
+    body_force: wp.array(dtype=wp.vec3),
+    body_torque: wp.array(dtype=wp.vec3),
+):
+    """Apply sample-level thin-shell hydrostatic support to non-contact cloth regions."""
+    tid = wp.tid()
+
+    if boundary_triangle[tid] < 0:
+        return
+    if (boundary_flags[tid] & _BOUNDARY_SAMPLE_ACTIVE) == 0:
+        return
+    pressure_difference_weight = boundary_triangle_pressure_difference_from_wetness(
+        boundary_wet_weight_same_side[tid],
+        boundary_wet_weight_opposite_side[tid],
+    )
+    if pressure_difference_weight <= 0.0:
+        return
+    if rest_density <= 0.0 or dt <= 0.0 or hydrostatic_support_scale <= 0.0:
+        return
+
+    occ = occupancy[tid]
+    if occ <= 0.0:
+        return
+
+    v0 = boundary_vertex0[tid]
+    v1 = boundary_vertex1[tid]
+    v2 = boundary_vertex2[tid]
+    if v0 < 0 or v1 < 0 or v2 < 0:
+        return
+
+    world_idx = particle_world_all[v0]
+    world_gravity = gravity[wp.max(world_idx, 0)]
+    gravity_magnitude = wp.length(world_gravity)
+    if gravity_magnitude <= 0.0:
+        return
+    gravity_up = -world_gravity / gravity_magnitude
+
+    normal = boundary_normal[tid]
+    barycentric = boundary_barycentric[tid]
+    contact_delta_prev = (
+        barycentric[0] * vertex_contact_delta_prev[v0]
+        + barycentric[1] * vertex_contact_delta_prev[v1]
+        + barycentric[2] * vertex_contact_delta_prev[v2]
+    )
+    contact_support = wp.max(wp.dot(contact_delta_prev, normal), 0.0)
+    contact_handoff = triangle_contact_support_handoff_weight(
+        contact_support,
+        support_radius,
+        triangle_pressure_contact_exclusion_scale,
+    )
+    if contact_handoff <= 0.0:
+        return
+
+    sample_height = wp.dot(boundary_x[tid], gravity_up)
+    head = surface_height_max[tid] - sample_height
+    if head <= 0.0:
+        return
+
+    # A fully wetted thin-shell sample only sees the fluid on one side, so the
+    # local kernel occupancy corresponds to approximately half a full-space
+    # support domain. Reconstruct that one-sided occupancy into a saturating
+    # hydrostatic fill fraction before applying the sample quadrature force.
+    fill_fraction = contact_handoff * pressure_difference_weight * 2.0 * occ
+    if fill_fraction > 1.0:
+        fill_fraction = 1.0
+
+    hydro_pressure = hydrostatic_support_scale * rest_density * gravity_magnitude * head * fill_fraction
+    if hydro_pressure <= 0.0:
+        return
+
+    # Boundary sample normals point toward the wetted side of the shell.
+    force_on_boundary = -hydro_pressure * boundary_area_patch[tid] * normal
+    if wp.dot(force_on_boundary, force_on_boundary) == 0.0:
+        return
+
+    vertex_delta0 = dt * dt * barycentric[0] * particle_inv_mass_all[v0] * force_on_boundary
+    vertex_delta1 = dt * dt * barycentric[1] * particle_inv_mass_all[v1] * force_on_boundary
+    vertex_delta2 = dt * dt * barycentric[2] * particle_inv_mass_all[v2] * force_on_boundary
+
+    wp.atomic_add(sample_force, tid, force_on_boundary)
+    wp.atomic_add(vertex_contact_delta, v0, vertex_delta0)
+    wp.atomic_add(vertex_contact_delta, v1, vertex_delta1)
+    wp.atomic_add(vertex_contact_delta, v2, vertex_delta2)
+    wp.atomic_add(vertex_force, v0, barycentric[0] * force_on_boundary)
+    wp.atomic_add(vertex_force, v1, barycentric[1] * force_on_boundary)
+    wp.atomic_add(vertex_force, v2, barycentric[2] * force_on_boundary)
+    wp.atomic_add(vertex_pressure_force, v0, barycentric[0] * force_on_boundary)
+    wp.atomic_add(vertex_pressure_force, v1, barycentric[1] * force_on_boundary)
+    wp.atomic_add(vertex_pressure_force, v2, barycentric[2] * force_on_boundary)
+
+    body_index = boundary_body[tid]
+    if body_index < 0:
+        return
+
+    X_wb = body_q[body_index]
+    torque = body_reaction_torque_from_world_point(
+        boundary_x[tid],
+        force_on_boundary,
+        X_wb,
+        body_com[body_index],
+    )
+    wp.atomic_add(body_force, body_index, force_on_boundary)
+    wp.atomic_add(body_torque, body_index, torque)
 
 
 @wp.kernel
@@ -1267,8 +2075,12 @@ def accumulate_particle_triangle_swept_contact_correction(
     particle_inv_mass: wp.array(dtype=float),
     particle_radius: wp.array(dtype=float),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
     contact_margin: float,
     relaxation: float,
+    opposite_side_contact_min_scale: float,
+    opposite_side_contact_power: float,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
     vertex_contact_delta: wp.array(dtype=wp.vec3),
@@ -1383,7 +2195,22 @@ def accumulate_particle_triangle_swept_contact_correction(
     if denom <= 0.0:
         return 0
 
-    contact_lambda = -relaxation * c / denom
+    side_wet_weight = boundary_triangle_velocity_side_weight(
+        signed_curr_material,
+        triangle_wet_weight_same_side[tri],
+        triangle_wet_weight_opposite_side[tri],
+    )
+    effective_relaxation = relaxation
+    if signed_curr_material < 0.0:
+        effective_relaxation = relaxation * opposite_side_contact_relaxation_scale(
+            side_wet_weight,
+            opposite_side_contact_min_scale,
+            opposite_side_contact_power,
+        )
+    if effective_relaxation <= 0.0:
+        return 0
+
+    contact_lambda = -effective_relaxation * c / denom
     fluid_delta = wf * contact_lambda * direction
     vertex_delta0 = -w0 * b0 * contact_lambda * direction
     vertex_delta1 = -w1 * b1 * contact_lambda * direction
@@ -1416,8 +2243,12 @@ def accumulate_particle_triangle_contact_correction(
     particle_inv_mass: wp.array(dtype=float),
     particle_radius: wp.array(dtype=float),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
     contact_margin: float,
     relaxation: float,
+    opposite_side_contact_min_scale: float,
+    opposite_side_contact_power: float,
     continuous_enabled: int,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
@@ -1435,8 +2266,12 @@ def accumulate_particle_triangle_contact_correction(
             particle_inv_mass,
             particle_radius,
             tri_indices,
+            triangle_wet_weight_same_side,
+            triangle_wet_weight_opposite_side,
             contact_margin,
             relaxation,
+            opposite_side_contact_min_scale,
+            opposite_side_contact_power,
             dt,
             particle_contact_delta,
             vertex_contact_delta,
@@ -1476,10 +2311,10 @@ def accumulate_particle_triangle_contact_correction(
     distance = wp.length(separation)
 
     direction = normal
+    signed_plane_distance = wp.dot(normal, x - x0)
     if distance > 1.0e-8:
         direction = separation / distance
     else:
-        signed_plane_distance = wp.dot(normal, x - x0)
         if signed_plane_distance < 0.0:
             direction = -normal
         distance = wp.abs(signed_plane_distance)
@@ -1498,7 +2333,22 @@ def accumulate_particle_triangle_contact_correction(
     if denom <= 0.0:
         return
 
-    contact_lambda = -relaxation * c / denom
+    side_wet_weight = boundary_triangle_velocity_side_weight(
+        signed_plane_distance,
+        triangle_wet_weight_same_side[tri],
+        triangle_wet_weight_opposite_side[tri],
+    )
+    effective_relaxation = relaxation
+    if signed_plane_distance < 0.0:
+        effective_relaxation = relaxation * opposite_side_contact_relaxation_scale(
+            side_wet_weight,
+            opposite_side_contact_min_scale,
+            opposite_side_contact_power,
+        )
+    if effective_relaxation <= 0.0:
+        return
+
+    contact_lambda = -effective_relaxation * c / denom
     fluid_delta = wf * contact_lambda * direction
     vertex_delta0 = -w0 * b0 * contact_lambda * direction
     vertex_delta1 = -w1 * b1 * contact_lambda * direction
@@ -1528,10 +2378,14 @@ def accumulate_particle_triangle_contact_corrections(
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
     contact_triangle_indices: wp.array(dtype=wp.int32),
     contact_triangle_count: int,
     contact_margin: float,
     relaxation: float,
+    opposite_side_contact_min_scale: float,
+    opposite_side_contact_power: float,
     continuous_enabled: int,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
@@ -1558,8 +2412,12 @@ def accumulate_particle_triangle_contact_corrections(
             particle_inv_mass,
             particle_radius,
             tri_indices,
+            triangle_wet_weight_same_side,
+            triangle_wet_weight_opposite_side,
             contact_margin,
             relaxation,
+            opposite_side_contact_min_scale,
+            opposite_side_contact_power,
             continuous_enabled,
             dt,
             particle_contact_delta,
@@ -1854,12 +2712,15 @@ def collect_particle_triangle_contact_pairs_from_bvh(
     particle_q: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
     contact_margin: float,
     pair_cache_reuse: wp.array(dtype=wp.int32),
     pair_cache_skin: float,
+    max_pairs_per_particle: int,
     pair_capacity: int,
     pair_particle: wp.array(dtype=wp.int32),
     pair_triangle: wp.array(dtype=wp.int32),
+    pair_particle_count: wp.array(dtype=wp.int32),
     pair_count: wp.array(dtype=wp.int32),
     pair_overflow: wp.array(dtype=wp.int32),
 ):
@@ -1882,12 +2743,44 @@ def collect_particle_triangle_contact_pairs_from_bvh(
 
     query = wp.bvh_query_aabb(triangle_contact_bvh, lower, upper)
     triangle_leaf = wp.int32(-1)
+    best_triangle = wp.int32(-1)
+    best_dist2 = float(1.0e30)
 
     while wp.bvh_query_next(query, triangle_leaf):
+        tri = contact_triangle_indices[triangle_leaf]
+        if max_pairs_per_particle == 1:
+            v0 = tri_indices[tri, 0]
+            v1 = tri_indices[tri, 1]
+            v2 = tri_indices[tri, 2]
+            closest, _barycentric, _feature_type = triangle_closest_point(
+                particle_q[v0],
+                particle_q[v1],
+                particle_q[v2],
+                x,
+            )
+            dist2 = wp.dot(x - closest, x - closest)
+            if dist2 < best_dist2:
+                best_dist2 = dist2
+                best_triangle = tri
+            continue
+
+        local_pair_index = wp.atomic_add(pair_particle_count, tid, 1)
+        if max_pairs_per_particle > 0 and local_pair_index >= max_pairs_per_particle:
+            continue
+
         pair_index = wp.atomic_add(pair_count, 0, 1)
         if pair_index < pair_capacity:
             pair_particle[pair_index] = tid
-            pair_triangle[pair_index] = contact_triangle_indices[triangle_leaf]
+            pair_triangle[pair_index] = tri
+        else:
+            pair_overflow[0] = 1
+
+    if max_pairs_per_particle == 1 and best_triangle >= 0:
+        pair_particle_count[tid] = 1
+        pair_index = wp.atomic_add(pair_count, 0, 1)
+        if pair_index < pair_capacity:
+            pair_particle[pair_index] = tid
+            pair_triangle[pair_index] = best_triangle
         else:
             pair_overflow[0] = 1
 
@@ -1920,20 +2813,128 @@ def finalize_triangle_contact_pair_cache_collection(
 
 
 @wp.kernel
+def rebuild_triangle_contact_pair_particle_counts_from_pairs(
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_capacity: int,
+    pair_particle_count: wp.array(dtype=wp.int32),
+):
+    """Rebuild retained compact-pair counts per fluid particle from stored pairs."""
+    tid = wp.tid()
+
+    pair_total = wp.min(pair_count[0], pair_capacity)
+    if tid >= pair_total:
+        return
+
+    particle_index = pair_particle[tid]
+    if particle_index < 0:
+        return
+
+    wp.atomic_add(pair_particle_count, particle_index, 1)
+
+
+@wp.func
+def triangle_contact_pair_ownership_scale(
+    particle_contact_count: int,
+    particle_normalization_power: float,
+    triangle_side_contact_count: int,
+    triangle_normalization_power: float,
+    side_partition_weight: float,
+) -> float:
+    """Return the ownership scale applied to a retained compact contact pair."""
+    scale = float(1.0)
+    if particle_normalization_power > 0.0:
+        scale = scale / wp.pow(float(wp.max(particle_contact_count, 1)), particle_normalization_power)
+    if triangle_normalization_power > 0.0:
+        scale = scale / wp.pow(float(wp.max(triangle_side_contact_count, 1)), triangle_normalization_power)
+    return scale * side_partition_weight
+
+
+@wp.kernel
+def rebuild_triangle_contact_pair_triangle_counts_from_pairs(
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_triangle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_capacity: int,
+    particle_q: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    pair_triangle_count: wp.array(dtype=wp.int32),
+    pair_triangle_same_side_count: wp.array(dtype=wp.int32),
+    pair_triangle_opposite_side_count: wp.array(dtype=wp.int32),
+):
+    """Rebuild retained compact-pair counts per cloth triangle from stored pairs."""
+    tid = wp.tid()
+
+    pair_total = wp.min(pair_count[0], pair_capacity)
+    if tid >= pair_total:
+        return
+
+    particle_index = pair_particle[tid]
+    triangle_index = pair_triangle[tid]
+    if particle_index < 0 or triangle_index < 0:
+        return
+
+    wp.atomic_add(pair_triangle_count, triangle_index, 1)
+    v0 = tri_indices[triangle_index, 0]
+    v1 = tri_indices[triangle_index, 1]
+    v2 = tri_indices[triangle_index, 2]
+    x0 = particle_q[v0]
+    x1 = particle_q[v1]
+    x2 = particle_q[v2]
+    normal = wp.cross(x1 - x0, x2 - x0)
+    if wp.dot(normal, normal) <= 0.0:
+        return
+
+    signed_plane_distance = wp.dot(normal, particle_q[particle_index] - x0)
+    if signed_plane_distance >= 0.0:
+        wp.atomic_add(pair_triangle_same_side_count, triangle_index, 1)
+    else:
+        wp.atomic_add(pair_triangle_opposite_side_count, triangle_index, 1)
+
+
+@wp.func
+def triangle_contact_pair_side_partition_weight(
+    signed_plane_distance: float,
+    triangle_same_side_contact_count: int,
+    triangle_opposite_side_contact_count: int,
+) -> float:
+    """Return the side-partitioned ownership share for a cloth patch."""
+    same_side_count = float(wp.max(triangle_same_side_contact_count, 0))
+    opposite_side_count = float(wp.max(triangle_opposite_side_contact_count, 0))
+    total_count = same_side_count + opposite_side_count
+    if total_count <= 0.0:
+        return 1.0
+    if signed_plane_distance >= 0.0:
+        return same_side_count / total_count
+    return opposite_side_count / total_count
+
+
+@wp.kernel
 def accumulate_particle_triangle_contact_corrections_from_pairs(
     pair_particle: wp.array(dtype=wp.int32),
     pair_triangle: wp.array(dtype=wp.int32),
     pair_count: wp.array(dtype=wp.int32),
     pair_overflow: wp.array(dtype=wp.int32),
     pair_capacity: int,
+    pair_particle_contact_count: wp.array(dtype=wp.int32),
+    pair_normalization_power: float,
+    pair_triangle_contact_count: wp.array(dtype=wp.int32),
+    pair_triangle_same_side_contact_count: wp.array(dtype=wp.int32),
+    pair_triangle_opposite_side_contact_count: wp.array(dtype=wp.int32),
+    triangle_normalization_power: float,
+    allow_overflow_subset: int,
     particle_q_prev: wp.array(dtype=wp.vec3),
     particle_q: wp.array(dtype=wp.vec3),
     particle_mass: wp.array(dtype=float),
     particle_inv_mass: wp.array(dtype=float),
     particle_radius: wp.array(dtype=float),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
     contact_margin: float,
     relaxation: float,
+    opposite_side_contact_min_scale: float,
+    opposite_side_contact_power: float,
     continuous_enabled: int,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
@@ -1946,7 +2947,7 @@ def accumulate_particle_triangle_contact_corrections_from_pairs(
 
     if relaxation == 0.0:
         return
-    if pair_overflow[0] != 0:
+    if pair_overflow[0] != 0 and allow_overflow_subset == 0:
         return
 
     pair_total = wp.min(pair_count[0], pair_capacity)
@@ -1958,6 +2959,29 @@ def accumulate_particle_triangle_contact_corrections_from_pairs(
     if particle_index < 0 or tri < 0:
         return
 
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+    normal = wp.cross(particle_q[v1] - particle_q[v0], particle_q[v2] - particle_q[v0])
+    signed_plane_distance = wp.dot(normal, particle_q[particle_index] - particle_q[v0])
+    triangle_side_contact_count = pair_triangle_same_side_contact_count[tri]
+    if signed_plane_distance < 0.0:
+        triangle_side_contact_count = pair_triangle_opposite_side_contact_count[tri]
+    side_partition_weight = triangle_contact_pair_side_partition_weight(
+        signed_plane_distance,
+        pair_triangle_same_side_contact_count[tri],
+        pair_triangle_opposite_side_contact_count[tri],
+    )
+    owned_relaxation = relaxation * triangle_contact_pair_ownership_scale(
+        pair_particle_contact_count[particle_index],
+        pair_normalization_power,
+        triangle_side_contact_count,
+        triangle_normalization_power,
+        side_partition_weight,
+    )
+    if owned_relaxation == 0.0:
+        return
+
     accumulate_particle_triangle_contact_correction(
         particle_index,
         tri,
@@ -1967,15 +2991,19 @@ def accumulate_particle_triangle_contact_corrections_from_pairs(
         particle_inv_mass,
         particle_radius,
         tri_indices,
+        triangle_wet_weight_same_side,
+        triangle_wet_weight_opposite_side,
         contact_margin,
-        relaxation,
+        owned_relaxation,
+        opposite_side_contact_min_scale,
+        opposite_side_contact_power,
         continuous_enabled,
         dt,
         particle_contact_delta,
         vertex_contact_delta,
         vertex_contact_delta_total,
         vertex_force,
-        )
+    )
 
 
 @wp.kernel
@@ -1987,11 +3015,16 @@ def accumulate_particle_triangle_contact_corrections_if_overflow(
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
     contact_triangle_indices: wp.array(dtype=wp.int32),
     contact_triangle_count: int,
     pair_overflow: wp.array(dtype=wp.int32),
+    allow_overflow_subset: int,
     contact_margin: float,
     relaxation: float,
+    opposite_side_contact_min_scale: float,
+    opposite_side_contact_power: float,
     continuous_enabled: int,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
@@ -2002,6 +3035,8 @@ def accumulate_particle_triangle_contact_corrections_if_overflow(
     """Accumulate full-scan triangle contacts only when compact pair collection overflowed."""
     tid = wp.tid()
 
+    if allow_overflow_subset != 0:
+        return
     if pair_overflow[0] == 0:
         return
     if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
@@ -2020,8 +3055,12 @@ def accumulate_particle_triangle_contact_corrections_if_overflow(
             particle_inv_mass,
             particle_radius,
             tri_indices,
+            triangle_wet_weight_same_side,
+            triangle_wet_weight_opposite_side,
             contact_margin,
             relaxation,
+            opposite_side_contact_min_scale,
+            opposite_side_contact_power,
             continuous_enabled,
             dt,
             particle_contact_delta,
@@ -2041,11 +3080,15 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
     particle_radius: wp.array(dtype=float),
     particle_flags: wp.array(dtype=wp.int32),
     tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
     contact_triangle_indices: wp.array(dtype=wp.int32),
     triangle_proxy_motion_max: wp.array(dtype=float),
     contact_search_radius: float,
     contact_margin: float,
     relaxation: float,
+    opposite_side_contact_min_scale: float,
+    opposite_side_contact_power: float,
     continuous_enabled: int,
     dt: float,
     particle_contact_delta: wp.array(dtype=wp.vec3),
@@ -2082,8 +3125,12 @@ def accumulate_particle_triangle_contact_corrections_from_grid(
             particle_inv_mass,
             particle_radius,
             tri_indices,
+            triangle_wet_weight_same_side,
+            triangle_wet_weight_opposite_side,
             contact_margin,
             relaxation,
+            opposite_side_contact_min_scale,
+            opposite_side_contact_power,
             continuous_enabled,
             dt,
             particle_contact_delta,
@@ -2265,6 +3312,364 @@ def finalize_particle_shape_boundary_velocity_projection(
     count = projected_contact_count[tid]
     if count > 0:
         particle_qd[tid] = projected_particle_qd[tid] / float(count)
+
+
+@wp.func
+def accumulate_particle_triangle_boundary_velocity_projection_contact(
+    tid: wp.int32,
+    tri: wp.int32,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    vertex_qd_all: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
+    contact_margin: float,
+    tangential_damping: float,
+    dt: float,
+    reaction_relaxation: float,
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+    vertex_velocity_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate a cloth triangle velocity projection and equal-opposite reaction."""
+    contact_distance = particle_radius[tid] + contact_margin
+    if contact_distance <= 0.0:
+        return
+
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+    if tid == v0 or tid == v1 or tid == v2:
+        return
+
+    x = particle_q[tid]
+    x0 = particle_q[v0]
+    x1 = particle_q[v1]
+    x2 = particle_q[v2]
+
+    normal = wp.cross(x1 - x0, x2 - x0)
+    normal_length = wp.length(normal)
+    if normal_length <= 0.0:
+        return
+    normal = normal / normal_length
+
+    closest, barycentric, _feature_type = triangle_closest_point(x0, x1, x2, x)
+    separation = x - closest
+    distance = wp.length(separation)
+
+    direction = normal
+    signed_plane_distance = wp.dot(normal, x - x0)
+    if distance > 1.0e-8:
+        direction = separation / distance
+    else:
+        if signed_plane_distance < 0.0:
+            direction = -normal
+        distance = wp.abs(signed_plane_distance)
+
+    if distance >= contact_distance:
+        return
+
+    signed_plane_distance = wp.dot(normal, x - x0)
+    side_wet_weight = boundary_triangle_velocity_side_weight(
+        signed_plane_distance,
+        triangle_wet_weight_same_side[tri],
+        triangle_wet_weight_opposite_side[tri],
+    )
+    normal_projection_weight = 1.0
+    if signed_plane_distance < 0.0:
+        normal_projection_weight = side_wet_weight
+    effective_tangential_damping = 1.0 - side_wet_weight * (1.0 - tangential_damping)
+
+    boundary_v = (
+        barycentric[0] * vertex_qd_all[v0] + barycentric[1] * vertex_qd_all[v1] + barycentric[2] * vertex_qd_all[v2]
+    )
+    old_v = particle_qd[tid]
+    rel_v = old_v - boundary_v
+    rel_v_n = wp.dot(rel_v, direction)
+    rel_v_t = rel_v - rel_v_n * direction
+    rel_v_projected_n = rel_v_n - normal_projection_weight * wp.min(rel_v_n, 0.0)
+    rel_v_projected = rel_v_projected_n * direction + effective_tangential_damping * rel_v_t
+    projected_v = boundary_v + rel_v_projected
+
+    wp.atomic_add(projected_particle_qd, tid, projected_v)
+    wp.atomic_add(projected_contact_count, tid, 1)
+
+    delta_v = projected_v - old_v
+    if wp.dot(delta_v, delta_v) == 0.0:
+        return
+
+    delta_v_n = normal_projection_weight * wp.dot(delta_v, direction) * direction
+    delta_v_t = delta_v - delta_v_n
+    reaction_delta_v = delta_v_n + side_wet_weight * delta_v_t
+    if wp.dot(reaction_delta_v, reaction_delta_v) == 0.0:
+        return
+
+    force_on_boundary = equivalent_force_from_velocity_delta(
+        reaction_delta_v,
+        particle_mass[tid],
+        dt,
+        reaction_relaxation,
+    )
+    wp.atomic_add(vertex_velocity_force, v0, barycentric[0] * force_on_boundary)
+    wp.atomic_add(vertex_velocity_force, v1, barycentric[1] * force_on_boundary)
+    wp.atomic_add(vertex_velocity_force, v2, barycentric[2] * force_on_boundary)
+
+
+@wp.kernel
+def accumulate_particle_triangle_boundary_velocity_projection(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    vertex_qd_all: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    contact_triangle_count: int,
+    contact_margin: float,
+    tangential_damping: float,
+    dt: float,
+    reaction_relaxation: float,
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+    vertex_velocity_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate fluid-cloth velocity projection by scanning all sampled triangles."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    for contact_triangle_index in range(contact_triangle_count):
+        tri = contact_triangle_indices[contact_triangle_index]
+        accumulate_particle_triangle_boundary_velocity_projection_contact(
+            tid,
+            tri,
+            particle_q,
+            particle_qd,
+            vertex_qd_all,
+            particle_mass,
+            particle_radius,
+            tri_indices,
+            triangle_wet_weight_same_side,
+            triangle_wet_weight_opposite_side,
+            contact_margin,
+            tangential_damping,
+            dt,
+            reaction_relaxation,
+            projected_particle_qd,
+            projected_contact_count,
+            vertex_velocity_force,
+        )
+
+
+@wp.kernel
+def accumulate_particle_triangle_boundary_velocity_projection_from_pairs(
+    pair_particle: wp.array(dtype=wp.int32),
+    pair_triangle: wp.array(dtype=wp.int32),
+    pair_count: wp.array(dtype=wp.int32),
+    pair_overflow: wp.array(dtype=wp.int32),
+    pair_capacity: int,
+    pair_particle_contact_count: wp.array(dtype=wp.int32),
+    pair_normalization_power: float,
+    pair_triangle_contact_count: wp.array(dtype=wp.int32),
+    pair_triangle_same_side_contact_count: wp.array(dtype=wp.int32),
+    pair_triangle_opposite_side_contact_count: wp.array(dtype=wp.int32),
+    triangle_normalization_power: float,
+    allow_overflow_subset: int,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    vertex_qd_all: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
+    contact_margin: float,
+    tangential_damping: float,
+    dt: float,
+    reaction_relaxation: float,
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+    vertex_velocity_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate fluid-cloth velocity projection from compact candidate pairs."""
+    tid = wp.tid()
+
+    if pair_overflow[0] != 0 and allow_overflow_subset == 0:
+        return
+
+    pair_total = wp.min(pair_count[0], pair_capacity)
+    if tid >= pair_total:
+        return
+
+    particle_index = pair_particle[tid]
+    tri = pair_triangle[tid]
+    if particle_index < 0 or tri < 0:
+        return
+
+    v0 = tri_indices[tri, 0]
+    v1 = tri_indices[tri, 1]
+    v2 = tri_indices[tri, 2]
+    normal = wp.cross(particle_q[v1] - particle_q[v0], particle_q[v2] - particle_q[v0])
+    signed_plane_distance = wp.dot(normal, particle_q[particle_index] - particle_q[v0])
+    triangle_side_contact_count = pair_triangle_same_side_contact_count[tri]
+    if signed_plane_distance < 0.0:
+        triangle_side_contact_count = pair_triangle_opposite_side_contact_count[tri]
+    side_partition_weight = triangle_contact_pair_side_partition_weight(
+        signed_plane_distance,
+        pair_triangle_same_side_contact_count[tri],
+        pair_triangle_opposite_side_contact_count[tri],
+    )
+    owned_reaction_relaxation = reaction_relaxation * triangle_contact_pair_ownership_scale(
+        pair_particle_contact_count[particle_index],
+        pair_normalization_power,
+        triangle_side_contact_count,
+        triangle_normalization_power,
+        side_partition_weight,
+    )
+    accumulate_particle_triangle_boundary_velocity_projection_contact(
+        particle_index,
+        tri,
+        particle_q,
+        particle_qd,
+        vertex_qd_all,
+        particle_mass,
+        particle_radius,
+        tri_indices,
+        triangle_wet_weight_same_side,
+        triangle_wet_weight_opposite_side,
+        contact_margin,
+        tangential_damping,
+        dt,
+        owned_reaction_relaxation,
+        projected_particle_qd,
+        projected_contact_count,
+        vertex_velocity_force,
+    )
+
+
+@wp.kernel
+def accumulate_particle_triangle_boundary_velocity_projection_if_overflow(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    vertex_qd_all: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    contact_triangle_count: int,
+    pair_overflow: wp.array(dtype=wp.int32),
+    allow_overflow_subset: int,
+    contact_margin: float,
+    tangential_damping: float,
+    dt: float,
+    reaction_relaxation: float,
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+    vertex_velocity_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate full-scan velocity projection only when compact pair collection overflowed."""
+    tid = wp.tid()
+
+    if allow_overflow_subset != 0:
+        return
+    if pair_overflow[0] == 0:
+        return
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+
+    for contact_triangle_index in range(contact_triangle_count):
+        tri = contact_triangle_indices[contact_triangle_index]
+        accumulate_particle_triangle_boundary_velocity_projection_contact(
+            tid,
+            tri,
+            particle_q,
+            particle_qd,
+            vertex_qd_all,
+            particle_mass,
+            particle_radius,
+            tri_indices,
+            triangle_wet_weight_same_side,
+            triangle_wet_weight_opposite_side,
+            contact_margin,
+            tangential_damping,
+            dt,
+            reaction_relaxation,
+            projected_particle_qd,
+            projected_contact_count,
+            vertex_velocity_force,
+        )
+
+
+@wp.kernel
+def accumulate_particle_triangle_boundary_velocity_projection_from_grid(
+    triangle_contact_grid: wp.uint64,
+    particle_q_prev: wp.array(dtype=wp.vec3),
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    vertex_qd_all: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.int32),
+    tri_indices: wp.array(dtype=wp.int32, ndim=2),
+    triangle_wet_weight_same_side: wp.array(dtype=float),
+    triangle_wet_weight_opposite_side: wp.array(dtype=float),
+    contact_triangle_indices: wp.array(dtype=wp.int32),
+    triangle_proxy_motion_max: wp.array(dtype=float),
+    contact_search_radius: float,
+    contact_margin: float,
+    tangential_damping: float,
+    dt: float,
+    reaction_relaxation: float,
+    projected_particle_qd: wp.array(dtype=wp.vec3),
+    projected_contact_count: wp.array(dtype=int),
+    vertex_velocity_force: wp.array(dtype=wp.vec3),
+):
+    """Accumulate fluid-cloth velocity projection from nearby triangle proxies."""
+    tid = wp.tid()
+
+    if (particle_flags[tid] & ParticleFlags.ACTIVE) == 0:
+        return
+    if contact_search_radius <= 0.0:
+        return
+
+    travel = particle_q[tid] - particle_q_prev[tid]
+    query_center = 0.5 * (particle_q[tid] + particle_q_prev[tid])
+    query_radius = contact_search_radius + 0.5 * wp.length(travel) + 0.5 * triangle_proxy_motion_max[0]
+
+    query = wp.hash_grid_query(triangle_contact_grid, query_center, query_radius)
+    triangle_proxy = int(0)
+
+    while wp.hash_grid_query_next(query, triangle_proxy):
+        tri = contact_triangle_indices[triangle_proxy]
+        accumulate_particle_triangle_boundary_velocity_projection_contact(
+            tid,
+            tri,
+            particle_q,
+            particle_qd,
+            vertex_qd_all,
+            particle_mass,
+            particle_radius,
+            tri_indices,
+            triangle_wet_weight_same_side,
+            triangle_wet_weight_opposite_side,
+            contact_margin,
+            tangential_damping,
+            dt,
+            reaction_relaxation,
+            projected_particle_qd,
+            projected_contact_count,
+            vertex_velocity_force,
+        )
 
 
 @wp.kernel

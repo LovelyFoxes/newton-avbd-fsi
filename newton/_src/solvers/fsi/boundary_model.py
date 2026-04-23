@@ -29,6 +29,7 @@ from ...sim import BodyFlags, Model, State
 from .boundary_kernels import (
     accumulate_step_reaction_diagnostics,
     update_boundary_sample_world_kinematics,
+    update_deformable_boundary_sample_hydrostatic_state,
     update_deformable_boundary_sample_world_kinematics,
     update_deformable_triangle_contact_proxy_query_kinematics,
     update_deformable_triangle_contact_proxy_world_kinematics,
@@ -164,8 +165,10 @@ class FSIBoundaryModel:
             triangle_sample_shape,
             triangle_sample_x_local,
             triangle_sample_normal_local,
+            triangle_sample_offset_distance,
             triangle_sample_area_patch,
             triangle_sample_volume_quadrature,
+            triangle_sample_rest_area,
         ) = self._sample_model_triangles(
             model,
             self.spacing,
@@ -179,8 +182,12 @@ class FSIBoundaryModel:
         sample_shape.extend(triangle_sample_shape)
         sample_x_local.extend(triangle_sample_x_local)
         sample_normal_local.extend(triangle_sample_normal_local)
+        sample_offset_distance = [0.0 for _ in range(shape_sample_count_total)]
+        sample_offset_distance.extend(triangle_sample_offset_distance)
         sample_area_patch.extend(triangle_sample_area_patch)
         sample_volume_quadrature.extend(triangle_sample_volume_quadrature)
+        sample_triangle_rest_area = [0.0 for _ in range(shape_sample_count_total)]
+        sample_triangle_rest_area.extend(triangle_sample_rest_area)
 
         sample_volume = self._calibrate_sample_volumes(
             sample_body[:shape_sample_count_total],
@@ -255,18 +262,41 @@ class FSIBoundaryModel:
 
         self.sample_x_local = wp.array(sample_x_local, dtype=wp.vec3, device=self.device)
         self.sample_normal_local = wp.array(sample_normal_local, dtype=wp.vec3, device=self.device)
+        self.sample_offset_distance = wp.array(sample_offset_distance, dtype=float, device=self.device)
         self.sample_volume = wp.array(sample_volume, dtype=float, device=self.device)
+        self.sample_volume_rest = wp.clone(self.sample_volume)
         self.sample_area_patch = wp.array(sample_area_patch, dtype=float, device=self.device)
+        self.sample_area_patch_rest = wp.clone(self.sample_area_patch)
         self.sample_volume_quadrature = wp.array(sample_volume_quadrature, dtype=float, device=self.device)
+        self.sample_volume_quadrature_rest = wp.clone(self.sample_volume_quadrature)
         self.sample_area_box_patch = self.sample_area_patch
         self.sample_volume_box_quadrature = self.sample_volume_quadrature
         self.sample_volume_hydrostatic = wp.array(sample_volume_hydrostatic, dtype=float, device=self.device)
+        self.sample_volume_hydrostatic_rest = wp.clone(self.sample_volume_hydrostatic)
         self.sample_volume_hydrostatic_scale = wp.array(
             sample_volume_hydrostatic_scale,
             dtype=float,
             device=self.device,
         )
+        self.sample_triangle_rest_area = wp.array(sample_triangle_rest_area, dtype=float, device=self.device)
         self.sample_mass_equiv = wp.zeros(self.sample_count, dtype=float, device=self.device)
+        self.sample_wet_weight_same_side = wp.full((self.sample_count,), 1.0, dtype=float, device=self.device)
+        self.sample_wet_weight_opposite_side = wp.zeros(self.sample_count, dtype=float, device=self.device)
+        self.sample_wet_weight = wp.full((self.sample_count,), 1.0, dtype=float, device=self.device)
+        self.sample_wet_weight_same_side_prev = wp.clone(self.sample_wet_weight_same_side)
+        self.sample_wet_weight_opposite_side_prev = wp.clone(self.sample_wet_weight_opposite_side)
+        self.triangle_wet_weight_same_side = wp.full(model.tri_count, 1.0, dtype=float, device=self.device)
+        self.triangle_wet_weight_opposite_side = wp.zeros(model.tri_count, dtype=float, device=self.device)
+        self.triangle_wet_weight_same_side_sum = wp.zeros(model.tri_count, dtype=float, device=self.device)
+        self.triangle_wet_weight_opposite_side_sum = wp.zeros(model.tri_count, dtype=float, device=self.device)
+        triangle_sample_count_per_triangle = [0 for _ in range(model.tri_count)]
+        for triangle_index in sample_triangle:
+            triangle_sample_count_per_triangle[int(triangle_index)] += 1
+        self.triangle_sample_count_per_triangle = wp.array(
+            triangle_sample_count_per_triangle,
+            dtype=wp.int32,
+            device=self.device,
+        )
 
         self.sample_x_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.sample_v_world = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
@@ -281,6 +311,8 @@ class FSIBoundaryModel:
         self.triangle_contact_proxy_motion_max = wp.zeros(1, dtype=float, device=self.device)
         self.sample_force = wp.zeros(self.sample_count, dtype=wp.vec3, device=self.device)
         self.vertex_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.vertex_pressure_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
+        self.vertex_velocity_force = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
         self.vertex_contact_delta = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
 
         body_count = int(getattr(model, "body_count", 0))
@@ -329,6 +361,32 @@ class FSIBoundaryModel:
         self.triangle_contact_proxy_motion_max.zero_()
         self._triangle_contact_history_initialized = False
 
+    def reset_wetness_state(self) -> None:
+        """Reset cached deformable wetness state to the default one-sided shell state."""
+        self.sample_wet_weight_same_side.fill_(1.0)
+        self.sample_wet_weight_opposite_side.zero_()
+        self.sample_wet_weight.fill_(1.0)
+        self.sample_wet_weight_same_side_prev.fill_(1.0)
+        self.sample_wet_weight_opposite_side_prev.zero_()
+        self.triangle_wet_weight_same_side.fill_(1.0)
+        self.triangle_wet_weight_opposite_side.zero_()
+        self.triangle_wet_weight_same_side_sum.zero_()
+        self.triangle_wet_weight_opposite_side_sum.zero_()
+
+    def set_triangle_boundary_samples_active(self, active: bool) -> None:
+        """Enable or disable deformable triangle boundary samples in density/pressure paths."""
+        if self.triangle_sample_count == 0:
+            return
+
+        flags = self.sample_flags.numpy()
+        triangle_mask = self.sample_triangle.numpy() >= 0
+        if active:
+            flags[triangle_mask] |= int(BoundarySampleFlags.ACTIVE)
+        else:
+            flags[triangle_mask] &= ~int(BoundarySampleFlags.ACTIVE)
+
+        self.sample_flags = wp.array(flags, dtype=wp.int32, device=self.device)
+
     def update_world_kinematics(self, state: State) -> None:
         """Update sample positions [m], velocities [m/s], and normals."""
         if self.sample_count == 0:
@@ -372,6 +430,7 @@ class FSIBoundaryModel:
                     self.sample_vertex1,
                     self.sample_vertex2,
                     self.sample_barycentric,
+                    self.sample_offset_distance,
                     state.particle_q,
                     state.particle_qd,
                 ],
@@ -379,6 +438,29 @@ class FSIBoundaryModel:
                     self.sample_x_world,
                     self.sample_v_world,
                     self.sample_normal_world,
+                ],
+                device=self.device,
+            )
+            wp.launch(
+                update_deformable_boundary_sample_hydrostatic_state,
+                dim=self.sample_count,
+                inputs=[
+                    self.sample_triangle,
+                    self.sample_vertex0,
+                    self.sample_vertex1,
+                    self.sample_vertex2,
+                    state.particle_q,
+                    self.sample_triangle_rest_area,
+                    self.sample_area_patch_rest,
+                    self.sample_volume_rest,
+                    self.sample_volume_quadrature_rest,
+                    self.sample_volume_hydrostatic_rest,
+                ],
+                outputs=[
+                    self.sample_area_patch,
+                    self.sample_volume,
+                    self.sample_volume_quadrature,
+                    self.sample_volume_hydrostatic,
                 ],
                 device=self.device,
             )
@@ -462,6 +544,8 @@ class FSIBoundaryModel:
         self.vertex_contact_delta_generation += 1
         self.sample_force.zero_()
         self.vertex_force.zero_()
+        self.vertex_pressure_force.zero_()
+        self.vertex_velocity_force.zero_()
         self.vertex_contact_delta.zero_()
         self.body_force.zero_()
         self.body_torque.zero_()
@@ -630,11 +714,13 @@ class FSIBoundaryModel:
         list[tuple[float, float, float]],
         list[float],
         list[float],
+        list[float],
+        list[float],
     ]:
         if not include_triangles or model.tri_count == 0:
-            return [], [], [], [], [], [], [], [], [], [], []
+            return [], [], [], [], [], [], [], [], [], [], [], [], []
         if model.tri_indices is None or model.particle_q is None:
-            return [], [], [], [], [], [], [], [], [], [], []
+            return [], [], [], [], [], [], [], [], [], [], [], [], []
 
         tri_indices = np.asarray(model.tri_indices.numpy(), dtype=np.int32).reshape((-1, 3))
         particle_q = np.asarray(model.particle_q.numpy(), dtype=np.float32)
@@ -653,8 +739,10 @@ class FSIBoundaryModel:
         sample_shape: list[int] = []
         sample_x_local: list[tuple[float, float, float]] = []
         sample_normal_local: list[tuple[float, float, float]] = []
+        sample_offset_distance: list[float] = []
         sample_area_patch: list[float] = []
         sample_volume_quadrature: list[float] = []
+        sample_rest_area: list[float] = []
 
         for triangle_index in indices:
             if triangle_index < 0 or triangle_index >= model.tri_count:
@@ -673,23 +761,34 @@ class FSIBoundaryModel:
             normal = normal / normal_norm
             barycentric_samples = cls._triangle_barycentric_samples(area, spacing)
             patch_area = area / len(barycentric_samples)
-            sample_volume = patch_area * thickness
+            sample_volume = 0.5 * patch_area * thickness
+            shell_offset = 0.5 * thickness * normal
 
             for barycentric in barycentric_samples:
                 bary = np.asarray(barycentric, dtype=np.float32)
-                point = bary[0] * p0 + bary[1] * p1 + bary[2] * p2
+                mid_point = bary[0] * p0 + bary[1] * p1 + bary[2] * p2
 
-                sample_triangle.append(int(triangle_index))
-                sample_vertex0.append(int(vertices[0]))
-                sample_vertex1.append(int(vertices[1]))
-                sample_vertex2.append(int(vertices[2]))
-                sample_barycentric.append(tuple(float(value) for value in barycentric))
-                sample_body.append(-1)
-                sample_shape.append(-1)
-                sample_x_local.append(tuple(float(value) for value in point))
-                sample_normal_local.append(tuple(float(value) for value in normal))
-                sample_area_patch.append(float(patch_area))
-                sample_volume_quadrature.append(float(sample_volume))
+                # Represent deformable cloth as a thin shell with two offset
+                # surfaces instead of a single mid-surface point sample.
+                # This gives IPBF a wetted-side boundary sample before the
+                # cloth mid-surface has already deeply penetrated the fluid.
+                for side in (-1.0, 1.0):
+                    point = mid_point + side * shell_offset
+                    normal_side = side * normal
+
+                    sample_triangle.append(int(triangle_index))
+                    sample_vertex0.append(int(vertices[0]))
+                    sample_vertex1.append(int(vertices[1]))
+                    sample_vertex2.append(int(vertices[2]))
+                    sample_barycentric.append(tuple(float(value) for value in barycentric))
+                    sample_body.append(-1)
+                    sample_shape.append(-1)
+                    sample_x_local.append(tuple(float(value) for value in point))
+                    sample_normal_local.append(tuple(float(value) for value in normal_side))
+                    sample_offset_distance.append(float(side * 0.5 * thickness))
+                    sample_area_patch.append(float(patch_area))
+                    sample_volume_quadrature.append(float(sample_volume))
+                    sample_rest_area.append(float(area))
 
         return (
             sample_triangle,
@@ -701,8 +800,10 @@ class FSIBoundaryModel:
             sample_shape,
             sample_x_local,
             sample_normal_local,
+            sample_offset_distance,
             sample_area_patch,
             sample_volume_quadrature,
+            sample_rest_area,
         )
 
     @staticmethod

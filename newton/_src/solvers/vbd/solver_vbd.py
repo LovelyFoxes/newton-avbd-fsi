@@ -1984,6 +1984,34 @@ class SolverVBD(SolverBase):
                     ],
                     device=self.device,
                 )
+                if getattr(self.fsi_boundary_model, "vertex_pressure_force", None) is not None:
+                    wp.launch(
+                        kernel=add_fsi_vertex_forces_to_particle_accumulators,
+                        dim=model.particle_count,
+                        inputs=[
+                            self.fsi_boundary_model.vertex_pressure_force,
+                            self.fsi_force_relaxation,
+                            self._vbd_particle_flags,
+                        ],
+                        outputs=[
+                            self.particle_forces,
+                        ],
+                        device=self.device,
+                    )
+                if getattr(self.fsi_boundary_model, "vertex_velocity_force", None) is not None:
+                    wp.launch(
+                        kernel=add_fsi_vertex_forces_to_particle_accumulators,
+                        dim=model.particle_count,
+                        inputs=[
+                            self.fsi_boundary_model.vertex_velocity_force,
+                            self.fsi_force_relaxation,
+                            self._vbd_particle_flags,
+                        ],
+                        outputs=[
+                            self.particle_forces,
+                        ],
+                        device=self.device,
+                    )
             elif getattr(self.fsi_boundary_model, "vertex_force", None) is not None:
                 wp.launch(
                     kernel=add_fsi_vertex_forces_to_particle_accumulators,

@@ -35,15 +35,22 @@ from ...sim import (
 from ..solver import SolverBase
 from .ipbf_kernels import (
     accumulate_boundary_pressure_reaction,
+    accumulate_boundary_triangle_hydrostatic_state,
     accumulate_particle_shape_boundary_velocity_projection,
     accumulate_particle_shape_boundary_velocity_projection_with_reaction,
+    accumulate_particle_triangle_boundary_velocity_projection,
+    accumulate_particle_triangle_boundary_velocity_projection_from_grid,
+    accumulate_particle_triangle_boundary_velocity_projection_from_pairs,
+    accumulate_particle_triangle_boundary_velocity_projection_if_overflow,
     accumulate_particle_triangle_contact_corrections,
     accumulate_particle_triangle_contact_corrections_from_grid,
     accumulate_particle_triangle_contact_corrections_from_pairs,
     accumulate_particle_triangle_contact_corrections_if_overflow,
     accumulate_triangle_contact_pair_cache_fluid_displacement_max,
     accumulate_triangle_contact_pair_cache_triangle_displacement_max,
+    accumulate_triangle_wetness_from_samples,
     apply_artificial_damping,
+    apply_boundary_triangle_hydrostatic_support,
     apply_particle_triangle_contact_deltas,
     apply_relaxed_jacobi_update,
     apply_viscosity_velocity_diffusion,
@@ -56,6 +63,7 @@ from .ipbf_kernels import (
     clear_triangle_contact_pair_cache_reuse_for_inactive,
     clear_triangle_contact_pair_cache_reuse_for_triangle_count_change,
     clear_triangle_contact_pair_cache_reuse_for_uncached_particles_near_bvh,
+    clear_triangle_wetness_accumulators,
     collect_particle_triangle_contact_pairs_from_bvh,
     compute_constraint_and_gradient,
     compute_constraint_and_gradient_with_boundary,
@@ -68,6 +76,7 @@ from .ipbf_kernels import (
     finalize_particle_shape_boundary_velocity_projection,
     finalize_triangle_contact_pair_cache_collection,
     finalize_triangle_contact_pair_cache_reuse,
+    finalize_triangle_wetness,
     initialize_constraint_and_gradient,
     initialize_constraint_and_gradient_with_boundary,
     initialize_density_and_neighbor_count,
@@ -81,8 +90,11 @@ from .ipbf_kernels import (
     prepare_triangle_contact_pair_collection,
     project_particle_shape_contacts,
     project_particle_shape_contacts_with_reaction,
+    rebuild_triangle_contact_pair_particle_counts_from_pairs,
+    rebuild_triangle_contact_pair_triangle_counts_from_pairs,
     restore_non_fluid_particle_state,
     solve_local_system,
+    update_boundary_triangle_wet_weights,
     update_triangle_contact_pair_cache_snapshot_for_sampled_triangles,
     update_triangle_contact_pair_cache_snapshot_if_active,
     update_velocity_from_positions,
@@ -152,13 +164,48 @@ class SolverIPBF(SolverBase):
             fsi_velocity_projection_reaction_relaxation: Unitless multiplier
                 applied when converting boundary velocity projection deltas into
                 FSI body reaction forces and torques.
+            fsi_triangle_velocity_projection_enabled: Whether active fluid
+                particles apply a final particle-triangle velocity projection
+                against deformable cloth boundaries.
+            fsi_triangle_velocity_damping: Tangential damping multiplier
+                applied to fluid velocities at final particle-triangle
+                contacts. If ``None``, :attr:`boundary_velocity_damping` is
+                reused for cloth boundaries.
             fsi_pressure_reaction_relaxation: Unitless multiplier applied when
                 converting boundary pressure-gradient position increments into
                 FSI body reaction forces and torques.
+            fsi_triangle_hydrostatic_support_scale: Unitless multiplier used
+                to scale a supplemental non-contact hydrostatic pressure
+                support operator for wet-side triangle boundary samples. Zero
+                disables this cloth-specific thin-shell support path.
+            fsi_triangle_wetness_rise_rate: Unitless exponential blend factor
+                in ``[0, 1]`` used when the measured deformable same-side or
+                opposite-side wetness increases. Larger values react more
+                quickly to newly arriving fluid.
+            fsi_triangle_wetness_fall_rate: Unitless exponential blend factor
+                in ``[0, 1]`` used when the measured deformable same-side or
+                opposite-side wetness decreases. Smaller values retain the
+                previous wetness state longer and add temporal hysteresis.
+            fsi_triangle_opposite_side_wetness_rise_rate: Optional unitless
+                exponential blend factor in ``[0, 1]`` used specifically when
+                measured opposite-side wetness increases. If ``None``, reuses
+                :attr:`fsi_triangle_wetness_rise_rate`.
+            fsi_triangle_opposite_side_wetness_fall_rate: Optional unitless
+                exponential blend factor in ``[0, 1]`` used specifically when
+                measured opposite-side wetness decreases. If ``None``, reuses
+                :attr:`fsi_triangle_wetness_fall_rate`.
+            fsi_triangle_reconstructed_support_depth_scale: Unitless
+                multiplier used to reconstruct a one-sided support volume for
+                triangle boundary samples from ``sample_area * support_radius``.
+                Zero keeps the raw sampled-shell volume.
             fsi_static_boundary_weight: Unitless diagnostic multiplier applied
                 to static boundary-sample contributions in the density,
                 constraint-gradient, pressure-reaction, and boundary-aware
                 velocity-smoothing / viscosity paths.
+            fsi_decouple_triangle_boundary_density: Whether triangle-bound
+                deformable FSI boundary samples contribute through a decoupled
+                support path instead of being fully mixed into the fluid-side
+                density constraint.
             fsi_triangle_contact_enabled: Whether active fluid particles are
                 projected against triangle-bound deformable FSI boundaries.
             fsi_triangle_contact_use_bvh: Whether deformable triangle contact
@@ -172,6 +219,18 @@ class SolverIPBF(SolverBase):
                 [m] used to decide whether previously collected compact BVH
                 contact pairs may be reused. If ``None``, the solver derives
                 a small default from the maximum particle radius.
+            fsi_triangle_contact_max_pairs_per_particle: Optional maximum
+                number of compact BVH cloth-contact pairs retained per fluid
+                particle. If ``None`` or ``0``, no per-particle cap is
+                applied.
+            fsi_triangle_contact_pair_normalization_power: Non-negative power
+                used when scaling retained compact cloth-contact pairs by the
+                number of pairs owned by the same fluid particle. Zero
+                disables the normalization.
+            fsi_triangle_contact_triangle_normalization_power: Non-negative
+                power used when scaling retained compact cloth-contact pairs
+                by the number of pairs owned by the same cloth triangle.
+                Zero disables triangle-side ownership normalization.
             fsi_triangle_contact_use_grid: Whether deformable triangle contact
                 should use the boundary model's triangle proxy grid instead of
                 scanning every sampled triangle when BVH broadphase is
@@ -188,6 +247,19 @@ class SolverIPBF(SolverBase):
                 margin [m] added to the fluid particle radius.
             fsi_triangle_contact_relaxation: Unitless relaxation used when
                 applying symmetric particle-triangle contact corrections.
+            fsi_triangle_opposite_side_contact_min_scale: Unitless lower bound
+                in ``[0, 1]`` used when scaling opposite-side cloth contact
+                relaxation from the local wetness state. Zero allows dry-side
+                spill contact to fade out completely.
+            fsi_triangle_opposite_side_contact_power: Positive exponent used
+                when mapping opposite-side wetness into the corresponding
+                cloth contact relaxation scale. Values above ``1`` delay
+                full-strength dry-side contact until the opposite side becomes
+                substantially wetted.
+            fsi_triangle_pressure_contact_exclusion_scale: Unitless multiplier
+                applied to the triangle-contact distance when suppressing
+                cloth pressure reaction for pairs already handled by direct
+                particle-triangle contact. Zero disables this handoff.
             fluid_particle_start: First particle index solved as IPBF fluid.
             fluid_particle_count: Number of consecutive particles solved as
                 IPBF fluid. If ``None``, all particles from
@@ -218,17 +290,32 @@ class SolverIPBF(SolverBase):
         fsi_reaction_relaxation: float | None = None
         fsi_projection_reaction_relaxation: float | None = None
         fsi_velocity_projection_reaction_relaxation: float | None = None
+        fsi_triangle_velocity_projection_enabled: bool = False
+        fsi_triangle_velocity_damping: float | None = None
         fsi_pressure_reaction_relaxation: float = 1.0
+        fsi_triangle_hydrostatic_support_scale: float = 0.0
+        fsi_triangle_wetness_rise_rate: float = 0.5
+        fsi_triangle_wetness_fall_rate: float = 0.15
+        fsi_triangle_opposite_side_wetness_rise_rate: float | None = None
+        fsi_triangle_opposite_side_wetness_fall_rate: float | None = None
+        fsi_triangle_reconstructed_support_depth_scale: float = 0.0
         fsi_static_boundary_weight: float = 1.0
+        fsi_decouple_triangle_boundary_density: bool = True
         fsi_triangle_contact_enabled: bool = True
         fsi_triangle_contact_use_bvh: bool = True
         fsi_triangle_contact_pair_capacity: int | None = None
         fsi_triangle_contact_pair_cache_skin: float | None = None
+        fsi_triangle_contact_max_pairs_per_particle: int | None = None
+        fsi_triangle_contact_pair_normalization_power: float = 1.0
+        fsi_triangle_contact_triangle_normalization_power: float = 0.0
         fsi_triangle_contact_use_grid: bool = True
         fsi_triangle_contact_search_radius: float | None = None
         fsi_triangle_contact_continuous_enabled: bool = True
         fsi_triangle_contact_margin: float = 0.0
         fsi_triangle_contact_relaxation: float = 1.0
+        fsi_triangle_opposite_side_contact_min_scale: float = 0.0
+        fsi_triangle_opposite_side_contact_power: float = 1.0
+        fsi_triangle_pressure_contact_exclusion_scale: float = 1.0
         fluid_particle_start: int = 0
         fluid_particle_count: int | None = None
 
@@ -410,6 +497,13 @@ class SolverIPBF(SolverBase):
         legacy_reaction_relaxation = self.config.fsi_reaction_relaxation
         projection_reaction_relaxation = self.config.fsi_projection_reaction_relaxation
         velocity_projection_reaction_relaxation = self.config.fsi_velocity_projection_reaction_relaxation
+        self.fsi_triangle_velocity_projection_enabled = bool(self.config.fsi_triangle_velocity_projection_enabled)
+        configured_triangle_velocity_damping = self.config.fsi_triangle_velocity_damping
+        self.fsi_triangle_velocity_damping = float(
+            configured_triangle_velocity_damping
+            if configured_triangle_velocity_damping is not None
+            else self.boundary_velocity_damping
+        )
         self.fsi_projection_reaction_relaxation = float(
             projection_reaction_relaxation
             if projection_reaction_relaxation is not None
@@ -421,9 +515,46 @@ class SolverIPBF(SolverBase):
             else (legacy_reaction_relaxation if legacy_reaction_relaxation is not None else 1.0)
         )
         self.fsi_pressure_reaction_relaxation = float(self.config.fsi_pressure_reaction_relaxation)
+        self.fsi_triangle_hydrostatic_support_scale = float(self.config.fsi_triangle_hydrostatic_support_scale)
+        if self.fsi_triangle_hydrostatic_support_scale < 0.0:
+            raise ValueError("IPBF triangle hydrostatic support scale must be non-negative.")
+        self.fsi_triangle_wetness_rise_rate = float(self.config.fsi_triangle_wetness_rise_rate)
+        if self.fsi_triangle_wetness_rise_rate < 0.0 or self.fsi_triangle_wetness_rise_rate > 1.0:
+            raise ValueError("IPBF triangle wetness rise rate must be in [0, 1].")
+        self.fsi_triangle_wetness_fall_rate = float(self.config.fsi_triangle_wetness_fall_rate)
+        if self.fsi_triangle_wetness_fall_rate < 0.0 or self.fsi_triangle_wetness_fall_rate > 1.0:
+            raise ValueError("IPBF triangle wetness fall rate must be in [0, 1].")
+        configured_opposite_side_wetness_rise_rate = self.config.fsi_triangle_opposite_side_wetness_rise_rate
+        self.fsi_triangle_opposite_side_wetness_rise_rate = float(
+            configured_opposite_side_wetness_rise_rate
+            if configured_opposite_side_wetness_rise_rate is not None
+            else self.fsi_triangle_wetness_rise_rate
+        )
+        if (
+            self.fsi_triangle_opposite_side_wetness_rise_rate < 0.0
+            or self.fsi_triangle_opposite_side_wetness_rise_rate > 1.0
+        ):
+            raise ValueError("IPBF triangle opposite-side wetness rise rate must be in [0, 1].")
+        configured_opposite_side_wetness_fall_rate = self.config.fsi_triangle_opposite_side_wetness_fall_rate
+        self.fsi_triangle_opposite_side_wetness_fall_rate = float(
+            configured_opposite_side_wetness_fall_rate
+            if configured_opposite_side_wetness_fall_rate is not None
+            else self.fsi_triangle_wetness_fall_rate
+        )
+        if (
+            self.fsi_triangle_opposite_side_wetness_fall_rate < 0.0
+            or self.fsi_triangle_opposite_side_wetness_fall_rate > 1.0
+        ):
+            raise ValueError("IPBF triangle opposite-side wetness fall rate must be in [0, 1].")
+        self.fsi_triangle_reconstructed_support_depth_scale = float(
+            self.config.fsi_triangle_reconstructed_support_depth_scale
+        )
+        if self.fsi_triangle_reconstructed_support_depth_scale < 0.0:
+            raise ValueError("IPBF triangle reconstructed support depth scale must be non-negative.")
         self.fsi_static_boundary_weight = float(self.config.fsi_static_boundary_weight)
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
+        self.fsi_decouple_triangle_boundary_density = bool(self.config.fsi_decouple_triangle_boundary_density)
         self.fsi_triangle_contact_enabled = bool(self.config.fsi_triangle_contact_enabled)
         self.fsi_triangle_contact_use_bvh = bool(self.config.fsi_triangle_contact_use_bvh)
         self.fsi_triangle_contact_use_grid = bool(self.config.fsi_triangle_contact_use_grid)
@@ -442,9 +573,42 @@ class SolverIPBF(SolverBase):
         self.fsi_triangle_contact_relaxation = float(self.config.fsi_triangle_contact_relaxation)
         if self.fsi_triangle_contact_relaxation < 0.0:
             raise ValueError("IPBF triangle contact relaxation must be non-negative.")
+        self.fsi_triangle_opposite_side_contact_min_scale = float(
+            self.config.fsi_triangle_opposite_side_contact_min_scale
+        )
+        if (
+            self.fsi_triangle_opposite_side_contact_min_scale < 0.0
+            or self.fsi_triangle_opposite_side_contact_min_scale > 1.0
+        ):
+            raise ValueError("IPBF triangle opposite-side contact min scale must be in [0, 1].")
+        self.fsi_triangle_opposite_side_contact_power = float(self.config.fsi_triangle_opposite_side_contact_power)
+        if self.fsi_triangle_opposite_side_contact_power <= 0.0:
+            raise ValueError("IPBF triangle opposite-side contact power must be positive.")
+        self.fsi_triangle_pressure_contact_exclusion_scale = float(
+            self.config.fsi_triangle_pressure_contact_exclusion_scale
+        )
+        if self.fsi_triangle_pressure_contact_exclusion_scale < 0.0:
+            raise ValueError("IPBF triangle pressure-contact exclusion scale must be non-negative.")
         self.fluid_particle_start, self.fluid_particle_count = self._validate_fluid_particle_range()
         self.fsi_triangle_contact_pair_capacity = self._resolve_triangle_contact_pair_capacity()
         self.fsi_triangle_contact_pair_cache_skin = self._resolve_triangle_contact_pair_cache_skin()
+        configured_max_pairs_per_particle = self.config.fsi_triangle_contact_max_pairs_per_particle
+        self.fsi_triangle_contact_max_pairs_per_particle = (
+            0 if configured_max_pairs_per_particle is None else int(configured_max_pairs_per_particle)
+        )
+        if self.fsi_triangle_contact_max_pairs_per_particle < 0:
+            raise ValueError("IPBF triangle contact max pairs per particle must be non-negative.")
+        self.fsi_triangle_contact_pair_normalization_power = float(
+            self.config.fsi_triangle_contact_pair_normalization_power
+        )
+        if self.fsi_triangle_contact_pair_normalization_power < 0.0:
+            raise ValueError("IPBF triangle contact pair normalization power must be non-negative.")
+        self.fsi_triangle_contact_triangle_normalization_power = float(
+            self.config.fsi_triangle_contact_triangle_normalization_power
+        )
+        if self.fsi_triangle_contact_triangle_normalization_power < 0.0:
+            raise ValueError("IPBF triangle contact triangle normalization power must be non-negative.")
+        self._triangle_contact_allow_overflow_subset = int(self.fsi_triangle_contact_max_pairs_per_particle > 0)
         self._uses_particle_subset = (
             self.fluid_particle_start != 0 or self.fluid_particle_count != self.model.particle_count
         )
@@ -470,6 +634,7 @@ class SolverIPBF(SolverBase):
             self._viscosity_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._xsph_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_density = wp.zeros(model.particle_count, dtype=float)
+            self._triangle_boundary_density = wp.zeros(model.particle_count, dtype=float)
             self._boundary_neighbor_count = wp.zeros(model.particle_count, dtype=wp.int32)
             self._boundary_projection_x_before = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_x_after = wp.zeros(model.particle_count, dtype=wp.vec3)
@@ -489,11 +654,18 @@ class SolverIPBF(SolverBase):
             )
             self._triangle_contact_pair_count = wp.zeros(1, dtype=wp.int32)
             self._triangle_contact_pair_overflow = wp.zeros(1, dtype=wp.int32)
+            self._triangle_contact_pair_particle_count = wp.zeros(model.particle_count, dtype=wp.int32)
+            self._triangle_contact_pair_triangle_count = wp.zeros(model.tri_count, dtype=wp.int32)
+            self._triangle_contact_pair_triangle_same_side_count = wp.zeros(model.tri_count, dtype=wp.int32)
+            self._triangle_contact_pair_triangle_opposite_side_count = wp.zeros(model.tri_count, dtype=wp.int32)
             self._triangle_contact_pair_cache_valid = wp.zeros(1, dtype=wp.int32)
             self._triangle_contact_pair_cache_reuse = wp.zeros(1, dtype=wp.int32)
             self._triangle_contact_pair_cache_displacement_max = wp.zeros(1, dtype=float)
             self._triangle_contact_pair_cache_particle_q = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._triangle_contact_pair_cached_particle_mask = wp.zeros(model.particle_count, dtype=wp.int32)
+            boundary_sample_count = int(getattr(self.boundary_model, "sample_count", 0)) if self.boundary_model else 0
+            self._triangle_hydro_occupancy = wp.zeros(boundary_sample_count, dtype=float)
+            self._triangle_hydro_surface_height = wp.zeros(boundary_sample_count, dtype=float)
             self._ipbf_particle_flags = wp.empty(model.particle_count, dtype=wp.int32)
             self._refresh_particle_flags()
 
@@ -515,6 +687,11 @@ class SolverIPBF(SolverBase):
                 raise ValueError("IPBF boundary model device must match the solver model device.")
 
         self.boundary_model = boundary_model
+        if hasattr(self, "_triangle_hydro_occupancy"):
+            boundary_sample_count = int(getattr(boundary_model, "sample_count", 0)) if boundary_model else 0
+            with wp.ScopedDevice(self.model.device):
+                self._triangle_hydro_occupancy = wp.zeros(boundary_sample_count, dtype=float)
+                self._triangle_hydro_surface_height = wp.zeros(boundary_sample_count, dtype=float)
 
     def _validate_fluid_particle_range(self) -> tuple[int, int]:
         """Return the validated consecutive particle range solved by IPBF."""
@@ -633,6 +810,7 @@ class SolverIPBF(SolverBase):
         state_out.ipbf.force.zero_()
         state_out.ipbf.delta_q.zero_()
         self._boundary_density.zero_()
+        self._triangle_boundary_density.zero_()
         self._boundary_neighbor_count.zero_()
         self._boundary_projection_x_before.zero_()
         self._boundary_projection_x_after.zero_()
@@ -642,6 +820,10 @@ class SolverIPBF(SolverBase):
         self._triangle_contact_vertex_delta.zero_()
         self._triangle_contact_pair_count.zero_()
         self._triangle_contact_pair_overflow.zero_()
+        self._triangle_contact_pair_particle_count.zero_()
+        self._triangle_contact_pair_triangle_count.zero_()
+        self._triangle_contact_pair_triangle_same_side_count.zero_()
+        self._triangle_contact_pair_triangle_opposite_side_count.zero_()
         self._triangle_contact_pair_cache_valid.zero_()
         self._triangle_contact_pair_cache_reuse.zero_()
         self._triangle_contact_pair_cache_displacement_max.zero_()
@@ -651,6 +833,7 @@ class SolverIPBF(SolverBase):
         if self.boundary_model is not None:
             self.boundary_model.clear_forces()
             self.boundary_model.reset_deformable_contact_history()
+            self.boundary_model.reset_wetness_state()
 
         if self.model.particle_count > 1 and self.model.particle_grid is not None:
             with wp.ScopedDevice(self.model.device):
@@ -670,6 +853,10 @@ class SolverIPBF(SolverBase):
             and self.model.tri_indices is not None
             and getattr(boundary_model, "triangle_count", 0) > 0
         )
+
+    def _has_triangle_boundary_velocity_projection(self) -> bool:
+        """Return whether deformable triangle velocity projection can be applied."""
+        return self.fsi_triangle_velocity_projection_enabled and self._has_triangle_boundary_contacts()
 
     def _has_fsi_body_reaction_target(self, state: State) -> bool:
         """Return whether FSI body reaction accumulation is available."""
@@ -767,6 +954,9 @@ class SolverIPBF(SolverBase):
 
             self._triangle_contact_particle_delta.zero_()
             self._triangle_contact_vertex_delta.zero_()
+            triangle_contact_margin = float(self.fsi_triangle_contact_margin)
+            if triangle_contact_margin == 0.0:
+                triangle_contact_margin = 0.5 * float(getattr(boundary_model, "deformable_sample_thickness", 0.0))
 
             if (
                 self.fsi_triangle_contact_use_bvh
@@ -901,6 +1091,7 @@ class SolverIPBF(SolverBase):
                     ],
                     device=model.device,
                 )
+                self._triangle_contact_pair_particle_count.zero_()
                 wp.launch(
                     collect_particle_triangle_contact_pairs_from_bvh,
                     dim=model.particle_count,
@@ -911,14 +1102,17 @@ class SolverIPBF(SolverBase):
                         state.particle_q,
                         model.particle_radius,
                         self._ipbf_particle_flags,
-                        self.fsi_triangle_contact_margin,
+                        model.tri_indices,
+                        triangle_contact_margin,
                         self._triangle_contact_pair_cache_reuse,
                         self.fsi_triangle_contact_pair_cache_skin,
+                        self.fsi_triangle_contact_max_pairs_per_particle,
                         self.fsi_triangle_contact_pair_capacity,
                     ],
                     outputs=[
                         self._triangle_contact_pair_particle,
                         self._triangle_contact_pair_triangle,
+                        self._triangle_contact_pair_particle_count,
                         self._triangle_contact_pair_count,
                         self._triangle_contact_pair_overflow,
                     ],
@@ -963,6 +1157,41 @@ class SolverIPBF(SolverBase):
                     ],
                     device=model.device,
                 )
+                self._triangle_contact_pair_particle_count.zero_()
+                self._triangle_contact_pair_triangle_count.zero_()
+                self._triangle_contact_pair_triangle_same_side_count.zero_()
+                self._triangle_contact_pair_triangle_opposite_side_count.zero_()
+                wp.launch(
+                    rebuild_triangle_contact_pair_particle_counts_from_pairs,
+                    dim=self.fsi_triangle_contact_pair_capacity,
+                    inputs=[
+                        self._triangle_contact_pair_particle,
+                        self._triangle_contact_pair_count,
+                        self.fsi_triangle_contact_pair_capacity,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_particle_count,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    rebuild_triangle_contact_pair_triangle_counts_from_pairs,
+                    dim=self.fsi_triangle_contact_pair_capacity,
+                    inputs=[
+                        self._triangle_contact_pair_particle,
+                        self._triangle_contact_pair_triangle,
+                        self._triangle_contact_pair_count,
+                        self.fsi_triangle_contact_pair_capacity,
+                        state.particle_q,
+                        model.tri_indices,
+                    ],
+                    outputs=[
+                        self._triangle_contact_pair_triangle_count,
+                        self._triangle_contact_pair_triangle_same_side_count,
+                        self._triangle_contact_pair_triangle_opposite_side_count,
+                    ],
+                    device=model.device,
+                )
                 wp.launch(
                     accumulate_particle_triangle_contact_corrections_from_pairs,
                     dim=self.fsi_triangle_contact_pair_capacity,
@@ -972,14 +1201,25 @@ class SolverIPBF(SolverBase):
                         self._triangle_contact_pair_count,
                         self._triangle_contact_pair_overflow,
                         self.fsi_triangle_contact_pair_capacity,
+                        self._triangle_contact_pair_particle_count,
+                        self.fsi_triangle_contact_pair_normalization_power,
+                        self._triangle_contact_pair_triangle_count,
+                        self._triangle_contact_pair_triangle_same_side_count,
+                        self._triangle_contact_pair_triangle_opposite_side_count,
+                        self.fsi_triangle_contact_triangle_normalization_power,
+                        self._triangle_contact_allow_overflow_subset,
                         boundary_model.triangle_contact_particle_q_prev,
                         state.particle_q,
                         model.particle_mass,
                         model.particle_inv_mass,
                         model.particle_radius,
                         model.tri_indices,
-                        self.fsi_triangle_contact_margin,
+                        boundary_model.triangle_wet_weight_same_side,
+                        boundary_model.triangle_wet_weight_opposite_side,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
+                        self.fsi_triangle_opposite_side_contact_min_scale,
+                        self.fsi_triangle_opposite_side_contact_power,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
                     ],
@@ -1002,11 +1242,16 @@ class SolverIPBF(SolverBase):
                         model.particle_radius,
                         self._ipbf_particle_flags,
                         model.tri_indices,
+                        boundary_model.triangle_wet_weight_same_side,
+                        boundary_model.triangle_wet_weight_opposite_side,
                         boundary_model.triangle_indices,
                         boundary_model.triangle_count,
                         self._triangle_contact_pair_overflow,
-                        self.fsi_triangle_contact_margin,
+                        self._triangle_contact_allow_overflow_subset,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
+                        self.fsi_triangle_opposite_side_contact_min_scale,
+                        self.fsi_triangle_opposite_side_contact_power,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
                     ],
@@ -1026,7 +1271,7 @@ class SolverIPBF(SolverBase):
                     self.fsi_triangle_contact_search_radius,
                     float(getattr(boundary_model, "triangle_contact_radius_max", 0.0))
                     + self._max_particle_radius
-                    + self.fsi_triangle_contact_margin,
+                    + triangle_contact_margin,
                 )
                 wp.launch(
                     accumulate_particle_triangle_contact_corrections_from_grid,
@@ -1040,11 +1285,15 @@ class SolverIPBF(SolverBase):
                         model.particle_radius,
                         self._ipbf_particle_flags,
                         model.tri_indices,
+                        boundary_model.triangle_wet_weight_same_side,
+                        boundary_model.triangle_wet_weight_opposite_side,
                         boundary_model.triangle_indices,
                         boundary_model.triangle_contact_proxy_motion_max,
                         contact_search_radius,
-                        self.fsi_triangle_contact_margin,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
+                        self.fsi_triangle_opposite_side_contact_min_scale,
+                        self.fsi_triangle_opposite_side_contact_power,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
                     ],
@@ -1068,10 +1317,14 @@ class SolverIPBF(SolverBase):
                         model.particle_radius,
                         self._ipbf_particle_flags,
                         model.tri_indices,
+                        boundary_model.triangle_wet_weight_same_side,
+                        boundary_model.triangle_wet_weight_opposite_side,
                         boundary_model.triangle_indices,
                         boundary_model.triangle_count,
-                        self.fsi_triangle_contact_margin,
+                        triangle_contact_margin,
                         self.fsi_triangle_contact_relaxation,
+                        self.fsi_triangle_opposite_side_contact_min_scale,
+                        self.fsi_triangle_opposite_side_contact_power,
                         int(self.fsi_triangle_contact_continuous_enabled),
                         dt,
                     ],
@@ -1174,6 +1427,192 @@ class SolverIPBF(SolverBase):
                 outputs=[
                     self._boundary_projected_particle_qd,
                     self._boundary_projected_contact_count,
+                ],
+                device=model.device,
+            )
+
+        wp.launch(
+            finalize_particle_shape_boundary_velocity_projection,
+            dim=model.particle_count,
+            inputs=[
+                state.particle_qd,
+                self._ipbf_particle_flags,
+                self._boundary_projected_particle_qd,
+                self._boundary_projected_contact_count,
+            ],
+            device=model.device,
+        )
+
+    def _apply_triangle_boundary_velocity_projection(
+        self,
+        state: State,
+        vertex_qd_all: wp.array(dtype=wp.vec3) | None,
+        dt: float,
+    ) -> None:
+        """Project final particle velocities against active cloth triangle contacts."""
+        if not self._has_triangle_boundary_velocity_projection() or vertex_qd_all is None:
+            return
+
+        boundary_model = self.boundary_model
+        if (
+            boundary_model is None
+            or getattr(boundary_model, "vertex_velocity_force", None) is None
+            or getattr(boundary_model, "triangle_indices", None) is None
+        ):
+            return
+
+        model = self.model
+        wp.launch(
+            initialize_particle_shape_boundary_velocity_projection,
+            dim=model.particle_count,
+            inputs=[
+                self._ipbf_particle_flags,
+            ],
+            outputs=[
+                self._boundary_projected_particle_qd,
+                self._boundary_projected_contact_count,
+            ],
+            device=model.device,
+        )
+
+        triangle_contact_margin = float(self.fsi_triangle_contact_margin)
+        if triangle_contact_margin == 0.0:
+            triangle_contact_margin = 0.5 * float(getattr(boundary_model, "deformable_sample_thickness", 0.0))
+
+        if (
+            self.fsi_triangle_contact_use_bvh
+            and getattr(boundary_model, "triangle_contact_bvh", None) is not None
+        ):
+            wp.launch(
+                accumulate_particle_triangle_boundary_velocity_projection_from_pairs,
+                dim=self.fsi_triangle_contact_pair_capacity,
+                inputs=[
+                    self._triangle_contact_pair_particle,
+                    self._triangle_contact_pair_triangle,
+                    self._triangle_contact_pair_count,
+                    self._triangle_contact_pair_overflow,
+                    self.fsi_triangle_contact_pair_capacity,
+                    self._triangle_contact_pair_particle_count,
+                    self.fsi_triangle_contact_pair_normalization_power,
+                    self._triangle_contact_pair_triangle_count,
+                    self._triangle_contact_pair_triangle_same_side_count,
+                    self._triangle_contact_pair_triangle_opposite_side_count,
+                    self.fsi_triangle_contact_triangle_normalization_power,
+                    self._triangle_contact_allow_overflow_subset,
+                    state.particle_q,
+                    state.particle_qd,
+                    vertex_qd_all,
+                    model.particle_mass,
+                    model.particle_radius,
+                    model.tri_indices,
+                    boundary_model.triangle_wet_weight_same_side,
+                    boundary_model.triangle_wet_weight_opposite_side,
+                    triangle_contact_margin,
+                    self.fsi_triangle_velocity_damping,
+                    dt,
+                    self.fsi_velocity_projection_reaction_relaxation,
+                ],
+                outputs=[
+                    self._boundary_projected_particle_qd,
+                    self._boundary_projected_contact_count,
+                    boundary_model.vertex_velocity_force,
+                ],
+                device=model.device,
+            )
+            wp.launch(
+                accumulate_particle_triangle_boundary_velocity_projection_if_overflow,
+                dim=model.particle_count,
+                inputs=[
+                    state.particle_q,
+                    state.particle_qd,
+                    vertex_qd_all,
+                    model.particle_mass,
+                    model.particle_radius,
+                    self._ipbf_particle_flags,
+                    model.tri_indices,
+                    boundary_model.triangle_wet_weight_same_side,
+                    boundary_model.triangle_wet_weight_opposite_side,
+                    boundary_model.triangle_indices,
+                    boundary_model.triangle_count,
+                    self._triangle_contact_pair_overflow,
+                    self._triangle_contact_allow_overflow_subset,
+                    triangle_contact_margin,
+                    self.fsi_triangle_velocity_damping,
+                    dt,
+                    self.fsi_velocity_projection_reaction_relaxation,
+                ],
+                outputs=[
+                    self._boundary_projected_particle_qd,
+                    self._boundary_projected_contact_count,
+                    boundary_model.vertex_velocity_force,
+                ],
+                device=model.device,
+            )
+        elif (
+            self.fsi_triangle_contact_use_grid
+            and getattr(boundary_model, "triangle_contact_grid", None) is not None
+        ):
+            contact_search_radius = max(
+                self.fsi_triangle_contact_search_radius,
+                float(getattr(boundary_model, "triangle_contact_radius_max", 0.0))
+                + self._max_particle_radius
+                + triangle_contact_margin,
+            )
+            wp.launch(
+                accumulate_particle_triangle_boundary_velocity_projection_from_grid,
+                dim=model.particle_count,
+                inputs=[
+                    boundary_model.triangle_contact_grid.id,
+                    boundary_model.triangle_contact_particle_q_prev,
+                    state.particle_q,
+                    state.particle_qd,
+                    vertex_qd_all,
+                    model.particle_mass,
+                    model.particle_radius,
+                    self._ipbf_particle_flags,
+                    model.tri_indices,
+                    boundary_model.triangle_wet_weight_same_side,
+                    boundary_model.triangle_wet_weight_opposite_side,
+                    boundary_model.triangle_indices,
+                    boundary_model.triangle_contact_proxy_motion_max,
+                    contact_search_radius,
+                    triangle_contact_margin,
+                    self.fsi_triangle_velocity_damping,
+                    dt,
+                    self.fsi_velocity_projection_reaction_relaxation,
+                ],
+                outputs=[
+                    self._boundary_projected_particle_qd,
+                    self._boundary_projected_contact_count,
+                    boundary_model.vertex_velocity_force,
+                ],
+                device=model.device,
+            )
+        else:
+            wp.launch(
+                accumulate_particle_triangle_boundary_velocity_projection,
+                dim=model.particle_count,
+                inputs=[
+                    state.particle_q,
+                    state.particle_qd,
+                    vertex_qd_all,
+                    model.particle_mass,
+                    model.particle_radius,
+                    self._ipbf_particle_flags,
+                    model.tri_indices,
+                    boundary_model.triangle_wet_weight_same_side,
+                    boundary_model.triangle_wet_weight_opposite_side,
+                    boundary_model.triangle_indices,
+                    boundary_model.triangle_count,
+                    triangle_contact_margin,
+                    self.fsi_triangle_velocity_damping,
+                    dt,
+                    self.fsi_velocity_projection_reaction_relaxation,
+                ],
+                outputs=[
+                    self._boundary_projected_particle_qd,
+                    self._boundary_projected_contact_count,
+                    boundary_model.vertex_velocity_force,
                 ],
                 device=model.device,
             )
@@ -1414,6 +1853,7 @@ class SolverIPBF(SolverBase):
 
         if recompute_density_constraint:
             self._boundary_density.zero_()
+            self._triangle_boundary_density.zero_()
             self._boundary_neighbor_count.zero_()
 
         if recompute_density_constraint and has_boundary:
@@ -1423,6 +1863,75 @@ class SolverIPBF(SolverBase):
         if recompute_density_constraint and model.particle_count > 1 and model.particle_grid is not None:
             with wp.ScopedDevice(model.device):
                 model.particle_grid.build(particle_q, radius=self.smoothing_radius)
+
+            if has_boundary:
+                boundary_model.sample_wet_weight_same_side_prev.assign(boundary_model.sample_wet_weight_same_side)
+                boundary_model.sample_wet_weight_opposite_side_prev.assign(boundary_model.sample_wet_weight_opposite_side)
+                wp.launch(
+                    update_boundary_triangle_wet_weights,
+                    dim=boundary_model.sample_count,
+                    inputs=[
+                        model.particle_grid.id,
+                        particle_q,
+                        model.particle_mass,
+                        self._ipbf_particle_flags,
+                        boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
+                        self.rest_density,
+                        self.smoothing_radius,
+                        self.kernel_family,
+                        self.fsi_triangle_wetness_rise_rate,
+                        self.fsi_triangle_wetness_fall_rate,
+                        self.fsi_triangle_opposite_side_wetness_rise_rate,
+                        self.fsi_triangle_opposite_side_wetness_fall_rate,
+                        boundary_model.sample_wet_weight_same_side_prev,
+                        boundary_model.sample_wet_weight_opposite_side_prev,
+                    ],
+                    outputs=[
+                        boundary_model.sample_wet_weight_same_side,
+                        boundary_model.sample_wet_weight_opposite_side,
+                        boundary_model.sample_wet_weight,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    clear_triangle_wetness_accumulators,
+                    dim=model.tri_count,
+                    outputs=[
+                        boundary_model.triangle_wet_weight_same_side_sum,
+                        boundary_model.triangle_wet_weight_opposite_side_sum,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    accumulate_triangle_wetness_from_samples,
+                    dim=boundary_model.sample_count,
+                    inputs=[
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_wet_weight_same_side,
+                        boundary_model.sample_wet_weight_opposite_side,
+                    ],
+                    outputs=[
+                        boundary_model.triangle_wet_weight_same_side_sum,
+                        boundary_model.triangle_wet_weight_opposite_side_sum,
+                    ],
+                    device=model.device,
+                )
+                wp.launch(
+                    finalize_triangle_wetness,
+                    dim=model.tri_count,
+                    inputs=[
+                        boundary_model.triangle_sample_count_per_triangle,
+                        boundary_model.triangle_wet_weight_same_side_sum,
+                        boundary_model.triangle_wet_weight_opposite_side_sum,
+                    ],
+                    outputs=[
+                        boundary_model.triangle_wet_weight_same_side,
+                        boundary_model.triangle_wet_weight_opposite_side,
+                    ],
+                    device=model.device,
+                )
 
             if has_boundary:
                 wp.launch(
@@ -1436,17 +1945,28 @@ class SolverIPBF(SolverBase):
                         self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight_same_side,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[
                         state.ipbf.density,
                         state.ipbf.neighbor_count,
                         self._boundary_density,
+                        self._triangle_boundary_density,
                         self._boundary_neighbor_count,
                     ],
                     device=model.device,
@@ -1463,14 +1983,26 @@ class SolverIPBF(SolverBase):
                         self._ipbf_particle_flags,
                         model.particle_world,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight_same_side,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         state.ipbf.density,
+                        self._triangle_boundary_density,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
                         int(self.use_constraint_clamp),
+                        int(self.fsi_decouple_triangle_boundary_density),
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
                     device=model.device,
@@ -1521,17 +2053,28 @@ class SolverIPBF(SolverBase):
                         model.particle_mass,
                         self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight_same_side,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[
                         state.ipbf.density,
                         state.ipbf.neighbor_count,
                         self._boundary_density,
+                        self._triangle_boundary_density,
                         self._boundary_neighbor_count,
                     ],
                     device=model.device,
@@ -1545,14 +2088,26 @@ class SolverIPBF(SolverBase):
                         particle_q,
                         self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
+                        boundary_model.sample_triangle,
+                        boundary_model.sample_normal_world,
+                        boundary_model.sample_wet_weight_same_side,
+                        boundary_model.sample_vertex0,
+                        boundary_model.sample_vertex1,
+                        boundary_model.sample_vertex2,
+                        boundary_model.sample_barycentric,
+                        boundary_model.sample_area_patch,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
+                        self._triangle_contact_vertex_delta,
                         self.fsi_static_boundary_weight,
                         state.ipbf.density,
+                        self._triangle_boundary_density,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
                         int(self.use_constraint_clamp),
+                        int(self.fsi_decouple_triangle_boundary_density),
+                        self.fsi_triangle_reconstructed_support_depth_scale,
                     ],
                     outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
                     device=model.device,
@@ -1888,6 +2443,9 @@ class SolverIPBF(SolverBase):
             return
 
         model = self.model
+        triangle_contact_margin = float(self.fsi_triangle_contact_margin)
+        if triangle_contact_margin == 0.0:
+            triangle_contact_margin = 0.5 * float(getattr(boundary_model, "deformable_sample_thickness", 0.0))
         wp.launch(
             accumulate_boundary_pressure_reaction,
             dim=model.particle_count,
@@ -1895,30 +2453,124 @@ class SolverIPBF(SolverBase):
                 boundary_model.boundary_grid.id,
                 particle_q,
                 model.particle_mass,
+                model.particle_radius,
                 self._ipbf_particle_flags,
+                state.ipbf.density,
                 state.ipbf.constraint,
                 state.ipbf.hessian,
                 boundary_model.sample_x_world,
                 boundary_model.sample_body,
                 boundary_model.sample_triangle,
+                boundary_model.sample_normal_world,
+                boundary_model.sample_wet_weight_same_side,
+                boundary_model.sample_wet_weight_opposite_side,
                 boundary_model.sample_vertex0,
                 boundary_model.sample_vertex1,
                 boundary_model.sample_vertex2,
                 boundary_model.sample_barycentric,
+                boundary_model.sample_area_patch,
                 boundary_model.sample_volume_hydrostatic,
                 boundary_model.sample_flags,
+                self._triangle_boundary_density,
                 state.body_q if state.body_q is not None else boundary_model._empty_body_q,
                 model.body_com if model.body_com is not None else boundary_model._empty_body_com,
+                self.rest_density,
                 self.smoothing_radius,
                 self.kernel_family,
                 self.fsi_static_boundary_weight,
+                triangle_contact_margin,
+                self.fsi_triangle_pressure_contact_exclusion_scale,
                 dt,
                 self.relaxation,
                 self.fsi_pressure_reaction_relaxation,
+                self.fsi_triangle_reconstructed_support_depth_scale,
+                int(self.fsi_decouple_triangle_boundary_density),
+                self._triangle_contact_vertex_delta,
+            ],
+            outputs=[
+                boundary_model.vertex_contact_delta,
+                boundary_model.sample_force,
+                boundary_model.vertex_force,
+                boundary_model.vertex_pressure_force,
+                boundary_model.body_force,
+                boundary_model.body_torque,
+            ],
+            device=model.device,
+        )
+
+        if (
+            self.fsi_triangle_hydrostatic_support_scale == 0.0
+            or boundary_model.sample_count == 0
+            or model.particle_grid is None
+        ):
+            return
+
+        self._triangle_hydro_occupancy.zero_()
+        self._triangle_hydro_surface_height.zero_()
+
+        wp.launch(
+            accumulate_boundary_triangle_hydrostatic_state,
+            dim=boundary_model.sample_count,
+            inputs=[
+                model.particle_grid.id,
+                particle_q,
+                model.particle_mass,
+                self._ipbf_particle_flags,
+                model.particle_world,
+                boundary_model.sample_x_world,
+                boundary_model.sample_triangle,
+                boundary_model.sample_normal_world,
+                boundary_model.sample_wet_weight_same_side,
+                boundary_model.sample_vertex0,
+                boundary_model.sample_flags,
+                model.gravity,
+                self.rest_density,
+                self.smoothing_radius,
+                self.kernel_family,
+                self.fsi_static_boundary_weight,
+            ],
+            outputs=[
+                self._triangle_hydro_occupancy,
+                self._triangle_hydro_surface_height,
+            ],
+            device=model.device,
+        )
+
+        wp.launch(
+            apply_boundary_triangle_hydrostatic_support,
+            dim=boundary_model.sample_count,
+            inputs=[
+                boundary_model.sample_x_world,
+                boundary_model.sample_body,
+                boundary_model.sample_triangle,
+                boundary_model.sample_normal_world,
+                boundary_model.sample_wet_weight_same_side,
+                boundary_model.sample_wet_weight_opposite_side,
+                boundary_model.sample_vertex0,
+                boundary_model.sample_vertex1,
+                boundary_model.sample_vertex2,
+                boundary_model.sample_barycentric,
+                boundary_model.sample_area_patch,
+                boundary_model.sample_flags,
+                model.particle_inv_mass,
+                model.particle_world,
+                self._triangle_contact_vertex_delta,
+                state.body_q if state.body_q is not None else boundary_model._empty_body_q,
+                model.body_com if model.body_com is not None else boundary_model._empty_body_com,
+                model.gravity,
+                self.rest_density,
+                self.smoothing_radius,
+                dt,
+                self.fsi_triangle_hydrostatic_support_scale,
+                self.fsi_triangle_pressure_contact_exclusion_scale,
+                self._triangle_hydro_occupancy,
+                self._triangle_hydro_surface_height,
             ],
             outputs=[
                 boundary_model.sample_force,
+                boundary_model.vertex_contact_delta,
                 boundary_model.vertex_force,
+                boundary_model.vertex_pressure_force,
                 boundary_model.body_force,
                 boundary_model.body_torque,
             ],
@@ -1972,6 +2624,7 @@ class SolverIPBF(SolverBase):
                 device=model.device,
             )
 
+        self._apply_triangle_boundary_velocity_projection(state_out, state_in.particle_qd, dt)
         self._apply_shape_boundary_velocity_projection(state_out, contacts, dt)
         self._apply_viscosity_velocity_diffusion(state_out, dt)
         self._apply_xsph_velocity_smoothing(state_out)
