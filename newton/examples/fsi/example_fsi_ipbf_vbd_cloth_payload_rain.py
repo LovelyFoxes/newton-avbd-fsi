@@ -63,6 +63,42 @@ class Example:
             help="Override the cloth tangential velocity damping used by triangle velocity projection.",
         )
         parser.add_argument(
+            "--cloth-dim",
+            type=int,
+            default=None,
+            help="Override both cloth_dim_x and cloth_dim_y with a square cloth resolution.",
+        )
+        parser.add_argument(
+            "--cloth-contact-thickness",
+            type=float,
+            default=None,
+            help="Override the effective thin-shell cloth contact thickness used by FSI triangle contact [m].",
+        )
+        parser.add_argument(
+            "--triangle-contact-margin-scale",
+            type=float,
+            default=None,
+            help="Override the fluid-radius multiplier used for cloth triangle contact margin.",
+        )
+        parser.add_argument(
+            "--ipbf-iterations",
+            type=int,
+            default=None,
+            help="Override the number of IPBF iterations per simulation substep.",
+        )
+        parser.add_argument(
+            "--vbd-iterations",
+            type=int,
+            default=None,
+            help="Override the number of VBD iterations per simulation substep.",
+        )
+        parser.add_argument(
+            "--sim-substeps",
+            type=int,
+            default=None,
+            help="Override the number of simulation substeps per rendered frame.",
+        )
+        parser.add_argument(
             "--show-boundary-samples",
             action=argparse.BooleanOptionalAction,
             default=False,
@@ -115,6 +151,7 @@ class Example:
                 "cloth_edge_kd": 0.06,
                 "cloth_self_contact_radius_ratio": 0.225,
                 "cloth_self_contact_margin_ratio": 0.375,
+                "cloth_contact_thickness": 0.028,
                 "payload_sphere_radius": 0.045,
                 "payload_densities": (300.0, 750.0, 1250.0),
                 "payload_mu": 0.35,
@@ -180,17 +217,18 @@ class Example:
                 "cloth_edge_kd": 0.12,
                 "cloth_self_contact_radius_ratio": 0.225,
                 "cloth_self_contact_margin_ratio": 0.375,
-                "payload_sphere_radius": 0.056,
-                "payload_densities": (250.0, 500.0, 750.0),
+                "cloth_contact_thickness": 0.036,
+                "payload_sphere_radius": 0.048,
+                "payload_densities": (200.0, 300.0, 400.0),
                 "payload_mu": 0.35,
                 "reservoir_center": (0.0, 1.44, -0.96),
                 "reservoir_half_width": 0.24,
                 "reservoir_half_height": 0.56,
                 "reservoir_half_depth": 0.24,
                 "reservoir_wall_thickness": 0.018,
-                "outlet_half_width": 0.088,
-                "outlet_half_height": 0.088,
-                "tunnel_half_length": 0.10,
+                "outlet_half_width": 0.064,
+                "outlet_half_height": 0.064,
+                "tunnel_half_length": 0.16,
                 "tunnel_floor_half_thickness": 0.020,
                 "tunnel_top_half_thickness": 0.014,
                 "tunnel_side_thickness": 0.014,
@@ -200,15 +238,15 @@ class Example:
                 "release_step": 30,
                 "fluid_cell": 0.018,
                 "fluid_dim_x": 24,
-                "fluid_dim_y": 54,
+                "fluid_dim_y": 48,
                 "fluid_dim_z": 24,
                 "fluid_mass": 0.0058,
                 "fluid_radius": 0.0068,
                 "rest_density": 1000.0,
                 "smoothing_radius": 0.040,
                 "ipbf_iterations": 4,
-                "vbd_iterations": 12,
-                "sim_substeps": 5,
+                "vbd_iterations": 8,
+                "sim_substeps": 8,
                 "velocity_damping": 0.999,
                 "viscosity_coefficient": 0.0025,
                 "xsph_coefficient": 0.006,
@@ -217,7 +255,7 @@ class Example:
                 "static_boundary_weight": 0.20,
                 "triangle_velocity_damping": 0.50,
                 "triangle_contact_relaxation": 1.0,
-                "triangle_contact_margin_scale": 0.75,
+                "triangle_contact_margin_scale": 1.25,
                 "boundary_spacing": 0.020,
                 "water_render_radius_scale": 0.70,
                 "boundary_render_radius_scale": 0.24,
@@ -237,6 +275,31 @@ class Example:
         triangle_velocity_damping = getattr(self.args, "triangle_velocity_damping", None)
         if triangle_velocity_damping is not None:
             config["triangle_velocity_damping"] = float(triangle_velocity_damping)
+
+        cloth_dim = getattr(self.args, "cloth_dim", None)
+        if cloth_dim is not None:
+            config["cloth_dim_x"] = max(1, int(cloth_dim))
+            config["cloth_dim_y"] = max(1, int(cloth_dim))
+
+        cloth_contact_thickness = getattr(self.args, "cloth_contact_thickness", None)
+        if cloth_contact_thickness is not None:
+            config["cloth_contact_thickness"] = max(0.0, float(cloth_contact_thickness))
+
+        triangle_contact_margin_scale = getattr(self.args, "triangle_contact_margin_scale", None)
+        if triangle_contact_margin_scale is not None:
+            config["triangle_contact_margin_scale"] = max(0.0, float(triangle_contact_margin_scale))
+
+        ipbf_iterations = getattr(self.args, "ipbf_iterations", None)
+        if ipbf_iterations is not None:
+            config["ipbf_iterations"] = max(1, int(ipbf_iterations))
+
+        vbd_iterations = getattr(self.args, "vbd_iterations", None)
+        if vbd_iterations is not None:
+            config["vbd_iterations"] = max(1, int(vbd_iterations))
+
+        sim_substeps = getattr(self.args, "sim_substeps", None)
+        if sim_substeps is not None:
+            config["sim_substeps"] = max(1, int(sim_substeps))
 
         return self._finalize_cloth_config(config)
 
@@ -329,6 +392,9 @@ class Example:
         ui.text(f"Payload densities: {tuple(float(v) for v in self.config['payload_densities'])}")
         ui.text(f"Cloth particles: {self.cloth_particle_count}")
         ui.text(f"Cloth total mass: {self.cloth_particle_count * float(self.config['cloth_particle_mass']):.3f} kg")
+        if not self.disable_fluid and not self.disable_tank:
+            ui.text(f"Bottom leak count: {self.current_bottom_leak_count}")
+            ui.text(f"Bottom leak max: {self.max_bottom_leak_count}")
 
     def _add_catch_tank(self, builder: newton.ModelBuilder) -> None:
         hx = float(self.config["tank_half_width"])
@@ -338,14 +404,14 @@ class Example:
         self.tank_top_y = self.floor_y + 2.0 * hy
 
         wall_cfg = newton.ModelBuilder.ShapeConfig(density=0.0, mu=0.0)
-        builder.add_shape_box(
-            body=-1,
-            xform=wp.transform((0.0, self.floor_y - wt, 0.0), wp.quat_identity()),
-            hx=hx + wt,
-            hy=wt,
-            hz=hz + wt,
-            cfg=wall_cfg,
-        )
+        # builder.add_shape_box(
+        #     body=-1,
+        #     xform=wp.transform((0.0, self.floor_y - wt, 0.0), wp.quat_identity()),
+        #     hx=hx + wt,
+        #     hy=wt,
+        #     hz=hz + wt,
+        #     cfg=wall_cfg,
+        # )
         builder.add_shape_box(
             body=-1,
             xform=wp.transform((hx + wt, self.floor_y + hy, 0.0), wp.quat_identity()),
@@ -664,10 +730,7 @@ class Example:
             include_static=True,
             include_dynamic=True,
             include_triangles=True,
-            deformable_sample_thickness=max(
-                float(self.config["fluid_radius"]) * 2.5,
-                float(self.config["cloth_particle_radius"]) * 2.0,
-            ),
+            deformable_sample_thickness=float(self.config["cloth_contact_thickness"]),
             device=self.model.device,
         )
         self.boundary_model.set_triangle_boundary_samples_active(False)
@@ -895,6 +958,9 @@ class Example:
         self.max_particle_speed = 0.0
         self.max_body_speed = 0.0
         self.max_triangle_contact_pair_count = 0
+        self.current_bottom_leak_count = 0
+        self.max_bottom_leak_count = 0
+        self.min_fluid_y_in_tank = float("inf")
         self.states_remain_finite = True
         self.viewer._paused = True
 
@@ -916,6 +982,28 @@ class Example:
         if body_qd is not None and body_qd.size:
             self.max_body_speed = max(self.max_body_speed, float(np.linalg.norm(body_qd[:, :3], axis=1).max()))
         self.max_triangle_contact_pair_count = max(self.max_triangle_contact_pair_count, triangle_pair_count)
+
+        if (
+            not self.disable_fluid
+            and not self.disable_tank
+            and self.fluid_particle_count > 0
+        ):
+            fluid_q = particle_q[self.fluid_particle_start : self.fluid_particle_start + self.fluid_particle_count]
+            bottom_threshold = self.floor_y + max(8.0 * float(self.config["fluid_radius"]), 0.06)
+            in_tank_xy = np.logical_and.reduce(
+                (
+                    fluid_q[:, 0] >= -float(self.config["tank_half_width"]),
+                    fluid_q[:, 0] <= float(self.config["tank_half_width"]),
+                    fluid_q[:, 2] >= -float(self.config["tank_half_depth"]),
+                    fluid_q[:, 2] <= float(self.config["tank_half_depth"]),
+                )
+            )
+            near_bottom = np.logical_and(in_tank_xy, fluid_q[:, 1] <= bottom_threshold)
+            self.current_bottom_leak_count = int(np.count_nonzero(near_bottom))
+            self.max_bottom_leak_count = max(self.max_bottom_leak_count, self.current_bottom_leak_count)
+            if np.any(in_tank_xy):
+                self.min_fluid_y_in_tank = min(self.min_fluid_y_in_tank, float(np.min(fluid_q[in_tank_xy, 1])))
+
         self.states_remain_finite = self.states_remain_finite and bool(
             np.isfinite(density).all()
             and np.isfinite(particle_q).all()
