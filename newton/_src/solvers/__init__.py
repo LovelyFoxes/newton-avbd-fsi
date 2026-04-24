@@ -8,6 +8,7 @@ from .implicit_mpm import SolverImplicitMPM
 from .ipbf import SolverIPBF
 from .kamino import SolverKamino
 from .mujoco import SolverMuJoCo
+from .pbf import SolverPBF
 from .semi_implicit import SolverSemiImplicit
 from .solver import SolverBase
 from .style3d.solver_style3d import SolverStyle3D
@@ -25,6 +26,7 @@ __all__ = [
     "SolverKamino",
     "SolverMuJoCo",
     "SolverNotifyFlags",
+    "SolverPBF",
     "SolverSemiImplicit",
     "SolverStyle3D",
     "SolverVBD",

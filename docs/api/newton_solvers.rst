@@ -428,6 +428,7 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    SolverKamino
    SolverMuJoCo
    SolverNotifyFlags
+   SolverPBF
    SolverSemiImplicit
    SolverStyle3D
    SolverVBD
