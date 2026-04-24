@@ -107,7 +107,7 @@ class Example:
                 "cloth_span_x": 0.96,
                 "cloth_span_y": 0.96,
                 "cloth_surface_density": 0.55,
-                "cloth_particle_radius_ratio": 0.125,
+                "cloth_particle_radius_ratio": 0.150,
                 "cloth_tri_ke": 95.0,
                 "cloth_tri_ka": 95.0,
                 "cloth_tri_kd": 0.28,
@@ -116,7 +116,6 @@ class Example:
                 "cloth_self_contact_radius_ratio": 0.225,
                 "cloth_self_contact_margin_ratio": 0.375,
                 "payload_sphere_radius": 0.045,
-                "payload_box_half_extents": (0.038, 0.038, 0.038),
                 "payload_densities": (300.0, 750.0, 1250.0),
                 "payload_mu": 0.35,
                 "reservoir_center": (0.0, 1.26, -0.74),
@@ -153,12 +152,13 @@ class Example:
                 "static_boundary_weight": 0.5,
                 "triangle_velocity_damping": 0.50,
                 "triangle_contact_relaxation": 1.0,
+                "triangle_contact_margin_scale": 0.60,
                 "boundary_spacing": 0.030,
                 "water_render_radius_scale": 0.70,
                 "boundary_render_radius_scale": 0.24,
                 "shape_contact_ke": 3.0e4,
                 "shape_contact_kd": 1.2e3,
-                "shape_contact_gap": 0.006,
+                "shape_contact_gap": 0.010,
             }
         else:
             config = {
@@ -166,13 +166,13 @@ class Example:
                 "tank_half_depth": 0.40,
                 "tank_wall_height": 0.40,
                 "tank_wall_thickness": 0.035,
-                "cloth_center": (0.0, 0.96, 0.0),
+                "cloth_center": (0.0, 0.84, 0.0),
                 "cloth_dim_x": 32,
                 "cloth_dim_y": 32,
                 "cloth_span_x": 1.44,
                 "cloth_span_y": 1.44,
                 "cloth_surface_density": 0.30,
-                "cloth_particle_radius_ratio": 0.125,
+                "cloth_particle_radius_ratio": 0.150,
                 "cloth_tri_ke": 480.0,
                 "cloth_tri_ka": 480.0,
                 "cloth_tri_kd": 0.48,
@@ -181,17 +181,16 @@ class Example:
                 "cloth_self_contact_radius_ratio": 0.225,
                 "cloth_self_contact_margin_ratio": 0.375,
                 "payload_sphere_radius": 0.056,
-                "payload_box_half_extents": (0.040, 0.040, 0.040),
                 "payload_densities": (250.0, 500.0, 750.0),
                 "payload_mu": 0.35,
-                "reservoir_center": (0.0, 1.60, -1.12),
+                "reservoir_center": (0.0, 1.44, -0.96),
                 "reservoir_half_width": 0.24,
                 "reservoir_half_height": 0.56,
                 "reservoir_half_depth": 0.24,
                 "reservoir_wall_thickness": 0.018,
                 "outlet_half_width": 0.088,
                 "outlet_half_height": 0.088,
-                "tunnel_half_length": 0.20,
+                "tunnel_half_length": 0.10,
                 "tunnel_floor_half_thickness": 0.020,
                 "tunnel_top_half_thickness": 0.014,
                 "tunnel_side_thickness": 0.014,
@@ -218,12 +217,13 @@ class Example:
                 "static_boundary_weight": 0.20,
                 "triangle_velocity_damping": 0.50,
                 "triangle_contact_relaxation": 1.0,
+                "triangle_contact_margin_scale": 0.75,
                 "boundary_spacing": 0.020,
                 "water_render_radius_scale": 0.70,
                 "boundary_render_radius_scale": 0.24,
                 "shape_contact_ke": 4.0e4,
                 "shape_contact_kd": 1.5e3,
-                "shape_contact_gap": 0.006,
+                "shape_contact_gap": 0.010,
             }
 
         release_step = getattr(self.args, "release_step", None)
@@ -496,7 +496,7 @@ class Example:
         gate_hz = float(self.config["outlet_gate_half_thickness"])
         self.gate_half_extents = (outlet_hx, outlet_hy, gate_hz)
         self.gate_closed_center = (cx, outlet_y, cz + hz + gate_hz)
-        self.gate_open_center = (cx, float(self.config["gate_open_height"]), self.gate_closed_center[2])
+        self.gate_hidden_center = (cx, float(self.config["gate_open_height"]) + 5.0, self.gate_closed_center[2])
         self.gate_body = builder.add_body(
             xform=wp.transform(self.gate_closed_center, wp.quat_identity()),
             is_kinematic=True,
@@ -513,24 +513,29 @@ class Example:
     def _add_rigid_payloads(self, builder: newton.ModelBuilder) -> None:
         cloth_y = float(self.config["cloth_center"][1])
         sphere_radius = float(self.config["payload_sphere_radius"])
-        box_hx, box_hy, box_hz = tuple(float(v) for v in self.config["payload_box_half_extents"])
         densities = tuple(float(v) for v in self.config["payload_densities"])
         mu = float(self.config["payload_mu"])
 
         sphere_positions = (
-            (-0.17, cloth_y + sphere_radius + 0.012, -0.04),
-            (0.00, cloth_y + sphere_radius + 0.018, 0.08),
-            (0.17, cloth_y + sphere_radius + 0.012, -0.04),
+            (-0.18, cloth_y + sphere_radius + 0.020, -0.10),
+            (0.18, cloth_y + sphere_radius + 0.020, -0.10),
+            (-0.10, cloth_y + sphere_radius + 0.060, 0.10),
+            (0.10, cloth_y + sphere_radius + 0.060, 0.10),
+            (-0.06, cloth_y + sphere_radius + 0.100, -0.24),
+            (0.06, cloth_y + sphere_radius + 0.100, -0.24),
         )
-        box_positions = (
-            (-0.12, cloth_y + box_hy + 0.016, 0.18),
-            (0.12, cloth_y + box_hy + 0.016, 0.18),
-            (0.00, cloth_y + box_hy + 0.018, -0.16),
+        sphere_densities = (
+            densities[0],
+            densities[0],
+            densities[1],
+            densities[1],
+            densities[2],
+            densities[2],
         )
 
         self.sphere_bodies: list[int] = []
         self.box_bodies: list[int] = []
-        for index, (position, density) in enumerate(zip(sphere_positions, densities, strict=True)):
+        for index, (position, density) in enumerate(zip(sphere_positions, sphere_densities, strict=True)):
             body = builder.add_body(xform=wp.transform(position, wp.quat_identity()), label=f"fsi_payload_sphere_{index}")
             builder.add_shape_sphere(
                 body=body,
@@ -538,23 +543,6 @@ class Example:
                 cfg=newton.ModelBuilder.ShapeConfig(density=density, mu=mu),
             )
             self.sphere_bodies.append(body)
-
-        for index, (position, density) in enumerate(zip(box_positions, densities, strict=True)):
-            body = builder.add_body(
-                xform=wp.transform(
-                    position,
-                    wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), 0.35 * float(index + 1)),
-                ),
-                label=f"fsi_payload_box_{index}",
-            )
-            builder.add_shape_box(
-                body=body,
-                hx=box_hx,
-                hy=box_hy,
-                hz=box_hz,
-                cfg=newton.ModelBuilder.ShapeConfig(density=density, mu=mu),
-            )
-            self.box_bodies.append(body)
 
     def _add_fluid_block(self, builder: newton.ModelBuilder) -> None:
         self.fluid_particle_start = builder.particle_count
@@ -676,7 +664,10 @@ class Example:
             include_static=True,
             include_dynamic=True,
             include_triangles=True,
-            deformable_sample_thickness=float(self.config["fluid_radius"]) * 2.0,
+            deformable_sample_thickness=max(
+                float(self.config["fluid_radius"]) * 2.5,
+                float(self.config["cloth_particle_radius"]) * 2.0,
+            ),
             device=self.model.device,
         )
         self.boundary_model.set_triangle_boundary_samples_active(False)
@@ -697,7 +688,8 @@ class Example:
                 fsi_triangle_velocity_damping=float(self.config["triangle_velocity_damping"]),
                 fsi_static_boundary_weight=float(self.config["static_boundary_weight"]),
                 fsi_triangle_contact_enabled=True,
-                fsi_triangle_contact_margin=0.0,
+                fsi_triangle_contact_margin=float(self.config["triangle_contact_margin_scale"])
+                * float(self.config["fluid_radius"]),
                 fsi_triangle_contact_relaxation=float(self.config["triangle_contact_relaxation"]),
                 fluid_particle_start=self.fluid_particle_start,
                 fluid_particle_count=self.fluid_particle_count,
@@ -713,8 +705,8 @@ class Example:
             particle_self_contact_radius=float(self.config["cloth_self_contact_radius"]),
             particle_self_contact_margin=float(self.config["cloth_self_contact_margin"]),
             particle_external_vertex_contact_filtering_map=self._build_cloth_self_contact_vertex_filtering_map(),
-            rigid_body_contact_buffer_size=96,
-            rigid_body_particle_contact_buffer_size=384,
+            rigid_body_contact_buffer_size=256,
+            rigid_body_particle_contact_buffer_size=2048,
             fsi_boundary_model=self.boundary_model,
         )
         coupling_mode = getattr(self.args, "coupling_mode", "interlinked")
@@ -779,12 +771,14 @@ class Example:
             device=self.model.device,
         )
         self.sphere_colors = wp.array(
-            [wp.vec3(1.0, 0.72, 0.24), wp.vec3(0.30, 0.86, 0.34), wp.vec3(0.18, 0.80, 1.00)],
-            dtype=wp.vec3,
-            device=self.model.device,
-        )
-        self.box_colors = wp.array(
-            [wp.vec3(1.0, 0.46, 0.20), wp.vec3(0.54, 0.88, 0.28), wp.vec3(0.16, 0.58, 0.88)],
+            [
+                wp.vec3(1.0, 0.72, 0.24),
+                wp.vec3(1.0, 0.72, 0.24),
+                wp.vec3(0.30, 0.86, 0.34),
+                wp.vec3(0.30, 0.86, 0.34),
+                wp.vec3(0.18, 0.80, 1.00),
+                wp.vec3(0.18, 0.80, 1.00),
+            ],
             dtype=wp.vec3,
             device=self.model.device,
         )
@@ -880,7 +874,7 @@ class Example:
     def _apply_gate_state(self, state: newton.State) -> None:
         if self.disable_fluid or self.gate_body is None:
             return
-        gate_center = self._lerp_center(self.gate_closed_center, self.gate_open_center, self._gate_alpha())
+        gate_center = self.gate_hidden_center if self._gate_is_open() else self.gate_closed_center
         self._set_body_pose(state, self.gate_body, gate_center, wp.quat_identity())
 
     def reset(self):
@@ -1010,6 +1004,7 @@ class Example:
                 self._body_xforms([self.gate_body]),
                 wp.array([wp.vec3(0.82, 0.84, 0.88)], dtype=wp.vec3, device=self.model.device),
                 self.shape_material,
+                hidden=self._gate_is_open(),
             )
         if self.sphere_bodies:
             self.viewer.log_shapes(
@@ -1018,15 +1013,6 @@ class Example:
                 float(self.config["payload_sphere_radius"]),
                 self._body_xforms(self.sphere_bodies),
                 self.sphere_colors,
-                self.shape_material,
-            )
-        if self.box_bodies:
-            self.viewer.log_shapes(
-                "/fsi/cloth_payload_rain_boxes",
-                newton.GeoType.BOX,
-                tuple(float(v) for v in self.config["payload_box_half_extents"]),
-                self._body_xforms(self.box_bodies),
-                self.box_colors,
                 self.shape_material,
             )
         if self.fluid_particle_count > 0:

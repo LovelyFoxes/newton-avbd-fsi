@@ -551,9 +551,9 @@ class Example:
         )
         gate_x = self.fluid_outlet_wall_center_x + self.fluid_gate_half_extents[0]
         self.fluid_gate_closed_center = (gate_x, self.fluid_outlet_center[1], self.fluid_outlet_center[2])
-        self.fluid_gate_open_center = (
+        self.fluid_gate_hidden_center = (
             self.fluid_gate_closed_center[0],
-            float(self.config["fluid_gate_open_height"]),
+            float(self.config["fluid_gate_open_height"]) + 5.0,
             self.fluid_gate_closed_center[2],
         )
         self.fluid_gate_body = builder.add_body(
@@ -913,11 +913,7 @@ class Example:
         return float(self.frame_index - release_step + 1) / float(duration_frames)
 
     def _apply_gate_states(self, state: newton.State) -> None:
-        fluid_alpha = self._gate_alpha(
-            int(self.config["fluid_release_step"]),
-            int(self.config["fluid_gate_open_duration_frames"]),
-        )
-        fluid_center = self._lerp_center(self.fluid_gate_closed_center, self.fluid_gate_open_center, fluid_alpha)
+        fluid_center = self.fluid_gate_hidden_center if self._fluid_gate_is_open() else self.fluid_gate_closed_center
         self._set_body_pose(state, self.fluid_gate_body, fluid_center, self.tunnel_rotation)
 
     def reset(self):
@@ -1085,6 +1081,7 @@ class Example:
             self._body_xforms([self.fluid_gate_body]),
             self.gate_colors,
             self.shape_material,
+            hidden=self._fluid_gate_is_open(),
         )
         self.viewer.log_points(
             "/fsi/cascade_water_points",
