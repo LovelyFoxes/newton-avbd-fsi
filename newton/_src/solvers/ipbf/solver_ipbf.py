@@ -169,6 +169,9 @@ class SolverIPBF(SolverBase):
                 applied to fluid velocities at final particle-triangle
                 contacts. If ``None``, :attr:`boundary_velocity_damping` is
                 reused for cloth boundaries.
+            fsi_triangle_pressure_reaction_enabled: Legacy compatibility flag.
+                Triangle-bound deformable FSI boundary samples no longer
+                participate in the boundary pressure-reaction path.
             fsi_pressure_reaction_relaxation: Unitless multiplier applied when
                 converting boundary pressure-gradient position increments into
                 FSI body reaction forces and torques.
@@ -192,10 +195,9 @@ class SolverIPBF(SolverBase):
                 to static boundary-sample contributions in the density,
                 constraint-gradient, pressure-reaction, and boundary-aware
                 velocity-smoothing / viscosity paths.
-            fsi_decouple_triangle_boundary_density: Whether triangle-bound
-                deformable FSI boundary samples contribute through a decoupled
-                support path instead of being fully mixed into the fluid-side
-                density constraint.
+            fsi_decouple_triangle_boundary_density: Legacy compatibility flag.
+                Triangle-bound deformable FSI boundary samples no longer
+                contribute through the fluid-side density constraint.
             fsi_triangle_contact_enabled: Whether active fluid particles are
                 projected against triangle-bound deformable FSI boundaries.
             fsi_triangle_contact_use_bvh: Whether deformable triangle contact
@@ -246,10 +248,10 @@ class SolverIPBF(SolverBase):
                 cloth contact relaxation scale. Values above ``1`` delay
                 full-strength dry-side contact until the opposite side becomes
                 substantially wetted.
-            fsi_triangle_pressure_contact_exclusion_scale: Unitless multiplier
-                applied to the triangle-contact distance when suppressing
-                cloth pressure reaction for pairs already handled by direct
-                particle-triangle contact. Zero disables this handoff.
+            fsi_triangle_pressure_contact_exclusion_scale: Legacy
+                compatibility flag retained for older cloth pressure
+                configurations. The current cloth contact-dominant path no
+                longer applies triangle pressure/contact handoff.
             fluid_particle_start: First particle index solved as IPBF fluid.
             fluid_particle_count: Number of consecutive particles solved as
                 IPBF fluid. If ``None``, all particles from
@@ -282,6 +284,7 @@ class SolverIPBF(SolverBase):
         fsi_velocity_projection_reaction_relaxation: float | None = None
         fsi_triangle_velocity_projection_enabled: bool = False
         fsi_triangle_velocity_damping: float | None = None
+        fsi_triangle_pressure_reaction_enabled: bool = True
         fsi_pressure_reaction_relaxation: float = 1.0
         fsi_triangle_wetness_rise_rate: float = 0.5
         fsi_triangle_wetness_fall_rate: float = 0.15
@@ -534,7 +537,6 @@ class SolverIPBF(SolverBase):
         self.fsi_static_boundary_weight = float(self.config.fsi_static_boundary_weight)
         if self.fsi_static_boundary_weight < 0.0:
             raise ValueError("IPBF static boundary weight must be non-negative.")
-        self.fsi_decouple_triangle_boundary_density = bool(self.config.fsi_decouple_triangle_boundary_density)
         self.fsi_triangle_contact_enabled = bool(self.config.fsi_triangle_contact_enabled)
         self.fsi_triangle_contact_use_bvh = bool(self.config.fsi_triangle_contact_use_bvh)
         self.fsi_triangle_contact_use_grid = bool(self.config.fsi_triangle_contact_use_grid)
@@ -564,11 +566,6 @@ class SolverIPBF(SolverBase):
         self.fsi_triangle_opposite_side_contact_power = float(self.config.fsi_triangle_opposite_side_contact_power)
         if self.fsi_triangle_opposite_side_contact_power <= 0.0:
             raise ValueError("IPBF triangle opposite-side contact power must be positive.")
-        self.fsi_triangle_pressure_contact_exclusion_scale = float(
-            self.config.fsi_triangle_pressure_contact_exclusion_scale
-        )
-        if self.fsi_triangle_pressure_contact_exclusion_scale < 0.0:
-            raise ValueError("IPBF triangle pressure-contact exclusion scale must be non-negative.")
         self.fluid_particle_start, self.fluid_particle_count = self._validate_fluid_particle_range()
         self.fsi_triangle_contact_pair_capacity = self._resolve_triangle_contact_pair_capacity()
         self.fsi_triangle_contact_pair_cache_skin = self._resolve_triangle_contact_pair_cache_skin()
@@ -614,7 +611,6 @@ class SolverIPBF(SolverBase):
             self._viscosity_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._xsph_particle_qd = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_density = wp.zeros(model.particle_count, dtype=float)
-            self._triangle_boundary_density = wp.zeros(model.particle_count, dtype=float)
             self._boundary_neighbor_count = wp.zeros(model.particle_count, dtype=wp.int32)
             self._boundary_projection_x_before = wp.zeros(model.particle_count, dtype=wp.vec3)
             self._boundary_projection_x_after = wp.zeros(model.particle_count, dtype=wp.vec3)
@@ -782,7 +778,6 @@ class SolverIPBF(SolverBase):
         state_out.ipbf.force.zero_()
         state_out.ipbf.delta_q.zero_()
         self._boundary_density.zero_()
-        self._triangle_boundary_density.zero_()
         self._boundary_neighbor_count.zero_()
         self._boundary_projection_x_before.zero_()
         self._boundary_projection_x_after.zero_()
@@ -1825,7 +1820,6 @@ class SolverIPBF(SolverBase):
 
         if recompute_density_constraint:
             self._boundary_density.zero_()
-            self._triangle_boundary_density.zero_()
             self._boundary_neighbor_count.zero_()
 
         if recompute_density_constraint and has_boundary:
@@ -1918,8 +1912,6 @@ class SolverIPBF(SolverBase):
                         model.particle_world,
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
-                        boundary_model.sample_normal_world,
-                        boundary_model.sample_wet_weight_same_side,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -1931,7 +1923,6 @@ class SolverIPBF(SolverBase):
                         state.ipbf.density,
                         state.ipbf.neighbor_count,
                         self._boundary_density,
-                        self._triangle_boundary_density,
                         self._boundary_neighbor_count,
                     ],
                     device=model.device,
@@ -1949,18 +1940,14 @@ class SolverIPBF(SolverBase):
                         model.particle_world,
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
-                        boundary_model.sample_normal_world,
-                        boundary_model.sample_wet_weight_same_side,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
                         state.ipbf.density,
-                        self._triangle_boundary_density,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
                         int(self.use_constraint_clamp),
-                        int(self.fsi_decouple_triangle_boundary_density),
                     ],
                     outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
                     device=model.device,
@@ -2012,8 +1999,6 @@ class SolverIPBF(SolverBase):
                         self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
-                        boundary_model.sample_normal_world,
-                        boundary_model.sample_wet_weight_same_side,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
@@ -2025,7 +2010,6 @@ class SolverIPBF(SolverBase):
                         state.ipbf.density,
                         state.ipbf.neighbor_count,
                         self._boundary_density,
-                        self._triangle_boundary_density,
                         self._boundary_neighbor_count,
                     ],
                     device=model.device,
@@ -2040,18 +2024,14 @@ class SolverIPBF(SolverBase):
                         self._ipbf_particle_flags,
                         boundary_model.sample_x_world,
                         boundary_model.sample_triangle,
-                        boundary_model.sample_normal_world,
-                        boundary_model.sample_wet_weight_same_side,
                         boundary_model.sample_volume_hydrostatic,
                         boundary_model.sample_flags,
                         self.fsi_static_boundary_weight,
                         state.ipbf.density,
-                        self._triangle_boundary_density,
                         self.rest_density,
                         self.smoothing_radius,
                         self.kernel_family,
                         int(self.use_constraint_clamp),
-                        int(self.fsi_decouple_triangle_boundary_density),
                     ],
                     outputs=[state.ipbf.constraint, state.ipbf.constraint_gradient],
                     device=model.device,
@@ -2387,9 +2367,6 @@ class SolverIPBF(SolverBase):
             return
 
         model = self.model
-        triangle_contact_margin = float(self.fsi_triangle_contact_margin)
-        if triangle_contact_margin == 0.0:
-            triangle_contact_margin = 0.5 * float(getattr(boundary_model, "deformable_sample_thickness", 0.0))
         wp.launch(
             accumulate_boundary_pressure_reaction,
             dim=model.particle_count,
@@ -2397,37 +2374,22 @@ class SolverIPBF(SolverBase):
                 boundary_model.boundary_grid.id,
                 particle_q,
                 model.particle_mass,
-                model.particle_radius,
                 self._ipbf_particle_flags,
-                state.ipbf.density,
                 state.ipbf.constraint,
                 state.ipbf.hessian,
                 boundary_model.sample_x_world,
                 boundary_model.sample_body,
                 boundary_model.sample_triangle,
-                boundary_model.sample_normal_world,
-                boundary_model.sample_wet_weight_same_side,
-                boundary_model.sample_wet_weight_opposite_side,
-                boundary_model.sample_vertex0,
-                boundary_model.sample_vertex1,
-                boundary_model.sample_vertex2,
-                boundary_model.sample_barycentric,
                 boundary_model.sample_volume_hydrostatic,
                 boundary_model.sample_flags,
-                self._triangle_boundary_density,
                 state.body_q if state.body_q is not None else boundary_model._empty_body_q,
                 model.body_com if model.body_com is not None else boundary_model._empty_body_com,
-                self.rest_density,
                 self.smoothing_radius,
                 self.kernel_family,
                 self.fsi_static_boundary_weight,
-                triangle_contact_margin,
-                self.fsi_triangle_pressure_contact_exclusion_scale,
                 dt,
                 self.relaxation,
                 self.fsi_pressure_reaction_relaxation,
-                int(self.fsi_decouple_triangle_boundary_density),
-                self._triangle_contact_vertex_delta,
             ],
             outputs=[
                 boundary_model.vertex_contact_delta,
