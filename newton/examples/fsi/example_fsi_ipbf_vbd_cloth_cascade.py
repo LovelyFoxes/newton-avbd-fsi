@@ -66,7 +66,7 @@ class Example:
         parser.add_argument(
             "--coupling-iterations",
             type=int,
-            default=3,
+            default=4,
             help="Number of outer fluid-solid feedback passes used in interlinked mode.",
         )
         parser.add_argument(
@@ -173,7 +173,7 @@ class Example:
                 "cloth_self_contact_margin": 0.034,
                 "rest_density": 1000.0,
                 "smoothing_radius": 0.075,
-                "ipbf_iterations": 6,
+                "ipbf_iterations": 4,
                 "vbd_iterations": 8,
                 "sim_substeps": 5,
                 "velocity_damping": 0.997,
@@ -242,8 +242,8 @@ class Example:
                 "cloth_self_contact_margin": 0.020,
                 "rest_density": 1000.0,
                 "smoothing_radius": 0.040,
-                "ipbf_iterations": 6,
-                "vbd_iterations": 6,
+                "ipbf_iterations": 4,
+                "vbd_iterations": 8,
                 "sim_substeps": 5,
                 "velocity_damping": 0.999,
                 "viscosity_coefficient": 0.0025,
