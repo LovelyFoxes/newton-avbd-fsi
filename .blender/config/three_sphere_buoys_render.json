@@ -1,0 +1,36 @@
+{
+  "name": "fsi_three_sphere_buoys",
+  "axis_conversion": "newton-y-up-to-blender-z-up",
+  "resolution": [1920, 1080],
+  "fps": 30,
+  "frame_count": 30,
+  "camera": {
+    "location": [0.0, -1.85, 0.78],
+    "target": [0.0, 0.0, 0.40],
+    "focal_length_mm": 50.0
+  },
+  "tank": {
+    "half_width": 0.52,
+    "half_depth": 0.39,
+    "half_height": 0.92,
+    "wall_thickness": 0.035
+  },
+  "water": {
+    "preview_radius_scale": 0.55,
+    "max_preview_particles": 2500,
+    "material_color": [0.22, 0.58, 1.0, 0.32]
+  },
+  "buoys": {
+    "default_radius": 0.07,
+    "density_colors": [
+      [1.0, 0.62, 0.12, 1.0],
+      [0.28, 0.82, 0.20, 1.0],
+      [0.06, 0.88, 0.86, 1.0]
+    ]
+  },
+  "render": {
+    "engine": "CYCLES",
+    "samples": 96,
+    "transparent_background": false
+  }
+}

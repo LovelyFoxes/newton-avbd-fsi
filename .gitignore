@@ -75,6 +75,9 @@ docs/_static/viser/
 # Notebook checkpoints
 **/*.ipynb_checkpoints/
 /.analysis
-/.blender
+/.blender/cache
+/.blender/templates
 /.notes
 /.warp-cache
+/.blender/renders
+/.blender/usd

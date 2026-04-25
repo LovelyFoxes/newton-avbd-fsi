@@ -1,0 +1,55 @@
+{
+  "name": "fluid_quasi2d_box_float_panel",
+  "scene": "box_compare",
+  "box_case": "float",
+  "cache_dir": ".blender/cache/fluid_quasi2d_box_float_panel",
+  "render_dir": ".blender/renders/fluid_quasi2d_box_float_panel",
+  "blend_file": ".blender/templates/fluid_quasi2d_box_float_panel.blend",
+  "record_frames": 180,
+  "record_initial_frame": true,
+  "box_clamp": true,
+  "coupling_mode": "interlinked",
+  "coupling_iterations": 3,
+  "render": {
+    "resolution": [3200, 1000],
+    "fps": 60,
+    "samples": 24
+  },
+  "layout": {
+    "case_gap": 0.20,
+    "label_offset": 0.15,
+    "label_size": 0.060,
+    "colorbar_offset": 0.17,
+    "camera_y": 2.20
+  },
+  "cases": [
+    {
+      "key": "pbf_it8_steps4",
+      "label": "PBF\nit 8 steps 4",
+      "fluid_solver": "pbf",
+      "iterations": 8,
+      "sim_substeps": 4
+    },
+    {
+      "key": "pbf_it8_steps8",
+      "label": "PBF\nit 8 steps 8",
+      "fluid_solver": "pbf",
+      "iterations": 8,
+      "sim_substeps": 8
+    },
+    {
+      "key": "ipbf_it8_steps4",
+      "label": "IPBF\nit 8 steps 4",
+      "fluid_solver": "ipbf",
+      "iterations": 8,
+      "sim_substeps": 4
+    },
+    {
+      "key": "ipbf_it8_steps8",
+      "label": "IPBF\nit 8 steps 8",
+      "fluid_solver": "ipbf",
+      "iterations": 8,
+      "sim_substeps": 8
+    }
+  ]
+}
