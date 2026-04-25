@@ -71,9 +71,9 @@ class Example:
             config = {
                 "container_half_width": 0.14,
                 "container_half_depth": 0.040,
-                "wall_half_height": 0.42,
-                "pool_dim_x": 16,
-                "pool_dim_y": 32,
+                "wall_half_height": 0.34,
+                "pool_dim_x": 14,
+                "pool_dim_y": 20,
                 "pool_dim_z": 4,
                 "cell": 0.020,
                 "mass": 0.008,
@@ -96,12 +96,12 @@ class Example:
             return apply_shared_fluid_tuning_overrides(self.args, config)
 
         config = {
-            "container_half_width": 0.16,
-            "container_half_depth": 0.040,
-            "wall_half_height": 0.74,
-            "pool_dim_x": 24,
-            "pool_dim_y": 72,
-            "pool_dim_z": 4,
+            "container_half_width": 0.15,
+            "container_half_depth": 0.036,
+            "wall_half_height": 0.50,
+            "pool_dim_x": 25,
+            "pool_dim_y": 82,
+            "pool_dim_z": 6,
             "cell": 0.012,
             "mass": 0.001728,
             "radius": 0.0052,
@@ -180,7 +180,7 @@ class Example:
         )
         self.particle_radii = wp.full(
             self.model.particle_count,
-            value=float(scene["radius"]) * 0.78,
+            value=max(float(scene["radius"]) * 0.90, float(scene["cell"]) * 0.47),
             dtype=wp.float32,
             device=self.model.device,
         )
