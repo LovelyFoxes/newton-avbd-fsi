@@ -91,6 +91,49 @@ def shared_shape_contact_settings(*, particle_radius: float) -> dict[str, float]
     }
 
 
+@wp.func
+def _lerp_color(a: wp.vec3, b: wp.vec3, t: float) -> wp.vec3:
+    return (1.0 - t) * a + t * b
+
+
+@wp.func
+def density_ratio_to_comparison_color(ratio: float) -> wp.vec3:
+    """Map density ratio to a paper-style blue-green-yellow-red colormap."""
+    r = wp.clamp(ratio, 0.70, 1.30)
+
+    c0 = wp.vec3(0.02, 0.02, 0.55)
+    c1 = wp.vec3(0.06, 0.20, 1.00)
+    c2 = wp.vec3(0.00, 0.72, 1.00)
+    c3 = wp.vec3(0.00, 0.95, 0.20)
+    c4 = wp.vec3(0.95, 0.95, 0.05)
+    c5 = wp.vec3(1.00, 0.55, 0.05)
+    c6 = wp.vec3(0.95, 0.05, 0.05)
+
+    if r <= 1.00:
+        return _lerp_color(c0, c1, (r - 0.70) / 0.30)
+    if r <= 1.05:
+        return _lerp_color(c1, c2, (r - 1.00) / 0.05)
+    if r <= 1.10:
+        return _lerp_color(c2, c3, (r - 1.05) / 0.05)
+    if r <= 1.15:
+        return _lerp_color(c3, c4, (r - 1.10) / 0.05)
+    if r <= 1.20:
+        return _lerp_color(c4, c5, (r - 1.15) / 0.05)
+    return _lerp_color(c5, c6, (r - 1.20) / 0.10)
+
+
+@wp.kernel
+def color_particles_from_density_comparison(
+    density: wp.array(dtype=wp.float32),
+    rest_density: float,
+    colors: wp.array(dtype=wp.vec3),
+):
+    """Color particles using a density-ratio comparison colormap."""
+    tid = wp.tid()
+    ratio = density[tid] / max(rest_density, 1.0e-8)
+    colors[tid] = density_ratio_to_comparison_color(ratio)
+
+
 @wp.kernel
 def clamp_particles_to_box(
     particle_q: wp.array(dtype=wp.vec3),
