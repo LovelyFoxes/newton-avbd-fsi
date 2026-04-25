@@ -59,6 +59,12 @@ class Example:
         add_fluid_solver_argument(parser)
         add_shared_fluid_tuning_arguments(parser)
         parser.add_argument(
+            "--iterations",
+            type=int,
+            default=None,
+            help="Override both fluid and rigid iterations for comparison rendering.",
+        )
+        parser.add_argument(
             "--coupling-mode",
             choices=["interlinked", "loose"],
             default="interlinked",
@@ -67,7 +73,7 @@ class Example:
         parser.add_argument(
             "--coupling-iterations",
             type=int,
-            default=3,
+            default=4,
             help="Number of outer fluid-solid feedback passes used per simulation substep.",
         )
         parser.add_argument(
@@ -117,6 +123,7 @@ class Example:
     def _get_scene_config(self) -> dict[str, object]:
         fluid_iterations_override = getattr(self.args, "fluid_iterations", None)
         sim_substeps_override = getattr(self.args, "sim_substeps", None)
+        iterations_override = getattr(self.args, "iterations", None)
         box_density_override = getattr(self.args, "box_density", None)
         box_case = str(getattr(self.args, "box_case", "float"))
 
@@ -193,6 +200,9 @@ class Example:
                 "lambda_regularization": 5.0e-6,
             }
 
+        if iterations_override is not None:
+            config["fluid_iterations"] = int(iterations_override)
+            config["rigid_iterations"] = int(iterations_override)
         if fluid_iterations_override is not None:
             config["fluid_iterations"] = int(fluid_iterations_override)
         if sim_substeps_override is not None:
@@ -323,6 +333,7 @@ class Example:
         self.max_density_ratio = 0.0
         self.max_density_ratio_rms = 0.0
         self.states_remain_finite = True
+        self.frame_index = 0
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
@@ -532,6 +543,9 @@ class Example:
             self.reset()
         ui.text(f"Fluid solver: {self.fluid_solver_name.upper()}")
         ui.text(f"Box case: {self.box_case}")
+        ui.text(f"Frame: {self.frame_index}")
+        ui.text(f"Iterations: {int(self.config['fluid_iterations'])}/{int(self.config['rigid_iterations'])}")
+        ui.text(f"Substeps: {self.sim_substeps}")
         ui.text(f"Box density: {float(self.config['box_density']):.1f} kg/m^3")
         ui.text(f"Box clamp: {'on' if self.use_box_clamp else 'off'}")
         ui.text(f"Max density ratio: {self.max_density_ratio:.3f}")
@@ -540,6 +554,7 @@ class Example:
 
     def reset(self):
         self.sim_time = 0.0
+        self.frame_index = 0
         self.fluid_solver.reset(self.state_0)
         self.fluid_solver.reset(self.state_1)
         self.solid_solver.reset(self.state_0)
@@ -622,6 +637,7 @@ class Example:
         self.simulate()
         self._update_particle_colors()
         self._record_diagnostics()
+        self.frame_index += 1
 
     def test_final(self):
         assert self.states_remain_finite, "quasi-2D box comparison produced non-finite state"

@@ -59,6 +59,12 @@ class Example:
         add_fluid_solver_argument(parser)
         add_shared_fluid_tuning_arguments(parser)
         parser.add_argument(
+            "--iterations",
+            type=int,
+            default=None,
+            help="Override the number of fluid density iterations for comparison rendering.",
+        )
+        parser.add_argument(
             "--box-clamp",
             action=argparse.BooleanOptionalAction,
             default=True,
@@ -67,6 +73,7 @@ class Example:
         return parser
 
     def _get_scene_config(self) -> dict[str, object]:
+        iterations_override = getattr(self.args, "iterations", None)
         if bool(getattr(self.args, "test", False)):
             config = {
                 "container_half_width": 0.14,
@@ -93,6 +100,8 @@ class Example:
                 "lambda_regularization": 5.0e-6,
                 "use_constraint_clamp": True,
             }
+            if iterations_override is not None:
+                config["iterations"] = int(iterations_override)
             return apply_shared_fluid_tuning_overrides(self.args, config)
 
         config = {
@@ -120,6 +129,8 @@ class Example:
             "lambda_regularization": 5.0e-6,
             "use_constraint_clamp": True,
         }
+        if iterations_override is not None:
+            config["iterations"] = int(iterations_override)
         return apply_shared_fluid_tuning_overrides(self.args, config)
 
     def __init__(self, viewer, args=None):
@@ -198,6 +209,7 @@ class Example:
         self.max_density_ratio = 0.0
         self.max_density_ratio_rms = 0.0
         self.states_remain_finite = True
+        self.frame_index = 0
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
@@ -293,12 +305,16 @@ class Example:
             self.reset()
         ui.text(f"Fluid solver: {self.fluid_solver_name.upper()}")
         ui.text("Scene: quasi-2D density column")
+        ui.text(f"Frame: {self.frame_index}")
+        ui.text(f"Iterations: {int(self.scene['iterations'])}")
+        ui.text(f"Substeps: {self.sim_substeps}")
         ui.text(f"Box clamp: {'on' if self.use_box_clamp else 'off'}")
         ui.text(f"Max density ratio: {self.max_density_ratio:.3f}")
         ui.text(f"Max density RMS: {self.max_density_ratio_rms:.4f}")
 
     def reset(self):
         self.sim_time = 0.0
+        self.frame_index = 0
         self.solver.reset(self.state_0)
         self.solver.reset(self.state_1)
         self.contacts.clear()
@@ -372,6 +388,7 @@ class Example:
         self.simulate()
         self._update_particle_colors()
         self._record_diagnostics()
+        self.frame_index += 1
 
     def test_final(self):
         assert self.states_remain_finite, "quasi-2D density column produced non-finite state"
