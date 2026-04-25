@@ -34,8 +34,12 @@ import newton
 import newton.examples
 from newton.examples.fluid.common import (
     add_fluid_solver_argument,
+    add_shared_fluid_tuning_arguments,
+    apply_shared_fluid_tuning_overrides,
+    clamp_particles_to_box,
     create_fluid_solver,
     register_fluid_solver_attributes,
+    shared_shape_contact_settings,
 )
 from newton.examples.ipbf.common import (
     build_box_wireframe,
@@ -52,11 +56,12 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         add_fluid_solver_argument(parser)
+        add_shared_fluid_tuning_arguments(parser)
         return parser
 
     def _get_scene_config(self) -> dict[str, object]:
         if bool(getattr(self.args, "test", False)):
-            return {
+            config = {
                 "container_half_extent": 0.62,
                 "wall_half_height": 0.62,
                 "center_offset": (0.0, 0.22, 0.0),
@@ -66,8 +71,8 @@ class Example:
                 "mass": 0.11,
                 "radius": 0.018,
                 "smoothing_radius": 0.078,
-                "iterations": 6,
-                "sim_substeps": 6,
+                "iterations": 3,
+                "sim_substeps": 4,
                 "velocity_damping": 0.997,
                 "viscosity": 0.0015,
                 "xsph": 0.003,
@@ -78,8 +83,9 @@ class Example:
                 "lambda_regularization": 1.0e-6,
                 "use_constraint_clamp": True,
             }
+            return apply_shared_fluid_tuning_overrides(self.args, config)
 
-        return {
+        config = {
             "container_half_extent": 0.50,
             "wall_half_height": 0.50,
             "center_offset": (0.0, 0.0, 0.0),
@@ -101,6 +107,7 @@ class Example:
             "lambda_regularization": 1.0e-6,
             "use_constraint_clamp": True,
         }
+        return apply_shared_fluid_tuning_overrides(self.args, config)
 
     def __init__(self, viewer, args=None):
         self.fps = 60
@@ -114,11 +121,12 @@ class Example:
         self._reset_key_prev = False
 
         scene = self._get_scene_config()
+        contact_settings = shared_shape_contact_settings(particle_radius=float(scene["radius"]))
         self.sim_substeps = int(scene["sim_substeps"])
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.container_half_extent = float(scene["container_half_extent"])
         self.wall_half_height = float(scene["wall_half_height"])
-        self.wall_thickness = 0.05
+        self.wall_thickness = float(contact_settings["wall_thickness"])
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
         self.velocity_damping = float(scene["velocity_damping"])
@@ -127,6 +135,8 @@ class Example:
         register_fluid_solver_attributes(builder, self.fluid_solver_name)
 
         builder.default_shape_cfg.mu = 0.0
+        builder.default_shape_cfg.margin = float(contact_settings["shape_margin"])
+        builder.default_shape_cfg.gap = float(contact_settings["shape_gap"])
         self._add_container(builder)
 
         box_center = get_box_center(wall_half_height=self.wall_half_height, floor_y=self.floor_y)
@@ -171,7 +181,7 @@ class Example:
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model,
             args,
-            soft_contact_margin=0.05,
+            soft_contact_margin=float(contact_settings["soft_contact_margin"]),
         )
 
         self.state_0 = self.model.state()
@@ -286,6 +296,20 @@ class Example:
                 device=self.model.device,
             )
             self.solver.step(self.state_0, self.state_1, control=None, contacts=self.contacts, dt=self.sim_dt)
+            wp.launch(
+                clamp_particles_to_box,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.state_1.particle_q,
+                    self.state_1.particle_qd,
+                    self.model.particle_radius,
+                    self.container_half_extent,
+                    self.floor_y,
+                    self.top_y,
+                    self.container_half_extent,
+                ],
+                device=self.model.device,
+            )
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):

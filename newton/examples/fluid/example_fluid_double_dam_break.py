@@ -35,8 +35,12 @@ import newton
 import newton.examples
 from newton.examples.fluid.common import (
     add_fluid_solver_argument,
+    add_shared_fluid_tuning_arguments,
+    apply_shared_fluid_tuning_overrides,
+    clamp_particles_to_box,
     create_fluid_solver,
     register_fluid_solver_attributes,
+    shared_shape_contact_settings,
 )
 from newton.examples.ipbf.common import (
     build_box_wireframe,
@@ -55,6 +59,7 @@ class Example:
     def create_parser():
         parser = newton.examples.create_parser()
         add_fluid_solver_argument(parser)
+        add_shared_fluid_tuning_arguments(parser)
         parser.add_argument(
             "--include-static-boundary-samples",
             action=argparse.BooleanOptionalAction,
@@ -113,7 +118,7 @@ class Example:
 
     def _get_particle_block_config(self) -> dict[str, object]:
         if bool(getattr(self.args, "test", False)):
-            return {
+            config = {
                 "dim_x": 6,
                 "dim_y": 14,
                 "dim_z": 6,
@@ -124,8 +129,8 @@ class Example:
                 "column_center_offset_x": None,
                 "column_wall_gap_x": 0.04,
                 "bottom_clearance_y": 0.035,
-                "iterations": 6,
-                "sim_substeps": 6,
+                "iterations": 4,
+                "sim_substeps": 4,
                 "velocity_damping": 0.997,
                 "viscosity_coefficient": 0.002,
                 "viscosity_boundary_coefficient": 0.0,
@@ -141,8 +146,9 @@ class Example:
                 "lambda_regularization": 1.0e-6,
                 "use_constraint_clamp": True,
             }
+            return apply_shared_fluid_tuning_overrides(self.args, config)
 
-        return {
+        config = {
             "dim_x": 28,
             "dim_y": 84,
             "dim_z": 12,
@@ -170,6 +176,7 @@ class Example:
             "lambda_regularization": 1.0e-6,
             "use_constraint_clamp": True,
         }
+        return apply_shared_fluid_tuning_overrides(self.args, config)
 
     def _get_arg_or_scene_value(self, name: str, scene: dict[str, object]) -> object:
         value = getattr(self.args, name, None)
@@ -188,13 +195,14 @@ class Example:
         self.fluid_solver_name = str(getattr(self.args, "fluid_solver", "ipbf"))
         self._reset_key_prev = False
 
+        particle_block = self._get_particle_block_config()
+        contact_settings = shared_shape_contact_settings(particle_radius=float(particle_block["radius_mean"]))
         self.container_half_width = 1.08
         self.container_half_depth = 0.2
-        self.wall_thickness = 0.05
+        self.wall_thickness = float(contact_settings["wall_thickness"])
         self.wall_half_height = 0.95
         self.floor_y = 0.0
         self.top_y = 2.0 * self.wall_half_height
-        particle_block = self._get_particle_block_config()
         self.sim_substeps = int(particle_block["sim_substeps"])
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.velocity_damping = float(self._get_arg_or_scene_value("velocity_damping", particle_block))
@@ -203,6 +211,8 @@ class Example:
         register_fluid_solver_attributes(builder, self.fluid_solver_name)
 
         builder.default_shape_cfg.mu = 0.0
+        builder.default_shape_cfg.margin = float(contact_settings["shape_margin"])
+        builder.default_shape_cfg.gap = float(contact_settings["shape_gap"])
         self._add_container(builder)
 
         _, half_span_y, _ = get_particle_grid_half_span(
@@ -298,7 +308,7 @@ class Example:
         self.collision_pipeline = newton.examples.create_collision_pipeline(
             self.model,
             args,
-            soft_contact_margin=0.05,
+            soft_contact_margin=float(contact_settings["soft_contact_margin"]),
         )
 
         self.state_0 = self.model.state()
@@ -336,7 +346,7 @@ class Example:
         self.capture()
 
     def _add_container(self, builder: newton.ModelBuilder) -> None:
-        wall_t = self.wall_thickness
+        wall_t = max(self.wall_thickness, 0.0)
         hx = self.container_half_width
         hz = self.container_half_depth
         hy = self.wall_half_height
@@ -412,6 +422,20 @@ class Example:
                 device=self.model.device,
             )
             self.solver.step(self.state_0, self.state_1, control=None, contacts=self.contacts, dt=self.sim_dt)
+            wp.launch(
+                clamp_particles_to_box,
+                dim=self.model.particle_count,
+                inputs=[
+                    self.state_1.particle_q,
+                    self.state_1.particle_qd,
+                    self.model.particle_radius,
+                    self.container_half_width,
+                    self.floor_y,
+                    self.top_y,
+                    self.container_half_depth,
+                ],
+                device=self.model.device,
+            )
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
