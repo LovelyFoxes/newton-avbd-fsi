@@ -25,6 +25,10 @@ import newton
 from newton.solvers import FSIBoundaryModel, SolverIPBF, SolverPBF
 
 
+DENSITY_COLOR_MIN_RATIO = 0.90
+DENSITY_COLOR_MAX_RATIO = 1.30
+
+
 def add_fluid_solver_argument(parser: ArgumentParser) -> ArgumentParser:
     """Add the shared ``--fluid-solver`` selector to a parser."""
     parser.add_argument(
@@ -98,28 +102,27 @@ def _lerp_color(a: wp.vec3, b: wp.vec3, t: float) -> wp.vec3:
 
 @wp.func
 def density_ratio_to_comparison_color(ratio: float) -> wp.vec3:
-    """Map density ratio to a paper-style blue-green-yellow-red colormap."""
-    r = wp.clamp(ratio, 0.70, 1.30)
+    """Map density ratio to a clipped paper-style blue-green-yellow-red colormap."""
+    r = wp.clamp(ratio, DENSITY_COLOR_MIN_RATIO, DENSITY_COLOR_MAX_RATIO)
 
-    c0 = wp.vec3(0.02, 0.02, 0.55)
-    c1 = wp.vec3(0.06, 0.20, 1.00)
-    c2 = wp.vec3(0.00, 0.72, 1.00)
-    c3 = wp.vec3(0.00, 0.95, 0.20)
-    c4 = wp.vec3(0.95, 0.95, 0.05)
-    c5 = wp.vec3(1.00, 0.55, 0.05)
-    c6 = wp.vec3(0.95, 0.05, 0.05)
+    c_blue = wp.vec3(0.06, 0.20, 1.00)
+    c_cyan = wp.vec3(0.00, 0.72, 1.00)
+    c_green = wp.vec3(0.00, 0.95, 0.20)
+    c_yellow = wp.vec3(0.95, 0.95, 0.05)
+    c_orange = wp.vec3(1.00, 0.55, 0.05)
+    c_red = wp.vec3(0.95, 0.05, 0.05)
 
     if r <= 1.00:
-        return _lerp_color(c0, c1, (r - 0.70) / 0.30)
+        return c_blue
     if r <= 1.05:
-        return _lerp_color(c1, c2, (r - 1.00) / 0.05)
+        return _lerp_color(c_blue, c_cyan, (r - 1.00) / 0.05)
     if r <= 1.10:
-        return _lerp_color(c2, c3, (r - 1.05) / 0.05)
+        return _lerp_color(c_cyan, c_green, (r - 1.05) / 0.05)
     if r <= 1.15:
-        return _lerp_color(c3, c4, (r - 1.10) / 0.05)
+        return _lerp_color(c_green, c_yellow, (r - 1.10) / 0.05)
     if r <= 1.20:
-        return _lerp_color(c4, c5, (r - 1.15) / 0.05)
-    return _lerp_color(c5, c6, (r - 1.20) / 0.10)
+        return _lerp_color(c_yellow, c_orange, (r - 1.15) / 0.05)
+    return c_red
 
 
 @wp.kernel

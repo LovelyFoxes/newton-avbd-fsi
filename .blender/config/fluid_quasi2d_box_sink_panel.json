@@ -11,7 +11,7 @@
   "coupling_mode": "interlinked",
   "coupling_iterations": 3,
   "render": {
-    "resolution": [3200, 1000],
+    "resolution": [1920, 1080],
     "fps": 60,
     "samples": 24
   },
@@ -20,7 +20,10 @@
     "label_offset": 0.15,
     "label_size": 0.060,
     "colorbar_offset": 0.17,
-    "camera_y": 2.20
+    "camera_y": 2.20,
+    "ortho_scale": 3.0,
+    "colorbar_min_ratio": 0.85,
+    "colorbar_max_ratio": 1.30
   },
   "cases": [
     {

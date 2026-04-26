@@ -4,7 +4,10 @@ import argparse
 import gc
 import importlib
 import json
+import os
+import subprocess
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -27,6 +30,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=None, help="Optional override for cache root directory.")
     parser.add_argument("--device", type=str, default=None, help="Warp device, for example cuda:0.")
     parser.add_argument("--record-frames", type=int, default=None, help="Optional override for recorded frame count.")
+    parser.add_argument("--case-key", type=str, default=None, help="Export only one case key from the panel config.")
+    parser.add_argument(
+        "--isolate-cases",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Export each case in a fresh Python process for better Warp stability.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite the output root if it already exists.")
     return parser.parse_args()
 
@@ -107,6 +117,8 @@ def instantiate_example(
         wp.set_device(args.device)
     viewer = newton.viewer.ViewerNull(num_frames=max(record_frames, 1))
     example = module.Example(viewer, args)
+    if hasattr(example, "enable_diagnostics"):
+        example.enable_diagnostics = False
     return example
 
 
@@ -202,6 +214,7 @@ def export_case(
     record_initial_frame: bool,
     device: str | None,
 ) -> dict[str, Any]:
+    print(f"[Fluid Compare] Export case: {case_config['key']}")
     example = instantiate_example(
         panel_config=panel_config,
         case_config=case_config,
@@ -217,13 +230,18 @@ def export_case(
         record_index += 1
 
     while record_index < record_frames:
-        wp.synchronize_device(example.model.device)
-        start = time.perf_counter()
-        example.step()
-        wp.synchronize_device(example.model.device)
-        sim_ms.append((time.perf_counter() - start) * 1000.0)
-        write_frame_payload(case_dir, record_index=record_index, payload=capture_payload(example, record_index=record_index))
-        record_index += 1
+        try:
+            wp.synchronize_device(example.model.device)
+            start = time.perf_counter()
+            example.step()
+            wp.synchronize_device(example.model.device)
+            sim_ms.append((time.perf_counter() - start) * 1000.0)
+            write_frame_payload(case_dir, record_index=record_index, payload=capture_payload(example, record_index=record_index))
+            record_index += 1
+        except Exception as exc:
+            raise RuntimeError(
+                f"Case '{case_config['key']}' failed while exporting record frame {record_index}."
+            ) from exc
 
     metadata = build_case_metadata(
         example=example,
@@ -241,6 +259,74 @@ def export_case(
     return metadata
 
 
+def build_export_subprocess_command(
+    *,
+    args: argparse.Namespace,
+    output_root: Path,
+    case_key: str,
+    record_frames: int,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--config",
+        str(args.config.resolve()),
+        "--output-root",
+        str(output_root),
+        "--record-frames",
+        str(record_frames),
+        "--case-key",
+        case_key,
+        "--no-isolate-cases",
+    ]
+    if args.device:
+        command.extend(["--device", args.device])
+    return command
+
+
+def export_cases_in_subprocesses(
+    *,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    output_root: Path,
+    record_frames: int,
+) -> dict[str, Any]:
+    panel_metadata: dict[str, Any] = {
+        "name": str(config["name"]),
+        "scene": str(config["scene"]),
+        "record_frames": record_frames,
+        "record_initial_frame": bool(config.get("record_initial_frame", True)),
+        "cases": [],
+        "axis_conversion": "newton-y-up-to-blender-z-up",
+        "config_path": str(args.config.resolve()),
+    }
+
+    for case_config in config["cases"]:
+        case_key = str(case_config["key"])
+        command = build_export_subprocess_command(
+            args=args,
+            output_root=output_root,
+            case_key=case_key,
+            record_frames=record_frames,
+        )
+        child_env = os.environ.copy()
+        print(f"[Fluid Compare] Spawn case process: {case_key}")
+        subprocess.run(command, check=True, env=child_env)
+        metadata = load_json(output_root / case_key / "metadata.json")
+        panel_metadata["cases"].append(
+            {
+                "key": case_key,
+                "label": str(case_config["label"]),
+                "path": str((output_root / case_key).resolve()),
+                "fluid_solver": metadata["fluid_solver"],
+                "iterations": metadata["iterations"],
+                "sim_substeps": metadata["sim_substeps"],
+            }
+        )
+
+    return panel_metadata
+
+
 def main() -> None:
     args = parse_args()
     wp.config.use_precompiled_headers = False
@@ -248,7 +334,28 @@ def main() -> None:
     record_frames = int(args.record_frames or config.get("record_frames", 180))
     record_initial_frame = bool(config.get("record_initial_frame", True))
     output_root = resolve_output_root(args, config)
-    prepare_output_root(output_root, args.overwrite)
+    if args.case_key is None:
+        prepare_output_root(output_root, args.overwrite)
+    elif not output_root.exists():
+        output_root.mkdir(parents=True, exist_ok=True)
+
+    if args.case_key is None and args.isolate_cases and len(config["cases"]) > 1:
+        panel_metadata = export_cases_in_subprocesses(
+            args=args,
+            config=config,
+            output_root=output_root,
+            record_frames=record_frames,
+        )
+        save_json(output_root / "panel_metadata.json", panel_metadata)
+        return
+
+    if args.case_key is not None:
+        matching_cases = [case for case in config["cases"] if str(case["key"]) == args.case_key]
+        if not matching_cases:
+            raise KeyError(f"Case key not found in config: {args.case_key}")
+        cases_to_export = matching_cases
+    else:
+        cases_to_export = list(config["cases"])
 
     panel_metadata: dict[str, Any] = {
         "name": str(config["name"]),
@@ -260,7 +367,7 @@ def main() -> None:
         "config_path": str(args.config.resolve()),
     }
 
-    for case_config in config["cases"]:
+    for case_config in cases_to_export:
         case_key = str(case_config["key"])
         case_dir = output_root / case_key
         case_dir.mkdir(parents=True, exist_ok=True)

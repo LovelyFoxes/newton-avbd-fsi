@@ -125,7 +125,7 @@ class Example:
             "rest_density": 1000.0,
             "compliance": 0.0,
             "ipbf_relaxation": 0.5,
-            "pbf_relaxation": 0.8,
+            "pbf_relaxation": 0.5,
             "lambda_regularization": 5.0e-6,
             "use_constraint_clamp": True,
         }
@@ -210,6 +210,7 @@ class Example:
         self.max_density_ratio_rms = 0.0
         self.states_remain_finite = True
         self.frame_index = 0
+        self.enable_diagnostics = True
 
         self.viewer.set_model(self.model)
         self.viewer.show_particles = True
@@ -387,7 +388,8 @@ class Example:
     def step(self):
         self.simulate()
         self._update_particle_colors()
-        self._record_diagnostics()
+        if self.enable_diagnostics:
+            self._record_diagnostics()
         self.frame_index += 1
 
     def test_final(self):

@@ -16,6 +16,12 @@ if str(SCRIPT_DIR) not in sys.path:
 import render_fsi_cache as cache_preview
 
 
+COLORBAR_MIN_RATIO = 0.90
+COLORBAR_MAX_RATIO = 1.30
+COLORBAR_RHO0_RATIO = 1.00
+COLORBAR_RHO12_RATIO = 1.20
+
+
 def parse_args() -> argparse.Namespace:
     argv = sys.argv
     if "--" in argv:
@@ -62,7 +68,22 @@ def configure_scene(config: dict, frame_count: int, output_dir: Path) -> None:
     scene.render.engine = "CYCLES"
     scene.cycles.samples = int(render_cfg.get("samples", 32))
     scene.cycles.use_denoising = True
+    scene.cycles.device = "GPU"
     scene.render.fps = int(render_cfg.get("fps", 60))
+
+    cycles_addon = bpy.context.preferences.addons.get("cycles")
+    if cycles_addon is not None:
+        cycles_prefs = cycles_addon.preferences
+        for compute_type in ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL"):
+            try:
+                cycles_prefs.compute_device_type = compute_type
+                cycles_prefs.get_devices()
+                if any(getattr(device, "type", "") != "CPU" for device in cycles_prefs.devices):
+                    for device in cycles_prefs.devices:
+                        device.use = getattr(device, "type", "") != "CPU"
+                    break
+            except Exception:
+                continue
 
     world = scene.world
     if world is None:
@@ -115,47 +136,58 @@ def make_particle_material(name: str):
 
 
 def density_ratio_to_color(ratio: float) -> tuple[float, float, float]:
-    r = min(max(ratio, 0.70), 1.30)
-    c0 = np.array([0.02, 0.02, 0.55], dtype=np.float32)
-    c1 = np.array([0.06, 0.20, 1.00], dtype=np.float32)
-    c2 = np.array([0.00, 0.72, 1.00], dtype=np.float32)
-    c3 = np.array([0.00, 0.95, 0.20], dtype=np.float32)
-    c4 = np.array([0.95, 0.95, 0.05], dtype=np.float32)
-    c5 = np.array([1.00, 0.55, 0.05], dtype=np.float32)
-    c6 = np.array([0.95, 0.05, 0.05], dtype=np.float32)
+    r = min(max(ratio, COLORBAR_MIN_RATIO), COLORBAR_MAX_RATIO)
+    c_blue = np.array([0.06, 0.20, 1.00], dtype=np.float32)
+    c_cyan = np.array([0.00, 0.72, 1.00], dtype=np.float32)
+    c_green = np.array([0.00, 0.95, 0.20], dtype=np.float32)
+    c_yellow = np.array([0.95, 0.95, 0.05], dtype=np.float32)
+    c_orange = np.array([1.00, 0.55, 0.05], dtype=np.float32)
+    c_red = np.array([0.95, 0.05, 0.05], dtype=np.float32)
 
     if r <= 1.00:
-        t = (r - 0.70) / 0.30
-        color = (1.0 - t) * c0 + t * c1
+        color = c_blue
     elif r <= 1.05:
         t = (r - 1.00) / 0.05
-        color = (1.0 - t) * c1 + t * c2
+        color = (1.0 - t) * c_blue + t * c_cyan
     elif r <= 1.10:
         t = (r - 1.05) / 0.05
-        color = (1.0 - t) * c2 + t * c3
+        color = (1.0 - t) * c_cyan + t * c_green
     elif r <= 1.15:
         t = (r - 1.10) / 0.05
-        color = (1.0 - t) * c3 + t * c4
+        color = (1.0 - t) * c_green + t * c_yellow
     elif r <= 1.20:
         t = (r - 1.15) / 0.05
-        color = (1.0 - t) * c4 + t * c5
+        color = (1.0 - t) * c_yellow + t * c_orange
     else:
-        t = (r - 1.20) / 0.10
-        color = (1.0 - t) * c5 + t * c6
+        color = c_red
     return (float(color[0]), float(color[1]), float(color[2]))
 
 
-def create_colorbar_image(name: str, width: int = 1024, height: int = 32) -> bpy.types.Image:
+def create_colorbar_image(
+    name: str,
+    width: int = 1024,
+    height: int = 32,
+    *,
+    min_ratio: float = COLORBAR_MIN_RATIO,
+    max_ratio: float = COLORBAR_MAX_RATIO,
+) -> bpy.types.Image:
+    existing = bpy.data.images.get(name)
+    if existing is not None:
+        bpy.data.images.remove(existing)
     image = bpy.data.images.new(name, width=width, height=height, alpha=True, float_buffer=True)
+    image.colorspace_settings.name = "sRGB"
     pixels = np.zeros((height, width, 4), dtype=np.float32)
     for x in range(width):
-        ratio = 0.70 + (1.30 - 0.70) * (float(x) / float(max(1, width - 1)))
+        ratio = min_ratio + (max_ratio - min_ratio) * (float(x) / float(max(1, width - 1)))
         color = density_ratio_to_color(ratio)
         pixels[:, x, 0] = color[0]
         pixels[:, x, 1] = color[1]
         pixels[:, x, 2] = color[2]
         pixels[:, x, 3] = 1.0
     image.pixels.foreach_set(pixels.reshape(-1))
+    image.update()
+    image.pack()
+    image.use_fake_user = True
     return image
 
 
@@ -286,7 +318,14 @@ def add_colorbar(
     center_z: float,
     material: bpy.types.Material,
     text_material: bpy.types.Material,
+    tick_material: bpy.types.Material,
+    min_ratio: float = COLORBAR_MIN_RATIO,
+    max_ratio: float = COLORBAR_MAX_RATIO,
 ) -> None:
+    def ratio_to_x(ratio: float) -> float:
+        t = (ratio - min_ratio) / max(max_ratio - min_ratio, 1.0e-8)
+        return (t - 0.5) * total_width
+
     bpy.ops.mesh.primitive_plane_add(location=(0.0, 0.0, center_z), rotation=(np.pi / 2.0, 0.0, 0.0))
     obj = bpy.context.object
     obj.name = "Density_Colorbar"
@@ -295,17 +334,29 @@ def add_colorbar(
     obj.data.materials.append(material)
     disable_shadows(obj)
 
+    for name, ratio in (("Colorbar_Rho0_Tick", COLORBAR_RHO0_RATIO), ("Colorbar_Rho12_Tick", COLORBAR_RHO12_RATIO)):
+        bpy.ops.mesh.primitive_plane_add(
+            location=(ratio_to_x(ratio), -0.001, center_z),
+            rotation=(np.pi / 2.0, 0.0, 0.0),
+        )
+        tick = bpy.context.object
+        tick.name = name
+        tick.scale = (0.003, 1.0, 0.060)
+        bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        tick.data.materials.append(tick_material)
+        disable_shadows(tick)
+
     add_text_label(
         name="Colorbar_Rho0",
-        text="rho0",
-        location=(-0.18 * total_width, 0.0, center_z - 0.075),
+        text="ρ0",
+        location=(ratio_to_x(COLORBAR_RHO0_RATIO), 0.0, center_z - 0.075),
         size=0.070,
         material=text_material,
     )
     add_text_label(
         name="Colorbar_Rho12",
-        text="1.2 rho0",
-        location=(0.18 * total_width, 0.0, center_z - 0.075),
+        text="1.2ρ0",
+        location=(ratio_to_x(COLORBAR_RHO12_RATIO), 0.0, center_z - 0.075),
         size=0.070,
         material=text_material,
     )
@@ -489,16 +540,19 @@ def main() -> None:
     cache_preview.clear_scene()
     configure_scene(config, frame_count, output_dir)
 
+    layout = config.get("layout", {})
+    min_ratio = float(layout.get("colorbar_min_ratio", COLORBAR_MIN_RATIO))
+    max_ratio = float(layout.get("colorbar_max_ratio", COLORBAR_MAX_RATIO))
     materials = {
         "particles": make_particle_material("FluidCompareParticles"),
         "outline": make_emission_material("FluidCompareOutline", (0.05, 0.20, 0.95, 1.0), strength=1.4),
         "text": make_emission_material("FluidCompareText", (1.0, 1.0, 1.0, 1.0), strength=1.2),
+        "tick": make_emission_material("FluidCompareTick", (0.0, 0.0, 0.0, 1.0), strength=1.0),
         "box": make_emission_material("FluidCompareBox", (0.90, 0.90, 0.90, 1.0), strength=0.9),
     }
-    colorbar_image = create_colorbar_image("FluidCompareColorbar")
+    colorbar_image = create_colorbar_image("FluidCompareColorbar", min_ratio=min_ratio, max_ratio=max_ratio)
     materials["colorbar"] = make_colorbar_material("FluidCompareColorbarMaterial", colorbar_image)
 
-    layout = config.get("layout", {})
     x_positions = [
         (index - 0.5 * float(case_count - 1)) * (case_width + case_gap) for index in range(case_count)
     ]
@@ -510,6 +564,9 @@ def main() -> None:
         center_z=float(max_top) + float(layout.get("colorbar_offset", 0.16)),
         material=materials["colorbar"],
         text_material=materials["text"],
+        tick_material=materials["tick"],
+        min_ratio=min_ratio,
+        max_ratio=max_ratio,
     )
 
     axis_mode = str(panel_meta.get("axis_conversion", "newton-y-up-to-blender-z-up"))
