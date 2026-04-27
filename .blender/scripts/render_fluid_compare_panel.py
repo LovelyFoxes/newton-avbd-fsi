@@ -85,6 +85,21 @@ def configure_scene(config: dict, frame_count: int, output_dir: Path) -> None:
             except Exception:
                 continue
 
+    try:
+        scene.display_settings.display_device = "sRGB"
+    except Exception:
+        pass
+    try:
+        scene.view_settings.view_transform = "Standard"
+    except Exception:
+        pass
+    try:
+        scene.view_settings.look = "None"
+    except Exception:
+        pass
+    scene.view_settings.exposure = float(render_cfg.get("exposure", 0.20))
+    scene.view_settings.gamma = float(render_cfg.get("gamma", 1.0))
+
     world = scene.world
     if world is None:
         world = bpy.data.worlds.new("World")
@@ -129,7 +144,7 @@ def make_particle_material(name: str):
     attribute.attribute_name = "density_color"
     emission = nodes.new("ShaderNodeEmission")
     output = nodes.new("ShaderNodeOutputMaterial")
-    emission.inputs["Strength"].default_value = 1.0
+    emission.inputs["Strength"].default_value = 1.35
     links.new(attribute.outputs["Color"], emission.inputs["Color"])
     links.new(emission.outputs["Emission"], output.inputs["Surface"])
     return material
@@ -137,12 +152,11 @@ def make_particle_material(name: str):
 
 def density_ratio_to_color(ratio: float) -> tuple[float, float, float]:
     r = min(max(ratio, COLORBAR_MIN_RATIO), COLORBAR_MAX_RATIO)
-    c_blue = np.array([0.06, 0.20, 1.00], dtype=np.float32)
-    c_cyan = np.array([0.00, 0.72, 1.00], dtype=np.float32)
-    c_green = np.array([0.00, 0.95, 0.20], dtype=np.float32)
-    c_yellow = np.array([0.95, 0.95, 0.05], dtype=np.float32)
-    c_orange = np.array([1.00, 0.55, 0.05], dtype=np.float32)
-    c_red = np.array([0.95, 0.05, 0.05], dtype=np.float32)
+    c_blue = np.array([0.00, 0.12, 1.00], dtype=np.float32)
+    c_cyan = np.array([0.00, 0.88, 1.00], dtype=np.float32)
+    c_green = np.array([0.00, 0.98, 0.10], dtype=np.float32)
+    c_yellow = np.array([1.00, 0.96, 0.02], dtype=np.float32)
+    c_red = np.array([1.00, 0.08, 0.04], dtype=np.float32)
 
     if r <= 1.00:
         color = c_blue
@@ -157,7 +171,7 @@ def density_ratio_to_color(ratio: float) -> tuple[float, float, float]:
         color = (1.0 - t) * c_green + t * c_yellow
     elif r <= 1.20:
         t = (r - 1.15) / 0.05
-        color = (1.0 - t) * c_yellow + t * c_orange
+        color = (1.0 - t) * c_yellow + t * c_red
     else:
         color = c_red
     return (float(color[0]), float(color[1]), float(color[2]))
@@ -202,7 +216,7 @@ def make_colorbar_material(name: str, image: bpy.types.Image):
     tex.image = image
     emission = nodes.new("ShaderNodeEmission")
     output = nodes.new("ShaderNodeOutputMaterial")
-    emission.inputs["Strength"].default_value = 1.0
+    emission.inputs["Strength"].default_value = 1.35
     links.new(tex.outputs["Color"], emission.inputs["Color"])
     links.new(emission.outputs["Emission"], output.inputs["Surface"])
     return material
@@ -329,7 +343,7 @@ def add_colorbar(
     bpy.ops.mesh.primitive_plane_add(location=(0.0, 0.0, center_z), rotation=(np.pi / 2.0, 0.0, 0.0))
     obj = bpy.context.object
     obj.name = "Density_Colorbar"
-    obj.scale = (0.5 * total_width, 1.0, 0.04)
+    obj.scale = (0.5 * total_width, 0.03, 0.04)
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     obj.data.materials.append(material)
     disable_shadows(obj)
@@ -341,21 +355,21 @@ def add_colorbar(
         )
         tick = bpy.context.object
         tick.name = name
-        tick.scale = (0.003, 1.0, 0.060)
+        tick.scale = (0.003, 0.03, 0.060)
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
         tick.data.materials.append(tick_material)
         disable_shadows(tick)
 
     add_text_label(
         name="Colorbar_Rho0",
-        text="ρ0",
+        text="\u03c10",
         location=(ratio_to_x(COLORBAR_RHO0_RATIO), 0.0, center_z - 0.075),
         size=0.070,
         material=text_material,
     )
     add_text_label(
         name="Colorbar_Rho12",
-        text="1.2ρ0",
+        text="1.2\u03c10",
         location=(ratio_to_x(COLORBAR_RHO12_RATIO), 0.0, center_z - 0.075),
         size=0.070,
         material=text_material,
@@ -545,10 +559,10 @@ def main() -> None:
     max_ratio = float(layout.get("colorbar_max_ratio", COLORBAR_MAX_RATIO))
     materials = {
         "particles": make_particle_material("FluidCompareParticles"),
-        "outline": make_emission_material("FluidCompareOutline", (0.05, 0.20, 0.95, 1.0), strength=1.4),
-        "text": make_emission_material("FluidCompareText", (1.0, 1.0, 1.0, 1.0), strength=1.2),
+        "outline": make_emission_material("FluidCompareOutline", (0.05, 0.20, 0.95, 1.0), strength=1.6),
+        "text": make_emission_material("FluidCompareText", (1.0, 1.0, 1.0, 1.0), strength=1.4),
         "tick": make_emission_material("FluidCompareTick", (0.0, 0.0, 0.0, 1.0), strength=1.0),
-        "box": make_emission_material("FluidCompareBox", (0.90, 0.90, 0.90, 1.0), strength=0.9),
+        "box": make_emission_material("FluidCompareBox", (0.90, 0.90, 0.90, 1.0), strength=1.0),
     }
     colorbar_image = create_colorbar_image("FluidCompareColorbar", min_ratio=min_ratio, max_ratio=max_ratio)
     materials["colorbar"] = make_colorbar_material("FluidCompareColorbarMaterial", colorbar_image)

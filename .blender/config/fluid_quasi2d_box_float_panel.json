@@ -22,7 +22,7 @@
     "colorbar_offset": 0.17,
     "camera_y": 2.20,
     "ortho_scale": 3.0,
-    "colorbar_min_ratio": 0.85,
+    "colorbar_min_ratio": 0.90,
     "colorbar_max_ratio": 1.30
   },
   "cases": [

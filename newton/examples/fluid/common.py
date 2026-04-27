@@ -105,12 +105,11 @@ def density_ratio_to_comparison_color(ratio: float) -> wp.vec3:
     """Map density ratio to a clipped paper-style blue-green-yellow-red colormap."""
     r = wp.clamp(ratio, DENSITY_COLOR_MIN_RATIO, DENSITY_COLOR_MAX_RATIO)
 
-    c_blue = wp.vec3(0.06, 0.20, 1.00)
-    c_cyan = wp.vec3(0.00, 0.72, 1.00)
-    c_green = wp.vec3(0.00, 0.95, 0.20)
-    c_yellow = wp.vec3(0.95, 0.95, 0.05)
-    c_orange = wp.vec3(1.00, 0.55, 0.05)
-    c_red = wp.vec3(0.95, 0.05, 0.05)
+    c_blue = wp.vec3(0.00, 0.12, 1.00)
+    c_cyan = wp.vec3(0.00, 0.88, 1.00)
+    c_green = wp.vec3(0.00, 0.98, 0.10)
+    c_yellow = wp.vec3(1.00, 0.96, 0.02)
+    c_red = wp.vec3(1.00, 0.08, 0.04)
 
     if r <= 1.00:
         return c_blue
@@ -121,7 +120,7 @@ def density_ratio_to_comparison_color(ratio: float) -> wp.vec3:
     if r <= 1.15:
         return _lerp_color(c_green, c_yellow, (r - 1.10) / 0.05)
     if r <= 1.20:
-        return _lerp_color(c_yellow, c_orange, (r - 1.15) / 0.05)
+        return _lerp_color(c_yellow, c_red, (r - 1.15) / 0.05)
     return c_red
 
 
