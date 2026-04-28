@@ -89,6 +89,17 @@ class Example:
             help="Override the rigid box density [kg/m^3].",
         )
         parser.add_argument(
+            "--hydrostatic-volume-mode",
+            choices=[
+                "raw",
+                "dynamic-shape-volume",
+                "dynamic-shape-surface-quadrature",
+                "dynamic-shape-surface-thickness",
+            ],
+            default="dynamic-shape-surface-quadrature",
+            help="Hydrostatic boundary-volume model used for dynamic box boundary samples.",
+        )
+        parser.add_argument(
             "--projection-reaction-relaxation",
             type=float,
             default=None,
@@ -120,6 +131,18 @@ class Example:
         )
         return parser
 
+    @staticmethod
+    def _parse_hydrostatic_volume_mode(mode: str) -> FSIBoundaryModel.HydrostaticVolumeMode:
+        mode_map = {
+            "raw": FSIBoundaryModel.HydrostaticVolumeMode.NONE,
+            "dynamic-shape-volume": FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_SHAPE_VOLUME,
+            "dynamic-shape-surface-quadrature": (
+                FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_QUADRATURE
+            ),
+            "dynamic-shape-surface-thickness": (FSIBoundaryModel.HydrostaticVolumeMode.DYNAMIC_SHAPE_SURFACE_THICKNESS),
+        }
+        return mode_map[str(mode)]
+
     def _get_scene_config(self) -> dict[str, object]:
         fluid_iterations_override = getattr(self.args, "fluid_iterations", None)
         sim_substeps_override = getattr(self.args, "sim_substeps", None)
@@ -145,15 +168,15 @@ class Example:
                 "box_density_float": 200.0,
                 "box_density_sink": 1600.0,
                 "rest_density": 1000.0,
-                "fluid_iterations": 5,
+                "fluid_iterations": 8,
                 "sim_substeps": 6,
                 "velocity_damping": 0.998,
-                "viscosity_coefficient": 0.0020,
+                "viscosity_coefficient": 0.0006,
                 "viscosity_boundary_coefficient": 0.0,
-                "xsph_coefficient": 0.0030,
+                "xsph_coefficient": 0.0008,
                 "xsph_boundary_coefficient": 0.0,
-                "boundary_velocity_damping": 0.995,
-                "rigid_iterations": 5,
+                "boundary_velocity_damping": 0.999,
+                "rigid_iterations": 8,
                 "boundary_spacing": 0.020,
                 "static_boundary_weight": 1.0,
                 "include_static_boundary_samples": False,
@@ -167,7 +190,7 @@ class Example:
             config = {
                 "container_half_width": 0.15,
                 "container_half_depth": 0.036,
-                "wall_half_height": 0.52,
+                "wall_half_height": 0.58,
                 "pool_dim_x": 25,
                 "pool_dim_y": 72,
                 "pool_dim_z": 6,
@@ -176,13 +199,13 @@ class Example:
                 "radius_mean": 0.0052,
                 "smoothing_radius": 0.022,
                 "pool_bottom_clearance": 0.012,
-                "box_half_extent": wp.vec3(0.090, 0.024, 0.018),
+                "box_half_extent": wp.vec3(0.090, 0.096, 0.030),
                 "box_bottom_gap": 0.008,
                 "box_density_float": 180.0,
                 "box_density_sink": 3200.0,
                 "rest_density": 1000.0,
                 "fluid_iterations": 8,
-                "sim_substeps": 4,
+                "sim_substeps": 8,
                 "velocity_damping": 0.999,
                 "viscosity_coefficient": 0.0018,
                 "viscosity_boundary_coefficient": 0.0,
@@ -234,6 +257,9 @@ class Example:
         self.box_case = str(getattr(self.args, "box_case", "float"))
         self.show_boundary_samples = bool(getattr(self.args, "show_boundary_samples", False))
         self.use_box_clamp = bool(getattr(self.args, "box_clamp", True))
+        self.hydrostatic_volume_mode = self._parse_hydrostatic_volume_mode(
+            getattr(self.args, "hydrostatic_volume_mode", "dynamic-shape-surface-quadrature")
+        )
         self.config = self._get_scene_config()
         self.include_static_boundary_samples = bool(self.config["include_static_boundary_samples"])
         self.sim_substeps = int(self.config["sim_substeps"])
@@ -261,6 +287,7 @@ class Example:
             self.model,
             spacing=float(self.config["boundary_spacing"]),
             support_radius=float(self.config["smoothing_radius"]),
+            hydrostatic_volume_mode=self.hydrostatic_volume_mode,
             include_static=self.include_static_boundary_samples,
             include_dynamic=True,
             device=self.model.device,
@@ -381,15 +408,15 @@ class Example:
 
         return SolverPBF(
             self.model,
-                SolverPBF.Config(
-                    **common_kwargs,
-                    kernel_family=SolverPBF.Config.KernelFamily.CUBIC_SPLINE,
-                    relaxation=float(self.config.get("pbf_relaxation", 1.0)),
-                    lambda_regularization=float(self.config.get("lambda_regularization", 1.0e-6)),
-                    use_constraint_clamp=True,
-                    fluid_particle_start=0,
-                    fluid_particle_count=None,
-                ),
+            SolverPBF.Config(
+                **common_kwargs,
+                kernel_family=SolverPBF.Config.KernelFamily.CUBIC_SPLINE,
+                relaxation=float(self.config.get("pbf_relaxation", 1.0)),
+                lambda_regularization=float(self.config.get("lambda_regularization", 1.0e-6)),
+                use_constraint_clamp=True,
+                fluid_particle_start=0,
+                fluid_particle_count=None,
+            ),
             boundary_model=self.boundary_model,
         )
 
