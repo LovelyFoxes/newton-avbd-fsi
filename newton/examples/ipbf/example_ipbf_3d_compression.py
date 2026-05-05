@@ -75,9 +75,9 @@ class Example:
             "smoothing_radius": 0.022,
             "iterations": 3,
             "sim_substeps": 4,
-            "velocity_damping": 0.999,
-            "viscosity": 0.0008,
-            "xsph": 0.002,
+            "velocity_damping": 1.0,
+            "viscosity": 0.0006,
+            "xsph": 0.0003,
         }
 
     def __init__(self, viewer, args=None):
