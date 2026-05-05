@@ -50,6 +50,25 @@ TRUNCATION_COLUMNS = [
     "truncate_reason",
 ]
 
+CASE_STYLES = {
+    ("pbf", 8, 4): {"color": "#F28E2B"},
+    ("pbf", 8, 8): {"color": "#D62728"},
+    ("ipbf", 4, 4): {"color": "#56B4E9"},
+    ("ipbf", 8, 4): {"color": "#0072B2"},
+    ("ipbf", 8, 8): {"color": "#004E64"},
+}
+
+SOLVER_FALLBACK_COLORS = {
+    "pbf": "#C44E52",
+    "ipbf": "#1F77B4",
+}
+
+PANEL_FILE_PREFIXES = {
+    "fluid_quasi2d_density_panel": "quasi2d_density",
+    "fluid_quasi2d_box_float_panel": "box_float",
+    "fluid_quasi2d_box_sink_panel": "box_sink",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot density-error curves from fluid comparison cache directories.")
@@ -79,7 +98,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-truncate-blowup",
         action="store_true",
-        help="Do not truncate case curves after the first blow-up frame.",
+        help="Do not detect blow-up frames; full curves will determine the plot y-axis.",
+    )
+    parser.add_argument(
+        "--hide-after-blowup",
+        action="store_true",
+        help="Hide frames after the first blow-up frame. By default full curves are drawn but y-limits ignore exploded tails.",
     )
     parser.add_argument(
         "--blowup-error-threshold",
@@ -87,6 +111,23 @@ def parse_args() -> argparse.Namespace:
         default=3.0,
         help="Truncate after the first frame whose max relative density error exceeds this threshold.",
     )
+    parser.add_argument(
+        "--axis-error-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional extra y-axis filter. If set, only frames below this max relative density error determine "
+            "plot y-limits. By default only detected blow-up tails are excluded."
+        ),
+    )
+    parser.add_argument(
+        "--axis-percentile",
+        type=float,
+        default=99.5,
+        help="Percentile of in-range samples used for plot y-limits.",
+    )
+    parser.add_argument("--legend-font-size", type=float, default=11.0, help="Legend font size for plots.")
+    parser.add_argument("--line-width", type=float, default=2.4, help="Line width for plotted curves.")
     parser.add_argument(
         "--truncate-solvers",
         type=str,
@@ -107,6 +148,23 @@ def parse_args() -> argparse.Namespace:
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
+
+
+def safe_file_stem(value: str) -> str:
+    chars = []
+    for char in value.lower():
+        if char.isalnum():
+            chars.append(char)
+        else:
+            chars.append("_")
+    stem = "".join(chars).strip("_")
+    while "__" in stem:
+        stem = stem.replace("__", "_")
+    return stem or "panel"
+
+
+def panel_file_prefix(panel_name: str) -> str:
+    return PANEL_FILE_PREFIXES.get(panel_name, safe_file_stem(panel_name))
 
 
 def find_panel_dirs(cache_root: Path, panel_names: list[str] | None) -> list[Path]:
@@ -341,24 +399,76 @@ def series_by_case(rows: list[dict[str, Any]], metric: str) -> dict[str, tuple[n
     return series
 
 
+def case_style(case_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    sample = case_rows[0]
+    solver = str(sample.get("fluid_solver", "")).lower()
+    iterations = int(sample.get("iterations", 0))
+    sim_substeps = int(sample.get("sim_substeps", 0))
+    style = dict(CASE_STYLES.get((solver, iterations, sim_substeps), {}))
+    style.setdefault("color", SOLVER_FALLBACK_COLORS.get(solver, "#4D4D4D"))
+    return style
+
+
+def grouped_case_rows(rows: list[dict[str, Any]]) -> list[tuple[str, list[dict[str, Any]]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for row in rows:
+        label = str(row["label"])
+        if label not in grouped:
+            order.append(label)
+            grouped[label] = []
+        grouped[label].append(row)
+    return [(label, grouped[label]) for label in order]
+
+
+def case_series(case_rows: list[dict[str, Any]], metric: str) -> tuple[np.ndarray, np.ndarray]:
+    ordered = sorted(case_rows, key=lambda item: (float(item["sim_time"]), int(item["record_index"])))
+    xs = np.asarray([float(item["sim_time"]) for item in ordered], dtype=np.float64)
+    ys = np.asarray([float(item[metric]) for item in ordered], dtype=np.float64)
+    return xs, ys
+
+
 def plot_metric(
     *,
     rows: list[dict[str, Any]],
+    axis_rows: list[dict[str, Any]],
+    truncation_summary: list[dict[str, Any]],
     metric: str,
     ylabel: str,
     title: str,
     output_base: Path,
     formats: list[str],
     dpi: int,
+    axis_error_threshold: float | None,
+    axis_percentile: float,
+    legend_font_size: float,
+    line_width: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
-    for label, (xs, ys) in series_by_case(rows, metric).items():
-        ax.plot(xs, ys, linewidth=1.8, label=label)
+    for label, case_rows in grouped_case_rows(rows):
+        xs, ys = case_series(case_rows, metric)
+        ax.plot(xs, ys, linewidth=line_width, label=label, **case_style(case_rows))
+
+    has_blowup = any(bool(item.get("truncated")) for item in truncation_summary)
+    axis_candidates = [row for row in axis_rows if np.isfinite(float(row[metric]))]
+    if has_blowup and axis_error_threshold is not None:
+        filtered = [row for row in axis_candidates if float(row["density_error_max"]) <= axis_error_threshold]
+        if filtered:
+            axis_candidates = filtered
+    if not axis_candidates:
+        axis_candidates = [row for row in axis_rows if np.isfinite(float(row[metric]))]
+    axis_values = np.asarray([float(row[metric]) for row in axis_candidates], dtype=np.float64)
+    if axis_values.size:
+        percentile = min(max(axis_percentile, 0.0), 100.0)
+        y_max = float(np.percentile(axis_values, percentile))
+        if y_max > 0.0:
+            ax.set_ylim(bottom=0.0, top=y_max * 1.18)
+
     ax.set_title(title)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(ylabel)
     ax.grid(True, linewidth=0.35, alpha=0.35)
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=legend_font_size)
     for fmt in formats:
         fig.savefig(output_base.with_suffix(f".{fmt}"), dpi=dpi)
     plt.close(fig)
@@ -367,23 +477,44 @@ def plot_metric(
 def plot_box_height(
     *,
     rows: list[dict[str, Any]],
+    axis_rows: list[dict[str, Any]],
+    truncation_summary: list[dict[str, Any]],
     output_base: Path,
     formats: list[str],
     dpi: int,
+    axis_error_threshold: float | None,
+    legend_font_size: float,
+    line_width: float,
 ) -> None:
     box_rows = [row for row in rows if row.get("box_y") not in (None, "")]
     if not box_rows:
         return
 
     fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
-    grouped = series_by_case(box_rows, "box_y")
-    for label, (xs, ys) in grouped.items():
-        ax.plot(xs, ys, linewidth=1.8, label=label)
+    for label, case_rows in grouped_case_rows(box_rows):
+        xs, ys = case_series(case_rows, "box_y")
+        ax.plot(xs, ys, linewidth=line_width, label=label, **case_style(case_rows))
+
+    has_blowup = any(bool(item.get("truncated")) for item in truncation_summary)
+    axis_box_rows = [row for row in axis_rows if row.get("box_y") not in (None, "")]
+    if has_blowup and axis_error_threshold is not None:
+        filtered = [row for row in axis_box_rows if float(row["density_error_max"]) <= axis_error_threshold]
+        if filtered:
+            axis_box_rows = filtered
+    if not axis_box_rows:
+        axis_box_rows = [row for row in axis_rows if row.get("box_y") not in (None, "")]
+    axis_values = np.asarray([float(row["box_y"]) for row in axis_box_rows], dtype=np.float64)
+    if axis_values.size:
+        y_min = float(np.min(axis_values))
+        y_max = float(np.max(axis_values))
+        padding = max((y_max - y_min) * 0.08, 1.0e-3)
+        ax.set_ylim(y_min - padding, y_max + padding)
+
     ax.set_title("Rigid Body Height")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Center height (m)")
     ax.grid(True, linewidth=0.35, alpha=0.35)
-    ax.legend(fontsize=8)
+    ax.legend(fontsize=legend_font_size)
     for fmt in formats:
         fig.savefig(output_base.with_suffix(f".{fmt}"), dpi=dpi)
     plt.close(fig)
@@ -396,11 +527,17 @@ def analyze_panel(
     formats: list[str],
     dpi: int,
     truncate_blowup: bool,
+    hide_after_blowup: bool,
     solver_filter: set[str] | None,
     blowup_threshold: float,
+    axis_error_threshold: float | None,
+    axis_percentile: float,
+    legend_font_size: float,
+    line_width: float,
 ) -> None:
     panel_metadata = load_json(panel_dir / "panel_metadata.json")
     panel_name = str(panel_metadata.get("name", panel_dir.name))
+    file_prefix = panel_file_prefix(panel_name)
     panel_output = output_root / panel_name
 
     full_rows: list[dict[str, Any]] = []
@@ -421,47 +558,73 @@ def analyze_panel(
         threshold=blowup_threshold,
     )
 
-    write_csv(panel_output / "density_metrics_full.csv", full_rows)
-    write_csv(panel_output / "density_metrics.csv", rows)
-    write_truncation_summary(panel_output / "truncation_summary.csv", truncation_summary)
+    write_csv(panel_output / f"{file_prefix}_density_metrics_full.csv", full_rows)
+    write_csv(panel_output / f"{file_prefix}_density_metrics.csv", rows)
+    write_truncation_summary(panel_output / f"{file_prefix}_truncation_summary.csv", truncation_summary)
+
+    plot_rows = rows if hide_after_blowup else full_rows
+    axis_rows = rows if truncate_blowup else full_rows
     plot_metric(
-        rows=rows,
+        rows=plot_rows,
+        axis_rows=axis_rows,
+        truncation_summary=truncation_summary,
         metric="density_error_max",
         ylabel="Max relative density error",
         title=f"{panel_name}: max density error",
-        output_base=panel_output / "density_error_max",
+        output_base=panel_output / f"{file_prefix}_density_error_max",
         formats=formats,
         dpi=dpi,
+        axis_error_threshold=axis_error_threshold,
+        axis_percentile=axis_percentile,
+        legend_font_size=legend_font_size,
+        line_width=line_width,
     )
     plot_metric(
-        rows=rows,
+        rows=plot_rows,
+        axis_rows=axis_rows,
+        truncation_summary=truncation_summary,
         metric="density_error_rms",
         ylabel="RMS relative density error",
         title=f"{panel_name}: RMS density error",
-        output_base=panel_output / "density_error_rms",
+        output_base=panel_output / f"{file_prefix}_density_error_rms",
         formats=formats,
         dpi=dpi,
+        axis_error_threshold=axis_error_threshold,
+        axis_percentile=axis_percentile,
+        legend_font_size=legend_font_size,
+        line_width=line_width,
     )
     plot_metric(
-        rows=rows,
+        rows=plot_rows,
+        axis_rows=axis_rows,
+        truncation_summary=truncation_summary,
         metric="density_error_p95",
         ylabel="95th percentile relative density error",
         title=f"{panel_name}: p95 density error",
-        output_base=panel_output / "density_error_p95",
+        output_base=panel_output / f"{file_prefix}_density_error_p95",
         formats=formats,
         dpi=dpi,
+        axis_error_threshold=axis_error_threshold,
+        axis_percentile=axis_percentile,
+        legend_font_size=legend_font_size,
+        line_width=line_width,
     )
     plot_box_height(
-        rows=rows,
-        output_base=panel_output / "box_height",
+        rows=plot_rows,
+        axis_rows=axis_rows,
+        truncation_summary=truncation_summary,
+        output_base=panel_output / f"{file_prefix}_box_height",
         formats=formats,
         dpi=dpi,
+        axis_error_threshold=axis_error_threshold,
+        legend_font_size=legend_font_size,
+        line_width=line_width,
     )
 
     truncated_cases = sum(1 for item in truncation_summary if item["truncated"])
     print(
-        f"[Density Curves] {panel_name}: wrote {len(rows)} plotted frame rows "
-        f"({len(full_rows)} full rows, {truncated_cases} truncated cases) to {panel_output}"
+        f"[Density Curves] {panel_name}: wrote {len(full_rows if not hide_after_blowup else rows)} plotted frame rows "
+        f"({len(full_rows)} full rows, {truncated_cases} blow-up markers) to {panel_output}"
     )
 
 
@@ -480,8 +643,13 @@ def main() -> None:
             formats=args.formats,
             dpi=args.dpi,
             truncate_blowup=not args.no_truncate_blowup,
+            hide_after_blowup=args.hide_after_blowup,
             solver_filter=solver_filter,
             blowup_threshold=args.blowup_error_threshold,
+            axis_error_threshold=args.axis_error_threshold,
+            axis_percentile=args.axis_percentile,
+            legend_font_size=args.legend_font_size,
+            line_width=args.line_width,
         )
 
 
