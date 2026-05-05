@@ -219,7 +219,7 @@ class Example:
                 "pool_bottom_clearance": 0.03,
                 "sphere_radius": 0.07,
                 "sphere_bottom_gap": 0.035,
-                "sphere_densities": (250.0, 700.0, 1250.0),
+                "sphere_densities": (250.0, 500.0, 1250.0),
                 "rest_density": 1000.0,
                 "ipbf_iterations": 6,
                 "sim_substeps": 4,
