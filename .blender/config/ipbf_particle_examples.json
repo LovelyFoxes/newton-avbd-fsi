@@ -3,6 +3,7 @@
   "cache_dir": ".blender/cache/ipbf_particle_examples",
   "render_dir": ".blender/renders/ipbf_particle_examples",
   "metrics_dir": ".blender/renders/ipbf_particle_metrics",
+  "blend_dir": ".blender/templates/ipbf_particle_examples",
   "record_frames": 180,
   "record_initial_frame": true,
   "render_wireframe": true,

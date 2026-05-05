@@ -27,6 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=None, help="Optional override for rendered frame directory.")
     parser.add_argument("--case-key", type=str, default=None, help="Render only one case key.")
     parser.add_argument("--frame-indices", type=str, default=None, help="Comma-separated frame indices overriding config.")
+    parser.add_argument(
+        "--save-blend",
+        type=Path,
+        default=None,
+        help="Optional .blend path for one case, or output directory for per-case .blend templates.",
+    )
     parser.add_argument("--render", action="store_true", help="Render PNG stills. Without this flag, only builds the first frame.")
     return parser.parse_args(argv)
 
@@ -254,6 +260,88 @@ def frame_payload(case_dir: Path, frame_index: int) -> dict[str, np.ndarray]:
         return {key: payload[key] for key in payload.files}
 
 
+def set_visible_only_at_frame(obj: bpy.types.Object, *, visible_frame: int, frame_start: int, frame_end: int) -> None:
+    obj.hide_viewport = True
+    obj.hide_render = True
+    obj.keyframe_insert(data_path="hide_viewport", frame=frame_start)
+    obj.keyframe_insert(data_path="hide_render", frame=frame_start)
+
+    if visible_frame > frame_start:
+        obj.hide_viewport = True
+        obj.hide_render = True
+        obj.keyframe_insert(data_path="hide_viewport", frame=visible_frame - 1)
+        obj.keyframe_insert(data_path="hide_render", frame=visible_frame - 1)
+
+    obj.hide_viewport = False
+    obj.hide_render = False
+    obj.keyframe_insert(data_path="hide_viewport", frame=visible_frame)
+    obj.keyframe_insert(data_path="hide_render", frame=visible_frame)
+
+    if visible_frame < frame_end:
+        obj.hide_viewport = True
+        obj.hide_render = True
+        obj.keyframe_insert(data_path="hide_viewport", frame=visible_frame + 1)
+        obj.keyframe_insert(data_path="hide_render", frame=visible_frame + 1)
+
+
+def blend_path_for_case(save_blend: Path, case_config: dict, multiple_cases: bool) -> Path:
+    key = str(case_config["key"])
+    resolved = save_blend.resolve()
+    if resolved.suffix.lower() == ".blend":
+        if multiple_cases:
+            return resolved.with_name(f"{resolved.stem}_{key}.blend")
+        return resolved
+    return resolved / f"{key}.blend"
+
+
+def build_case_template(
+    *,
+    config: dict,
+    case_config: dict,
+    case_dir: Path,
+    output_dir: Path,
+    frame_indices: list[int],
+    save_blend: Path,
+) -> None:
+    if not frame_indices:
+        raise ValueError(f"No frames selected for {case_config['key']}.")
+
+    metadata = load_json(case_dir / "metadata.json")
+    frame_start = min(frame_indices)
+    frame_end = max(frame_indices)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_preview.clear_scene()
+    configure_scene(config, output_dir / f"{case_config['key']}_frame_")
+    scene = bpy.context.scene
+    scene.frame_start = frame_start
+    scene.frame_end = frame_end
+    scene.frame_set(frame_start)
+
+    materials = {
+        "particles": make_particle_material("IPBFParticles"),
+        "wire": make_emission_material("IPBFWire", (0.85, 0.90, 1.0, 1.0), 1.3),
+    }
+
+    for frame_index in frame_indices:
+        payload = frame_payload(case_dir, frame_index)
+        obj = create_particle_object(
+            name=f"{case_config['key']}_particles_{frame_index:04d}",
+            payload=payload,
+            metadata=metadata,
+            config=config,
+            material=materials["particles"],
+        )
+        set_visible_only_at_frame(obj, visible_frame=frame_index, frame_start=frame_start, frame_end=frame_end)
+
+    if bool(config.get("render_wireframe", True)):
+        add_wireframe(metadata, materials["wire"])
+    add_camera(case_config, metadata)
+
+    save_blend.parent.mkdir(parents=True, exist_ok=True)
+    bpy.ops.wm.save_as_mainfile(filepath=str(save_blend))
+
+
 def render_case_frame(
     *,
     config: dict,
@@ -304,16 +392,29 @@ def main() -> None:
 
     for case_config in cases:
         case_dir = cache_root / str(case_config["key"])
-        for frame_index in parse_frame_indices(args.frame_indices, case_config):
-            print(f"[IPBF Particles] Render {case_config['key']} frame {frame_index}")
-            render_case_frame(
+        frame_indices = parse_frame_indices(args.frame_indices, case_config)
+        if args.save_blend is not None:
+            blend_path = blend_path_for_case(args.save_blend, case_config, multiple_cases=len(cases) > 1)
+            print(f"[IPBF Particles] Save template {blend_path}")
+            build_case_template(
                 config=config,
                 case_config=case_config,
                 case_dir=case_dir,
                 output_dir=output_dir,
-                frame_index=frame_index,
-                render=args.render,
+                frame_indices=frame_indices,
+                save_blend=blend_path,
             )
+        if args.render or args.save_blend is None:
+            for frame_index in frame_indices:
+                print(f"[IPBF Particles] Render {case_config['key']} frame {frame_index}")
+                render_case_frame(
+                    config=config,
+                    case_config=case_config,
+                    case_dir=case_dir,
+                    output_dir=output_dir,
+                    frame_index=frame_index,
+                    render=args.render,
+                )
 
 
 if __name__ == "__main__":
