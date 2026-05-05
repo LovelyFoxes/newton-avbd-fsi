@@ -12,17 +12,51 @@
   "render": {
     "resolution": [1920, 1080],
     "fps": 60,
-    "engine": "BLENDER_EEVEE_NEXT",
-    "samples": 16,
-    "background": [0.0, 0.0, 0.0, 1.0]
+    "engine": "CYCLES",
+    "device": "GPU",
+    "compute_device_type": "OPTIX",
+    "samples": 96,
+    "denoise": true,
+    "background": [1.0, 1.0, 1.0, 1.0],
+    "background_strength": 0.35
   },
   "particles": {
     "max_preview_particles": 25000,
-    "radius_scale": 0.75,
-    "color": [0.02, 0.78, 1.0, 1.0]
+    "radius_scale": 0.90,
+    "sphere_segments": 12,
+    "sphere_rings": 6,
+    "color": [0.0, 0.16, 0.78, 1.0]
   },
   "surface": {
-    "color": [0.18, 0.58, 1.0, 0.46]
+    "color": [0.18, 0.58, 1.0, 0.38]
+  },
+  "container": {
+    "render_glass": true,
+    "render_floor": true,
+    "wall_thickness": 0.01,
+    "glass_color": [0.96, 0.99, 1.0, 0.0],
+    "static_color": [0.78, 0.84, 0.90, 0.0],
+    "edge_color": [0.0, 0.0, 0.0, 0.92],
+    "floor_color": [0.82, 0.82, 0.80, 1.0],
+    "floor_size": 337.5,
+    "floor_thickness": 0.012
+  },
+  "lighting": {
+    "key": {
+      "name": "KeyLight_RightFrontTop",
+      "type": "AREA",
+      "location": [0.0, 0.0, 8.0],
+      "target": [0.0, 0.0, 0.0],
+      "energy": 500.0,
+      "size": 5.0
+    },
+    "fill": {
+      "name": "SoftFill",
+      "type": "SUN",
+      "location": [40.0, 40.0, 40.0],
+      "target": [0.0, 0.0, 0.0],
+      "energy": 1.0
+    }
   },
   "cases": [
     {
@@ -31,7 +65,7 @@
       "module": "newton.examples.fsi.example_fsi_ipbf_vbd_three_sphere_buoys",
       "group": "rigid_boundary",
       "render_frames": [0, 45, 90, 150],
-      "camera": {"location": [1.35, -1.72, 1.08], "target": [0.0, 0.0, 0.48], "ortho_scale": 1.45}
+      "camera": {"type": "PERSP", "location": [1.35, -1.72, 1.08], "target": [0.0, 0.0, 0.48], "focal_length_mm": 50.0, "sensor_width": 36.0}
     },
     {
       "key": "box_wall_break",
@@ -39,7 +73,7 @@
       "module": "newton.examples.fsi.example_fsi_ipbf_vbd_box_wall_break",
       "group": "rigid_boundary",
       "render_frames": [0, 55, 100, 155],
-      "camera": {"location": [1.82, -2.08, 1.22], "target": [0.0, 0.0, 0.42], "ortho_scale": 1.90}
+      "camera": {"type": "PERSP", "location": [1.82, -2.08, 1.22], "target": [0.0, 0.0, 0.42], "focal_length_mm": 50.0, "sensor_width": 36.0}
     },
     {
       "key": "moving_wall_float_box",
@@ -47,7 +81,7 @@
       "module": "newton.examples.fsi.example_fsi_ipbf_vbd_moving_wall_float_box",
       "group": "rigid_boundary",
       "render_frames": [0, 45, 90, 150],
-      "camera": {"location": [1.52, -2.02, 1.12], "target": [0.0, 0.0, 0.46], "ortho_scale": 1.60}
+      "camera": {"type": "PERSP", "location": [1.52, -2.02, 1.12], "target": [0.0, 0.0, 0.46], "focal_length_mm": 50.0, "sensor_width": 36.0}
     },
     {
       "key": "cloth_cascade",
@@ -56,7 +90,7 @@
       "group": "cloth_shell",
       "record_frames": 210,
       "render_frames": [0, 70, 130, 200],
-      "camera": {"location": [1.60, -2.55, 1.70], "target": [0.0, 0.0, 0.70], "ortho_scale": 2.15}
+      "camera": {"type": "PERSP", "location": [1.60, -2.55, 1.70], "target": [0.0, 0.0, 0.70], "focal_length_mm": 50.0, "sensor_width": 36.0}
     },
     {
       "key": "cloth_payload_rain",
@@ -65,7 +99,7 @@
       "group": "cloth_shell",
       "record_frames": 210,
       "render_frames": [0, 70, 130, 200],
-      "camera": {"location": [1.45, -2.30, 1.55], "target": [0.0, 0.0, 0.72], "ortho_scale": 1.85}
+      "camera": {"type": "PERSP", "location": [1.45, -2.30, 1.55], "target": [0.0, 0.0, 0.72], "focal_length_mm": 50.0, "sensor_width": 36.0}
     }
   ]
 }

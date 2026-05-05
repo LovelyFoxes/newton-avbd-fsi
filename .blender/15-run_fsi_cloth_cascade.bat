@@ -29,7 +29,7 @@ rem Use auto for every cached frame, or comma-separated indices such as 0,60,120
 set "FRAME_INDICES=auto"
 
 rem Turn EXPORT_CACHE on for the first run or whenever the simulation settings changed.
-set "EXPORT_CACHE=0"
+set "EXPORT_CACHE=1"
 set "EXPORT_SPLASHSURF_PARTICLES=1"
 set "RUN_SPLASHSURF=1"
 set "SAVE_PARTICLE_BLEND=1"
