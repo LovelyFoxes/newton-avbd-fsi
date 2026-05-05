@@ -46,7 +46,24 @@ def read_frame(cache_dir: Path, frame_index: int) -> dict[str, np.ndarray]:
         return {key: data[key] for key in data.files}
 
 
-def parse_frame_indices(raw: str | None, metadata: dict) -> list[int]:
+def available_frame_indices(cache_dir: Path) -> list[int]:
+    frame_dir = cache_dir / "frames"
+    paths = sorted(frame_dir.glob("frame_*.npz"))
+    indices: list[int] = []
+    for path in paths:
+        try:
+            indices.append(int(path.stem.split("_")[-1]))
+        except ValueError:
+            continue
+    return indices
+
+
+def parse_frame_indices(raw: str | None, metadata: dict, cache_dir: Path) -> list[int]:
+    if raw and raw.strip().lower() == "auto":
+        indices = available_frame_indices(cache_dir)
+        if not indices:
+            raise FileNotFoundError(f"No cached frames found in {cache_dir / 'frames'}.")
+        return indices
     if raw:
         return [int(item.strip()) for item in raw.split(",") if item.strip()]
     values = metadata.get("render_frames", [])
@@ -284,7 +301,7 @@ def main() -> None:
     args = parse_args()
     config = load_json(args.config)
     metadata = load_json(args.cache_dir / "metadata.json")
-    frame_indices = parse_frame_indices(args.frame_indices, metadata)
+    frame_indices = parse_frame_indices(args.frame_indices, metadata, args.cache_dir)
     frames = [read_frame(args.cache_dir, frame_index) for frame_index in frame_indices]
     frame_start = min(frame_indices) if frame_indices else 1
     frame_end = max(frame_indices) if frame_indices else 1

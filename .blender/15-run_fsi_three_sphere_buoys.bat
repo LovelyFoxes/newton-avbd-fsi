@@ -2,10 +2,7 @@
 setlocal EnableExtensions
 
 rem ---------------------------------------------------------------------------
-rem Single FSI experiment scene -> cache -> particle .blend / mesh .blend
-rem
-rem Default scene: three_sphere_buoys. Use the sibling 15-run_fsi_*.bat files
-rem for the other chapter-5 rigid and cloth FSI scenes.
+rem Single FSI scene: three_sphere_buoys -> cache -> particle .blend / mesh .blend
 rem ---------------------------------------------------------------------------
 
 set "BLENDER_DIR=E:\Softwares\3D Animation\Blender Foundation\Blender 4.5"

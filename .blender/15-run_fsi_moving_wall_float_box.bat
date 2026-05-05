@@ -2,10 +2,7 @@
 setlocal EnableExtensions
 
 rem ---------------------------------------------------------------------------
-rem Single FSI experiment scene -> cache -> particle .blend / mesh .blend
-rem
-rem Default scene: three_sphere_buoys. Use the sibling 15-run_fsi_*.bat files
-rem for the other chapter-5 rigid and cloth FSI scenes.
+rem Single FSI scene: moving_wall_float_box -> cache -> particle .blend / mesh .blend
 rem ---------------------------------------------------------------------------
 
 set "BLENDER_DIR=E:\Softwares\3D Animation\Blender Foundation\Blender 4.5"
@@ -17,8 +14,8 @@ if not exist "%UV_EXE%" set "UV_EXE=uv"
 set "PY_SPLASHSURF_EXE=pysplashsurf"
 set "CONFIG_PATH=.blender\config\fsi_experiment_scenes.json"
 set "DEVICE=cuda:0"
-set "CASE_KEY=three_sphere_buoys"
-set "CASE_NAME=three_sphere_buoys"
+set "CASE_KEY=moving_wall_float_box"
+set "CASE_NAME=moving_wall_float_box"
 
 set "CACHE_ROOT=.blender\cache\fsi_experiment_scenes"
 set "CACHE_DIR=%CACHE_ROOT%\%CASE_KEY%"

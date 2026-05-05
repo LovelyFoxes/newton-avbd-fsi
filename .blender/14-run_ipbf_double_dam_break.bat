@@ -2,10 +2,7 @@
 setlocal EnableExtensions
 
 rem ---------------------------------------------------------------------------
-rem Single IPBF particle scene -> cache -> particle .blend / optional stills
-rem
-rem This file intentionally handles one scene only. Use the two sibling bat
-rem files for block flop and 3D compression, or change CASE_KEY/CASE_NAME below.
+rem Single IPBF double-dam-break scene -> cache -> particle .blend / stills
 rem ---------------------------------------------------------------------------
 
 set "BLENDER_DIR=E:\Softwares\3D Animation\Blender Foundation\Blender 4.5"
@@ -28,7 +25,8 @@ set "BLEND_FILE=.blender\templates\ipbf_particle_examples\%CASE_NAME%.blend"
 rem Use auto for every cached frame, or comma-separated indices such as 0,45,90,150.
 set "FRAME_INDICES=auto"
 
-set "EXPORT_CACHE=1"
+rem Turn EXPORT_CACHE on only when the simulation cache needs to be regenerated.
+set "EXPORT_CACHE=0"
 set "SAVE_BLEND=1"
 set "RENDER_IMAGES=0"
 set "PLOT_METRICS=1"

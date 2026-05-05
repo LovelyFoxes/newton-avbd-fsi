@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot metrics from IPBF particle-example caches.")
     parser.add_argument("--cache-root", type=Path, default=Path(".blender/cache/ipbf_particle_examples"))
     parser.add_argument("--output-dir", type=Path, default=Path(".blender/renders/ipbf_particle_metrics"))
+    parser.add_argument("--case-key", action="append", default=None, help="Only plot the selected case key. Repeatable.")
     parser.add_argument("--include-initial-frame", action="store_true")
     parser.add_argument("--formats", type=str, default="pdf,png,svg")
     parser.add_argument("--dpi", type=int, default=220)
@@ -191,11 +192,14 @@ def main() -> None:
     args = parse_args()
     panel_metadata = load_json(args.cache_root / "panel_metadata.json")
     panel_name = str(panel_metadata.get("name", args.cache_root.name))
-    prefix = safe_stem(panel_name)
+    selected_keys = set(args.case_key or [])
+    prefix = safe_stem(panel_name if not selected_keys else "_".join(sorted(selected_keys)))
     formats = [item.strip().lower() for item in args.formats.split(",") if item.strip()]
 
     all_rows: list[dict[str, Any]] = []
     for case_entry in panel_metadata["cases"]:
+        if selected_keys and str(case_entry["key"]) not in selected_keys:
+            continue
         case_dir = case_path(args.cache_root, case_entry)
         rows = compute_case_rows(
             panel_name=panel_name,
@@ -207,6 +211,9 @@ def main() -> None:
         all_rows.extend(rows)
 
     write_csv(args.output_dir / f"{prefix}_metrics.csv", all_rows)
+    if not all_rows:
+        print(f"[IPBF Metrics] No metric rows found for {sorted(selected_keys)} in {args.cache_root}")
+        return
     plot_metric(
         rows=all_rows,
         metric="density_error_rms",

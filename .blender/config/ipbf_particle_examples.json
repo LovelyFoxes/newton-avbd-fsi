@@ -10,19 +10,54 @@
   "render": {
     "resolution": [1920, 1080],
     "fps": 30,
-    "engine": "BLENDER_EEVEE_NEXT",
-    "samples": 16,
-    "background": [0.0, 0.0, 0.0, 1.0],
-    "background_strength": 1.0,
+    "engine": "CYCLES",
+    "device": "GPU",
+    "compute_device_type": "OPTIX",
+    "samples": 96,
+    "denoise": true,
+    "background": [1.0, 1.0, 1.0, 1.0],
+    "background_strength": 0.35,
     "exposure": 0.0,
     "gamma": 1.0
   },
   "particles": {
-    "color_mode": "density",
-    "radius_scale": 0.80,
+    "color_mode": "uniform",
+    "radius_scale": 0.90,
+    "sphere_segments": 12,
+    "sphere_rings": 6,
+    "roughness": 0.22,
+    "specular": 0.82,
     "density_color_min_ratio": 0.90,
     "density_color_max_ratio": 1.30,
-    "uniform_color": [0.05, 0.55, 1.0]
+    "uniform_color": [0.0, 0.16, 0.78]
+  },
+  "container": {
+    "render_glass": true,
+    "render_floor": true,
+    "wall_thickness": 0.01,
+    "glass_color": [0.96, 0.99, 1.0, 0.04],
+    "glass_roughness": 0.02,
+    "glass_transmission": 0.08,
+    "edge_color": [0.0, 0.0, 0.0, 0.92],
+    "floor_color": [0.82, 0.82, 0.80, 1.0],
+    "floor_roughness": 0.52,
+    "floor_extent_scale": 2.25,
+    "floor_thickness": 0.012
+  },
+  "lighting": {
+    "key": {
+      "location": [2.4, -3.3, 3.4],
+      "target": [-0.45, 0.45, 0.25],
+      "energy": 700.0,
+      "size": 2.1
+    },
+    "fill": {
+      "enabled": true,
+      "location": [-2.0, 1.8, 2.0],
+      "target": [0.0, 0.0, 0.55],
+      "energy": 55.0,
+      "size": 5.0
+    }
   },
   "cases": [
     {
@@ -32,9 +67,11 @@
       "record_frames": 180,
       "render_frames": [1, 45, 90, 150],
       "camera": {
+        "type": "PERSP",
         "location": [2.10, -2.35, 1.45],
         "target": [0.0, 0.0, 0.95],
-        "ortho_scale": 2.65
+        "focal_length_mm": 50.0,
+        "sensor_width": 36.0
       }
     },
     {
@@ -44,9 +81,11 @@
       "record_frames": 180,
       "render_frames": [1, 45, 90, 150],
       "camera": {
-        "location": [2.35, -2.80, 1.85],
-        "target": [0.0, 0.0, 1.20],
-        "ortho_scale": 2.60
+        "type": "PERSP",
+        "location": [4.5, -5.5, 3.6500000953674316],
+        "rotation_euler": [1.2217304706573486, 0.0, 0.6981316804885864],
+        "focal_length_mm": 50.0,
+        "sensor_width": 36.0
       }
     },
     {
@@ -56,9 +95,11 @@
       "record_frames": 180,
       "render_frames": [1, 30, 75, 150],
       "camera": {
+        "type": "PERSP",
         "location": [1.35, -1.70, 1.10],
         "target": [0.0, 0.0, 0.55],
-        "ortho_scale": 1.45
+        "focal_length_mm": 50.0,
+        "sensor_width": 36.0
       }
     }
   ]

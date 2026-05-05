@@ -1,12 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-rem ---------------------------------------------------------------------------
-rem Single IPBF particle scene -> cache -> particle .blend / optional stills
-rem
-rem This file intentionally handles one scene only. Use the two sibling bat
-rem files for block flop and 3D compression, or change CASE_KEY/CASE_NAME below.
-rem ---------------------------------------------------------------------------
+rem Single IPBF 3D-compression scene. Does not run the other particle examples.
 
 set "BLENDER_DIR=E:\Softwares\3D Animation\Blender Foundation\Blender 4.5"
 set "BLENDER_EXE=%BLENDER_DIR%\blender.exe"
@@ -16,8 +11,8 @@ if not exist "%UV_EXE%" set "UV_EXE=uv"
 
 set "CONFIG_PATH=.blender\config\ipbf_particle_examples.json"
 set "DEVICE=cuda:0"
-set "CASE_KEY=ipbf_double_dam_break"
-set "CASE_NAME=ipbf_double_dam_break"
+set "CASE_KEY=ipbf_3d_compression"
+set "CASE_NAME=ipbf_3d_compression"
 
 set "CACHE_ROOT=.blender\cache\ipbf_particle_examples"
 set "CACHE_DIR=%CACHE_ROOT%\%CASE_KEY%"
@@ -25,10 +20,8 @@ set "RENDER_DIR=.blender\renders\ipbf_particle_examples\%CASE_NAME%"
 set "METRICS_DIR=.blender\renders\ipbf_particle_metrics"
 set "BLEND_FILE=.blender\templates\ipbf_particle_examples\%CASE_NAME%.blend"
 
-rem Use auto for every cached frame, or comma-separated indices such as 0,45,90,150.
 set "FRAME_INDICES=auto"
-
-set "EXPORT_CACHE=1"
+set "EXPORT_CACHE=0"
 set "SAVE_BLEND=1"
 set "RENDER_IMAGES=0"
 set "PLOT_METRICS=1"
@@ -42,7 +35,6 @@ set "EXTRA_METRIC_ARGS=--case-key %CASE_KEY%"
 set "UV_CACHE_DIR=%TEMP%\uv-cache-ipbf-particle-%CASE_NAME%"
 set "UV_TOOL_DIR=%TEMP%\uv-tools-ipbf-particle-%CASE_NAME%"
 set "WARP_CACHE_PATH=%TEMP%\warp-cache-ipbf-particle-%CASE_NAME%"
-
 set "PAUSE_ON_EXIT=1"
 
 cd /d "%~dp0.."
