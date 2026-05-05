@@ -27,18 +27,11 @@
   },
   "cases": [
     {
-      "key": "pbf_it8_steps4",
-      "label": "PBF\nit 8 steps 4",
-      "fluid_solver": "pbf",
-      "iterations": 8,
+      "key": "ipbf_it4_steps4",
+      "label": "IPBF\nit 4 steps 4",
+      "fluid_solver": "ipbf",
+      "iterations": 4,
       "sim_substeps": 4
-    },
-    {
-      "key": "pbf_it8_steps8",
-      "label": "PBF\nit 8 steps 8",
-      "fluid_solver": "pbf",
-      "iterations": 8,
-      "sim_substeps": 8
     },
     {
       "key": "ipbf_it8_steps4",
@@ -51,6 +44,13 @@
       "key": "ipbf_it8_steps8",
       "label": "IPBF\nit 8 steps 8",
       "fluid_solver": "ipbf",
+      "iterations": 8,
+      "sim_substeps": 8
+    },
+    {
+      "key": "pbf_it8_steps8",
+      "label": "PBF\nit 8 steps 8",
+      "fluid_solver": "pbf",
       "iterations": 8,
       "sim_substeps": 8
     }
