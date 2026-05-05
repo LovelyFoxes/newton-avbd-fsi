@@ -1,0 +1,64 @@
+{
+  "name": "ipbf_particle_examples",
+  "cache_dir": ".blender/cache/ipbf_particle_examples",
+  "render_dir": ".blender/renders/ipbf_particle_examples",
+  "metrics_dir": ".blender/renders/ipbf_particle_metrics",
+  "record_frames": 180,
+  "record_initial_frame": true,
+  "render_wireframe": true,
+  "render": {
+    "resolution": [1920, 1080],
+    "fps": 30,
+    "engine": "BLENDER_EEVEE_NEXT",
+    "samples": 16,
+    "background": [0.0, 0.0, 0.0, 1.0],
+    "background_strength": 1.0,
+    "exposure": 0.0,
+    "gamma": 1.0
+  },
+  "particles": {
+    "color_mode": "density",
+    "radius_scale": 0.80,
+    "density_color_min_ratio": 0.90,
+    "density_color_max_ratio": 1.30,
+    "uniform_color": [0.05, 0.55, 1.0]
+  },
+  "cases": [
+    {
+      "key": "ipbf_double_dam_break",
+      "label": "Double dam break",
+      "module": "newton.examples.ipbf.example_ipbf_double_dam_break",
+      "record_frames": 180,
+      "render_frames": [1, 45, 90, 150],
+      "camera": {
+        "location": [2.10, -2.35, 1.45],
+        "target": [0.0, 0.0, 0.95],
+        "ortho_scale": 2.65
+      }
+    },
+    {
+      "key": "ipbf_block_flop",
+      "label": "Block flop",
+      "module": "newton.examples.ipbf.example_ipbf_block_flop",
+      "record_frames": 180,
+      "render_frames": [1, 45, 90, 150],
+      "camera": {
+        "location": [2.35, -2.80, 1.85],
+        "target": [0.0, 0.0, 1.20],
+        "ortho_scale": 2.60
+      }
+    },
+    {
+      "key": "ipbf_3d_compression",
+      "label": "3D compression",
+      "module": "newton.examples.ipbf.example_ipbf_3d_compression",
+      "record_frames": 180,
+      "render_frames": [1, 30, 75, 150],
+      "camera": {
+        "location": [1.35, -1.70, 1.10],
+        "target": [0.0, 0.0, 0.55],
+        "ortho_scale": 1.45
+      }
+    }
+  ]
+}
