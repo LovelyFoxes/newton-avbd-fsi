@@ -190,7 +190,7 @@ class Example:
                 "velocity_damping": 0.999,
                 "viscosity_coefficient": 0.0025,
                 "xsph_coefficient": 0.006,
-                "boundary_velocity_damping": 0.97,
+                "boundary_velocity_damping": 0.999,
                 "fsi_pressure_reaction_relaxation": 1.5,
                 "static_boundary_weight": 0.20,
                 "boundary_spacing": 0.022,

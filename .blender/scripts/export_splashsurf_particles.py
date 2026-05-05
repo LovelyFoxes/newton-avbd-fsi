@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cache_dir = args.cache_dir
-    metadata = _load_json(cache_dir / "metadata.json")
+    metadata = _load_required_json(cache_dir / "metadata.json")
     output_dir = args.output_dir if args.output_dir is not None else cache_dir / "particles"
     frame_paths = _selected_frame_paths(cache_dir, args.start_frame, args.end_frame, args.stride)
     if not frame_paths:
@@ -100,6 +100,7 @@ def main() -> None:
         output_dir=output_dir,
         source_metadata=metadata,
         axis_mode=axis_mode,
+        frame_paths=frame_paths,
         exported_frames=exported_frames,
     )
     _write_json(output_dir / "splashsurf_particles_metadata.json", splashsurf_metadata)
@@ -116,9 +117,12 @@ def main() -> None:
         )
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_required_json(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {}
+        raise FileNotFoundError(
+            f"Required cache metadata not found: {path}. "
+            "Regenerate the Newton/FSI cache before exporting splashsurf particles."
+        )
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
@@ -215,12 +219,24 @@ def _build_splashsurf_metadata(
     output_dir: Path,
     source_metadata: dict[str, Any],
     axis_mode: str,
+    frame_paths: list[Path],
     exported_frames: list[dict[str, Any]],
 ) -> dict[str, Any]:
     fluid_metadata = source_metadata.get("fluid", {})
     export_metadata = source_metadata.get("export", {})
-    particle_radius = float(fluid_metadata.get("particle_radius", 0.0))
-    support_radius = float(fluid_metadata.get("smoothing_radius", 0.0))
+    particle_radius = float(fluid_metadata.get("particle_radius", 0.0) or 0.0)
+    if particle_radius <= 0.0:
+        particle_radius = _first_frame_radius(frame_paths)
+    support_radius = float(fluid_metadata.get("smoothing_radius", 0.0) or 0.0)
+    if support_radius <= 0.0 and particle_radius > 0.0:
+        support_radius = 4.0 * particle_radius
+    if particle_radius <= 0.0:
+        raise ValueError(
+            "Invalid splashsurf particle radius: 0. "
+            "The cache metadata must contain fluid.particle_radius or frames must contain positive fluid_radii."
+        )
+    if support_radius <= 0.0:
+        raise ValueError("Invalid splashsurf smoothing radius: 0.")
     rest_density = float(fluid_metadata.get("rest_density", 1000.0))
     smoothing_length = support_radius / max(2.0 * particle_radius, 1.0e-12)
 
@@ -261,6 +277,18 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2)
         file.write("\n")
+
+
+def _first_frame_radius(frame_paths: list[Path]) -> float:
+    for frame_path in frame_paths[: min(len(frame_paths), 8)]:
+        with np.load(frame_path, allow_pickle=False) as data:
+            if "fluid_radii" not in data:
+                continue
+            radii = np.asarray(data["fluid_radii"], dtype=np.float32).reshape(-1)
+            radii = radii[np.isfinite(radii) & (radii > 0.0)]
+            if radii.size:
+                return float(np.median(radii))
+    return 0.0
 
 
 if __name__ == "__main__":

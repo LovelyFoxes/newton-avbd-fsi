@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    particles_metadata = _load_json(args.particles_dir / "splashsurf_particles_metadata.json")
+    particles_metadata = _load_required_json(args.particles_dir / "splashsurf_particles_metadata.json")
     recommended = particles_metadata.get("recommended_reconstruct", {})
 
     particle_radius = _resolve_float(args.particle_radius, recommended, "particle_radius")
@@ -69,6 +69,10 @@ def main() -> None:
     smoothing_length = _resolve_float(args.smoothing_length, recommended, "smoothing_length")
     cube_size = _resolve_float(args.cube_size, recommended, "cube_size")
     surface_threshold = _resolve_float(args.surface_threshold, recommended, "surface_threshold")
+    _require_positive("particle_radius", particle_radius)
+    _require_positive("smoothing_length", smoothing_length)
+    _require_positive("cube_size", cube_size)
+    _require_positive("surface_threshold", surface_threshold)
     start_index = _resolve_int(args.start_index, recommended, "start_index")
     end_index = _resolve_int(args.end_index, recommended, "end_index")
     mesh_smoothing_iters = _resolve_int(args.mesh_smoothing_iters, recommended, "mesh_smoothing_iters")
@@ -137,9 +141,12 @@ def main() -> None:
     subprocess.run(command, check=True)
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_required_json(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {}
+        raise FileNotFoundError(
+            f"Required splashsurf metadata not found: {path}. "
+            "Run export_splashsurf_particles.py before reconstructing the surface."
+        )
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
@@ -176,6 +183,11 @@ def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
 
 def _fmt(value: float) -> str:
     return f"{float(value):.8g}"
+
+
+def _require_positive(name: str, value: float) -> None:
+    if float(value) <= 0.0:
+        raise ValueError(f"Invalid splashsurf parameter {name}={value}. Regenerate metadata or pass an override.")
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:

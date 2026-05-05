@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-blend", type=Path, default=None)
     parser.add_argument("--mode", choices=["particles", "surface"], default="particles")
     parser.add_argument("--frame-indices", type=str, default=None)
+    parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--render", action="store_true")
     return parser.parse_args(argv)
 
@@ -34,6 +35,16 @@ def parse_args() -> argparse.Namespace:
 def load_json(path: Path) -> dict:
     if not path.exists():
         return {}
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def load_required_json(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Required metadata file not found: {path}. "
+            "Regenerate the FSI cache with EXPORT_CACHE=1 before building the Blender template."
+        )
     with path.open("r", encoding="utf-8") as file:
         return json.load(file)
 
@@ -156,6 +167,14 @@ def keyframe_visibility(obj: bpy.types.Object, *, visible_frame: int, frame_star
     surface_preview.keyframe_visibility(obj, visible_frame=visible_frame, frame_start=frame_start, frame_end=frame_end)
 
 
+def shade_smooth_mesh(obj: bpy.types.Object) -> None:
+    if obj.type != "MESH" or obj.data is None:
+        return
+    for polygon in obj.data.polygons:
+        polygon.use_smooth = True
+    obj.data.update()
+
+
 def set_node_value(node: bpy.types.Node, socket_names: tuple[str, ...], value) -> None:
     for socket_name in socket_names:
         socket = node.inputs.get(socket_name)
@@ -224,6 +243,7 @@ def add_cloth_frame(frame: dict, metadata: dict, mat: bpy.types.Material, frame_
     obj = bpy.data.objects.new(f"Cloth_{frame_index:04d}", mesh)
     bpy.context.collection.objects.link(obj)
     obj.data.materials.append(mat)
+    shade_smooth_mesh(obj)
     keyframe_visibility(obj, visible_frame=frame_index, frame_start=start, frame_end=end)
 
 
@@ -236,6 +256,7 @@ def set_transform(obj: bpy.types.Object, transform: np.ndarray, axis_mode: str) 
 def create_shape_object(record: dict, mat: bpy.types.Material, axis_mode: str) -> bpy.types.Object | None:
     shape_type = str(record.get("type_name", ""))
     scale = tuple(float(v) for v in record.get("scale", [1, 1, 1]))
+    smooth = False
     if shape_type == "box":
         bpy.ops.mesh.primitive_cube_add(size=1.0)
         obj = bpy.context.object
@@ -244,15 +265,19 @@ def create_shape_object(record: dict, mat: bpy.types.Material, axis_mode: str) -
     elif shape_type == "sphere":
         bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=max(scale[0], 1.0e-5))
         obj = bpy.context.object
+        smooth = True
     elif shape_type == "ellipsoid":
         bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=1.0)
         obj = bpy.context.object
         obj.scale = cache_preview.to_blender_scale(scale, axis_mode)
         bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+        smooth = True
     else:
         return None
     obj.name = str(record.get("label", f"shape_{record.get('index', 0)}"))
     obj.data.materials.append(mat)
+    if smooth:
+        shade_smooth_mesh(obj)
     return obj
 
 
@@ -448,7 +473,9 @@ def add_surface_frames(surface_dir: Path, cache_dir: Path, frame_indices: list[i
 def main() -> None:
     args = parse_args()
     config = load_json(args.config)
-    metadata = load_json(args.cache_dir / "metadata.json")
+    if args.fps is not None:
+        config.setdefault("render", {})["fps"] = int(args.fps)
+    metadata = load_required_json(args.cache_dir / "metadata.json")
     frame_indices = parse_frame_indices(args.frame_indices, metadata, args.cache_dir)
     frames = [read_frame(args.cache_dir, frame_index) for frame_index in frame_indices]
     frame_start = min(frame_indices) if frame_indices else 1

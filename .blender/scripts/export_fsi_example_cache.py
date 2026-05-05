@@ -4,6 +4,7 @@ import argparse
 import importlib
 import json
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case-key", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--record-frames", type=int, default=None)
+    parser.add_argument("--render-fps", type=int, default=None)
     parser.add_argument("--test-example-config", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--compress-cache", action=argparse.BooleanOptionalAction, default=True)
@@ -39,6 +41,8 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
@@ -49,6 +53,8 @@ def jsonable(value: Any) -> Any:
         return {str(key): jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [jsonable(item) for item in value]
+    if type(value).__module__.startswith("warp.") and hasattr(value, "__len__") and hasattr(value, "__getitem__"):
+        return [jsonable(value[index]) for index in range(len(value))]
     return value
 
 
@@ -61,7 +67,9 @@ def array_or_empty(value: Any, *, dtype=np.float32, shape: tuple[int, ...] | Non
 def wp_numpy(value: Any) -> np.ndarray:
     if value is None:
         return np.empty((0,), dtype=np.float32)
-    return value.numpy()
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    return np.asarray(value)
 
 
 def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -170,8 +178,8 @@ def wireframes(example) -> list[dict[str, Any]]:
         ends = getattr(example, f"{prefix}_ends", None)
         if starts is None or ends is None:
             continue
-        starts_np = np.asarray(starts, dtype=np.float32).reshape(-1, 3)
-        ends_np = np.asarray(ends, dtype=np.float32).reshape(-1, 3)
+        starts_np = wp_numpy(starts).astype(np.float32, copy=False).reshape(-1, 3)
+        ends_np = wp_numpy(ends).astype(np.float32, copy=False).reshape(-1, 3)
         if starts_np.size == 0 or starts_np.shape != ends_np.shape:
             continue
         records.append({"name": prefix, "starts": starts_np.tolist(), "ends": ends_np.tolist()})
@@ -199,6 +207,25 @@ def cloth_metadata(example) -> dict[str, Any]:
         "triangle_start": None if tri_start is None else int(tri_start),
         "triangle_count": int(len(local[mask])),
         "indices": local[mask].astype(np.int32, copy=False).tolist(),
+    }
+
+
+def boundary_metadata(example) -> dict[str, Any]:
+    boundary = getattr(example, "boundary_model", None)
+    if boundary is None:
+        return {
+            "sample_count": 0,
+            "shape_sample_count": 0,
+            "triangle_sample_count": 0,
+            "spacing": 0.0,
+            "support_radius": 0.0,
+        }
+    return {
+        "sample_count": int(getattr(boundary, "sample_count", 0)),
+        "shape_sample_count": int(getattr(boundary, "shape_sample_count_total", 0)),
+        "triangle_sample_count": int(getattr(boundary, "triangle_sample_count", 0)),
+        "spacing": float(getattr(boundary, "spacing", 0.0)),
+        "support_radius": float(getattr(boundary, "support_radius", 0.0)),
     }
 
 
@@ -231,6 +258,26 @@ def shape_metadata(example) -> dict[str, Any]:
     return {"shapes": records, "body_labels": body_labels}
 
 
+def enum_label(value: Any) -> str:
+    name = getattr(value, "name", None)
+    if name is not None:
+        return str(name).lower()
+    text = str(value)
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text.lower()
+
+
+def timing_metadata(sim_ms: list[float] | None) -> dict[str, Any]:
+    values = [float(value) for value in (sim_ms or [])]
+    avg = float(np.mean(np.asarray(values, dtype=np.float64))) if values else 0.0
+    return {
+        "avg_sim_ms_per_frame": avg,
+        "sim_frame_ms": values,
+        "timed_frame_count": len(values),
+    }
+
+
 def capture_frame(example, record_index: int) -> dict[str, np.ndarray]:
     sl = particle_slice(example)
     particle_q = example.state_0.particle_q.numpy().astype(np.float32, copy=False)
@@ -251,6 +298,15 @@ def capture_frame(example, record_index: int) -> dict[str, np.ndarray]:
     radii = wp_numpy(getattr(example.model, "particle_radius", None)).astype(np.float32, copy=False).reshape(-1)
     if radii.shape[0] >= sl.stop:
         payload["fluid_radii"] = radii[sl]
+    else:
+        scene_config = getattr(example, "config", {})
+        radius = float(
+            scene_config.get(
+                "radius_mean",
+                scene_config.get("fluid_radius", scene_config.get("particle_radius", scene_config.get("cell", 0.006) * 0.43)),
+            )
+        )
+        payload["fluid_radii"] = np.full((sl.stop - sl.start,), radius, dtype=np.float32)
     if hasattr(example, "cloth_particle_start") and hasattr(example, "cloth_particle_count"):
         start = int(getattr(example, "cloth_particle_start"))
         count = int(getattr(example, "cloth_particle_count"))
@@ -265,39 +321,127 @@ def capture_frame(example, record_index: int) -> dict[str, np.ndarray]:
     return payload
 
 
-def metadata(example, case: dict[str, Any], config: dict[str, Any], record_frames: int) -> dict[str, Any]:
+def metadata(
+    example,
+    case: dict[str, Any],
+    config: dict[str, Any],
+    record_frames: int,
+    *,
+    sim_ms: list[float] | None = None,
+    test_example_config: bool = False,
+) -> dict[str, Any]:
     sl = particle_slice(example)
     solver_config = getattr(getattr(example, "fluid_solver", None), "config", None)
+    fsi_config = getattr(getattr(example, "solver", None), "config", None)
     scene_config = getattr(example, "config", {})
     particle_radius = wp_numpy(getattr(example.model, "particle_radius", None)).astype(np.float32, copy=False).reshape(-1)
-    default_radius = float(np.median(particle_radius[sl])) if particle_radius.size and sl.stop <= len(particle_radius) else 0.006
+    default_radius = float(np.median(particle_radius[sl])) if particle_radius.size and sl.stop <= len(particle_radius) else 0.0
+    if default_radius <= 0.0:
+        default_radius = float(
+            scene_config.get(
+                "radius_mean",
+                scene_config.get("fluid_radius", scene_config.get("particle_radius", scene_config.get("cell", 0.006) * 0.43)),
+            )
+        )
+    smoothing_radius = float(getattr(solver_config, "smoothing_radius", scene_config.get("smoothing_radius", 0.0)))
+    if smoothing_radius <= 0.0:
+        smoothing_radius = 4.0 * default_radius
+    floor_y = float(scene_config.get("floor_y", 0.0))
+    tank = {
+        "half_width": float(scene_config.get("container_half_width", scene_config.get("half_width", 0.0))),
+        "half_depth": float(scene_config.get("container_half_depth", scene_config.get("half_depth", 0.0))),
+        "floor_y": floor_y,
+        "top_y": floor_y + 2.0 * float(scene_config.get("wall_half_height", scene_config.get("half_height", 0.0))),
+    }
+    if tank["half_width"] <= 0.0 or tank["half_depth"] <= 0.0 or tank["top_y"] <= tank["floor_y"]:
+        tank = {}
+    render_fps = int(config.get("render", {}).get("fps", 60))
+    cloth_meta = cloth_metadata(example)
+    boundary_meta = boundary_metadata(example)
+    timing = timing_metadata(sim_ms)
+    fluid_iterations = int(getattr(solver_config, "iterations", scene_config.get("ipbf_iterations", 0)))
+    solid_iterations = int(
+        scene_config.get(
+            "vbd_iterations",
+            scene_config.get("rigid_iterations", getattr(getattr(example, "solid_solver", None), "iterations", 0)),
+        )
+    )
+    coupling_iterations = int(getattr(fsi_config, "coupling_iterations", 0))
+    coupling_mode = enum_label(getattr(fsi_config, "mode", ""))
+    particle_count = int(getattr(example.model, "particle_count", 0))
+    body_count = int(getattr(example.model, "body_count", 0))
+    shape_count = int(getattr(example.model, "shape_count", 0))
+    triangle_count = int(getattr(example.model, "tri_count", 0))
     meta = {
+        "name": str(config.get("name", "fsi_experiment_scenes")),
         "key": str(case["key"]),
+        "scene": str(case["key"]),
         "label": str(case.get("label", case["key"])),
         "module": str(case["module"]),
         "group": str(case.get("group", "")),
         "method": "IPBF-VBD FSI",
+        "fluid_solver": "ipbf",
+        "solid_solver": "vbd",
+        "iterations": fluid_iterations,
+        "ipbf_iterations": fluid_iterations,
+        "solid_iterations": solid_iterations,
+        "vbd_iterations": solid_iterations,
+        "coupling_iterations": coupling_iterations,
+        "coupling_mode": coupling_mode,
         "record_frames": int(record_frames),
         "record_initial_frame": bool(config.get("record_initial_frame", True)),
+        "test_example_config": bool(test_example_config),
         "render_frames": [int(value) for value in case.get("render_frames", [])],
         "frame_dt": float(getattr(example, "frame_dt", 0.0)),
         "sim_dt": float(getattr(example, "sim_dt", 0.0)),
         "sim_substeps": int(getattr(example, "sim_substeps", 0)),
         "fps": int(getattr(example, "fps", config.get("render", {}).get("fps", 60))),
+        "particle_count": particle_count,
+        "fluid_particle_count": int(sl.stop - sl.start),
+        "cloth_particle_count": int(cloth_meta.get("particle_count", 0)),
+        "body_count": body_count,
+        "shape_count": shape_count,
+        "triangle_count": triangle_count,
+        "boundary_sample_count": int(boundary_meta.get("sample_count", 0)),
+        "shape_boundary_sample_count": int(boundary_meta.get("shape_sample_count", 0)),
+        "triangle_boundary_sample_count": int(boundary_meta.get("triangle_sample_count", 0)),
+        "avg_sim_ms_per_frame": timing["avg_sim_ms_per_frame"],
+        "sim_frame_ms": timing["sim_frame_ms"],
         "fluid": {
             "particle_start": int(sl.start),
             "particle_count": int(sl.stop - sl.start),
             "particle_radius": default_radius,
             "rest_density": float(getattr(solver_config, "rest_density", scene_config.get("rest_density", 1000.0))),
-            "smoothing_radius": float(getattr(solver_config, "smoothing_radius", scene_config.get("smoothing_radius", 0.0))),
+            "smoothing_radius": smoothing_radius,
+            "iterations": fluid_iterations,
         },
+        "solid": {
+            "solver": "vbd",
+            "iterations": solid_iterations,
+            "particle_count": max(0, particle_count - int(sl.stop - sl.start)),
+            "body_count": body_count,
+            "shape_count": shape_count,
+            "triangle_count": triangle_count,
+        },
+        "coupling": {
+            "mode": coupling_mode,
+            "iterations": coupling_iterations,
+        },
+        "boundary": boundary_meta,
+        "tank": tank,
         "coordinate_system": {"blender_recommended_axis_conversion": config.get("axis_conversion", "newton-y-up-to-blender-z-up")},
         "axis_conversion": config.get("axis_conversion", "newton-y-up-to-blender-z-up"),
         "example_config": jsonable(scene_config),
+        "render": jsonable(config.get("render", {})),
         "camera": jsonable(case.get("camera", {})),
         "wireframes": wireframes(example),
-        "cloth": cloth_metadata(example),
-        "export": {"actual_video_fps": int(config.get("render", {}).get("fps", 60))},
+        "cloth": cloth_meta,
+        "timing": timing,
+        "export": {
+            "actual_video_fps": render_fps,
+            "avg_sim_ms_per_frame": timing["avg_sim_ms_per_frame"],
+            "timed_frame_count": timing["timed_frame_count"],
+        },
     }
     meta.update(shape_metadata(example))
     return meta
@@ -321,9 +465,28 @@ def export_case(case: dict[str, Any], config: dict[str, Any], args: argparse.Nam
 
     print(f"[FSI Example Cache] Export {case['key']} ({record_frames} frames)")
     example = build_example(case, device=args.device, record_frames=record_frames, test_config=args.test_example_config)
+    if args.render_fps is not None:
+        config.setdefault("render", {})["fps"] = int(args.render_fps)
+    sim_ms: list[float] = []
+    meta = metadata(
+        example,
+        case,
+        config,
+        record_frames,
+        sim_ms=sim_ms,
+        test_example_config=args.test_example_config,
+    )
+    write_json(case_dir / "metadata.json", jsonable(meta))
     save_npz(frames_dir / "frame_0000.npz", capture_frame(example, 0), compressed=args.compress_cache)
     for record_index in range(1, record_frames):
-        example.step()
+        try:
+            wp.synchronize_device(example.model.device)
+            start = time.perf_counter()
+            example.step()
+            wp.synchronize_device(example.model.device)
+            sim_ms.append((time.perf_counter() - start) * 1000.0)
+        except Exception as exc:
+            raise RuntimeError(f"Case '{case['key']}' failed while exporting record frame {record_index}.") from exc
         save_npz(
             frames_dir / f"frame_{record_index:04d}.npz",
             capture_frame(example, record_index),
@@ -332,7 +495,14 @@ def export_case(case: dict[str, Any], config: dict[str, Any], args: argparse.Nam
         if record_index % 25 == 0:
             print(f"[FSI Example Cache] {case['key']}: {record_index}/{record_frames}")
 
-    meta = metadata(example, case, config, record_frames)
+    meta = metadata(
+        example,
+        case,
+        config,
+        record_frames,
+        sim_ms=sim_ms,
+        test_example_config=args.test_example_config,
+    )
     write_json(case_dir / "metadata.json", jsonable(meta))
     return {
         "key": str(case["key"]),
@@ -340,6 +510,11 @@ def export_case(case: dict[str, Any], config: dict[str, Any], args: argparse.Nam
         "path": str(case_dir.resolve()),
         "record_frames": record_frames,
         "group": str(case.get("group", "")),
+        "iterations": meta["iterations"],
+        "sim_substeps": meta["sim_substeps"],
+        "fluid_particle_count": meta["fluid_particle_count"],
+        "cloth_particle_count": meta["cloth_particle_count"],
+        "avg_sim_ms_per_frame": meta["avg_sim_ms_per_frame"],
     }
 
 
@@ -348,7 +523,12 @@ def main() -> None:
     config = load_json(args.config)
     output_root = (args.output_root or Path(config.get("cache_root", ".blender/cache/fsi_experiment_scenes"))).resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    panel = {"name": config.get("name", "fsi_experiment_scenes"), "cases": []}
+    panel = {
+        "name": config.get("name", "fsi_experiment_scenes"),
+        "axis_conversion": config.get("axis_conversion", "newton-y-up-to-blender-z-up"),
+        "config_path": str(args.config.resolve()),
+        "cases": [],
+    }
     for case in selected_cases(config, args.case_key):
         panel["cases"].append(export_case(case, config, args, output_root))
     write_json(output_root / "panel_metadata.json", jsonable(panel))
