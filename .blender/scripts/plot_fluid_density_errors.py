@@ -8,6 +8,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import MaxNLocator
 
 
 METRIC_COLUMNS = [
@@ -63,11 +64,21 @@ SOLVER_FALLBACK_COLORS = {
     "ipbf": "#1F77B4",
 }
 
+PANEL_DISPLAY_TITLES = {
+    "fluid_quasi2d_density_panel": "Quasi-2D density",
+    "fluid_quasi2d_box_float_panel": "Float box",
+    "fluid_quasi2d_box_sink_panel": "Sink box",
+}
+
 PANEL_FILE_PREFIXES = {
     "fluid_quasi2d_density_panel": "quasi2d_density",
     "fluid_quasi2d_box_float_panel": "box_float",
     "fluid_quasi2d_box_sink_panel": "box_sink",
 }
+
+TITLE_FONT_SIZE = 18.0
+AXIS_LABEL_FONT_SIZE = 16.0
+TICK_LABEL_FONT_SIZE = 13.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,8 +137,8 @@ def parse_args() -> argparse.Namespace:
         default=99.5,
         help="Percentile of in-range samples used for plot y-limits.",
     )
-    parser.add_argument("--legend-font-size", type=float, default=11.0, help="Legend font size for plots.")
-    parser.add_argument("--line-width", type=float, default=2.4, help="Line width for plotted curves.")
+    parser.add_argument("--legend-font-size", type=float, default=13.0, help="Legend font size for plots.")
+    parser.add_argument("--line-width", type=float, default=2.6, help="Line width for plotted curves.")
     parser.add_argument(
         "--truncate-solvers",
         type=str,
@@ -165,6 +176,10 @@ def safe_file_stem(value: str) -> str:
 
 def panel_file_prefix(panel_name: str) -> str:
     return PANEL_FILE_PREFIXES.get(panel_name, safe_file_stem(panel_name))
+
+
+def panel_display_title(panel_name: str) -> str:
+    return PANEL_DISPLAY_TITLES.get(panel_name, panel_name.replace("_", " "))
 
 
 def find_panel_dirs(cache_root: Path, panel_names: list[str] | None) -> list[Path]:
@@ -335,7 +350,7 @@ def truncate_rows_on_blowup(
     summaries: list[dict[str, Any]] = []
 
     for key in order:
-        case_rows = sorted(grouped[key], key=lambda item: (float(item["sim_time"]), int(item["record_index"])))
+        case_rows = sorted(grouped[key], key=lambda item: (int(item["frame_index"]), int(item["record_index"])))
         cutoff_index: int | None = None
         reason: str | None = None
         if enabled and case_rows and should_truncate_solver(case_rows[0], solver_filter):
@@ -392,8 +407,8 @@ def series_by_case(rows: list[dict[str, Any]], metric: str) -> dict[str, tuple[n
 
     series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for label, case_rows in grouped.items():
-        ordered = sorted(case_rows, key=lambda item: (float(item["sim_time"]), int(item["record_index"])))
-        xs = np.asarray([float(item["sim_time"]) for item in ordered], dtype=np.float64)
+        ordered = sorted(case_rows, key=lambda item: (int(item["frame_index"]), int(item["record_index"])))
+        xs = np.asarray([float(item["frame_index"]) for item in ordered], dtype=np.float64)
         ys = np.asarray([float(item[metric]) for item in ordered], dtype=np.float64)
         series[label] = (xs, ys)
     return series
@@ -422,8 +437,8 @@ def grouped_case_rows(rows: list[dict[str, Any]]) -> list[tuple[str, list[dict[s
 
 
 def case_series(case_rows: list[dict[str, Any]], metric: str) -> tuple[np.ndarray, np.ndarray]:
-    ordered = sorted(case_rows, key=lambda item: (float(item["sim_time"]), int(item["record_index"])))
-    xs = np.asarray([float(item["sim_time"]) for item in ordered], dtype=np.float64)
+    ordered = sorted(case_rows, key=lambda item: (int(item["frame_index"]), int(item["record_index"])))
+    xs = np.asarray([float(item["frame_index"]) for item in ordered], dtype=np.float64)
     ys = np.asarray([float(item[metric]) for item in ordered], dtype=np.float64)
     return xs, ys
 
@@ -444,7 +459,7 @@ def plot_metric(
     legend_font_size: float,
     line_width: float,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(7.6, 4.6), constrained_layout=True)
     for label, case_rows in grouped_case_rows(rows):
         xs, ys = case_series(case_rows, metric)
         ax.plot(xs, ys, linewidth=line_width, label=label, **case_style(case_rows))
@@ -464,9 +479,11 @@ def plot_metric(
         if y_max > 0.0:
             ax.set_ylim(bottom=0.0, top=y_max * 1.18)
 
-    ax.set_title(title)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=TITLE_FONT_SIZE, pad=10)
+    ax.set_xlabel("Frame", fontsize=AXIS_LABEL_FONT_SIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True))
     ax.grid(True, linewidth=0.35, alpha=0.35)
     ax.legend(fontsize=legend_font_size)
     for fmt in formats:
@@ -490,7 +507,7 @@ def plot_box_height(
     if not box_rows:
         return
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(7.6, 4.6), constrained_layout=True)
     for label, case_rows in grouped_case_rows(box_rows):
         xs, ys = case_series(case_rows, "box_y")
         ax.plot(xs, ys, linewidth=line_width, label=label, **case_style(case_rows))
@@ -510,9 +527,11 @@ def plot_box_height(
         padding = max((y_max - y_min) * 0.08, 1.0e-3)
         ax.set_ylim(y_min - padding, y_max + padding)
 
-    ax.set_title("Rigid Body Height")
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Center height (m)")
+    ax.set_title("Rigid body height", fontsize=TITLE_FONT_SIZE, pad=10)
+    ax.set_xlabel("Frame", fontsize=AXIS_LABEL_FONT_SIZE)
+    ax.set_ylabel("Center height (m)", fontsize=AXIS_LABEL_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True))
     ax.grid(True, linewidth=0.35, alpha=0.35)
     ax.legend(fontsize=legend_font_size)
     for fmt in formats:
@@ -570,7 +589,7 @@ def analyze_panel(
         truncation_summary=truncation_summary,
         metric="density_error_max",
         ylabel="Max relative density error",
-        title=f"{panel_name}: max density error",
+        title=f"{panel_display_title(panel_name)}: max density error",
         output_base=panel_output / f"{file_prefix}_density_error_max",
         formats=formats,
         dpi=dpi,
@@ -585,7 +604,7 @@ def analyze_panel(
         truncation_summary=truncation_summary,
         metric="density_error_rms",
         ylabel="RMS relative density error",
-        title=f"{panel_name}: RMS density error",
+        title=f"{panel_display_title(panel_name)}: RMS density error",
         output_base=panel_output / f"{file_prefix}_density_error_rms",
         formats=formats,
         dpi=dpi,
@@ -600,7 +619,7 @@ def analyze_panel(
         truncation_summary=truncation_summary,
         metric="density_error_p95",
         ylabel="95th percentile relative density error",
-        title=f"{panel_name}: p95 density error",
+        title=f"{panel_display_title(panel_name)}: p95 density error",
         output_base=panel_output / f"{file_prefix}_density_error_p95",
         formats=formats,
         dpi=dpi,

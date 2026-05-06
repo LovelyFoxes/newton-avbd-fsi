@@ -8,6 +8,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import MaxNLocator
 
 
 METRIC_COLUMNS = [
@@ -43,11 +44,17 @@ CASE_COLORS = {
     "ipbf_3d_compression": "#D62728",
 }
 
+TITLE_FONT_SIZE = 18.0
+AXIS_LABEL_FONT_SIZE = 16.0
+TICK_LABEL_FONT_SIZE = 13.0
+LEGEND_FONT_SIZE = 13.0
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot metrics from IPBF particle-example caches.")
     parser.add_argument("--cache-root", type=Path, default=Path(".blender/cache/ipbf_particle_examples"))
     parser.add_argument("--output-dir", type=Path, default=Path(".blender/renders/ipbf_particle_metrics"))
+    parser.add_argument("--config", type=Path, default=Path(".blender/config/ipbf_particle_examples.json"))
     parser.add_argument("--case-key", action="append", default=None, help="Only plot the selected case key. Repeatable.")
     parser.add_argument("--include-initial-frame", action="store_true")
     parser.add_argument("--formats", type=str, default="pdf,png,svg")
@@ -75,10 +82,19 @@ def frame_paths(case_dir: Path) -> list[Path]:
 
 
 def case_path(panel_dir: Path, case_entry: dict[str, Any]) -> Path:
-    raw = Path(str(case_entry.get("path", "")))
-    if raw.exists():
+    raw_value = str(case_entry.get("path", ""))
+    raw = Path(raw_value)
+    if raw_value and raw.exists():
         return raw
     return panel_dir / str(case_entry["key"])
+
+
+def load_panel_metadata(cache_root: Path, config_path: Path) -> tuple[str, list[dict[str, Any]]]:
+    panel_metadata = load_json(cache_root / "panel_metadata.json") if (cache_root / "panel_metadata.json").exists() else {}
+    config = load_json(config_path) if config_path.exists() else {}
+    panel_name = str(config.get("name", panel_metadata.get("name", cache_root.name)))
+    cases = config.get("cases") or panel_metadata.get("cases", [])
+    return panel_name, cases
 
 
 def compute_case_rows(
@@ -166,18 +182,20 @@ def plot_metric(
     formats: list[str],
     dpi: int,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(7.6, 4.6), constrained_layout=True)
     for label, case_rows in grouped(rows):
-        ordered = sorted(case_rows, key=lambda item: (float(item["sim_time"]), int(item["record_index"])))
-        xs = np.asarray([float(item["sim_time"]) for item in ordered], dtype=np.float64)
+        ordered = sorted(case_rows, key=lambda item: (int(item["frame_index"]), int(item["record_index"])))
+        xs = np.asarray([float(item["frame_index"]) for item in ordered], dtype=np.float64)
         ys = np.asarray([float(item[metric]) for item in ordered], dtype=np.float64)
         key = str(ordered[0]["case_key"])
         ax.plot(xs, ys, linewidth=2.2, color=CASE_COLORS.get(key), label=label)
-    ax.set_title(title)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=TITLE_FONT_SIZE, pad=10)
+    ax.set_xlabel("Frame", fontsize=AXIS_LABEL_FONT_SIZE)
+    ax.set_ylabel(ylabel, fontsize=AXIS_LABEL_FONT_SIZE)
+    ax.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True))
     ax.grid(True, linewidth=0.35, alpha=0.35)
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=LEGEND_FONT_SIZE)
     output_base.parent.mkdir(parents=True, exist_ok=True)
     for fmt in formats:
         fig.savefig(output_base.with_suffix(f".{fmt}"), dpi=dpi)
@@ -188,16 +206,22 @@ def safe_stem(name: str) -> str:
     return "".join(ch.lower() if ch.isalnum() else "_" for ch in name).strip("_") or "ipbf_examples"
 
 
+def title_for(rows: list[dict[str, Any]], metric_title: str) -> str:
+    labels = {str(row["label"]) for row in rows}
+    if len(labels) == 1:
+        return f"{next(iter(labels))}: {metric_title}"
+    return f"IPBF particle examples: {metric_title}"
+
+
 def main() -> None:
     args = parse_args()
-    panel_metadata = load_json(args.cache_root / "panel_metadata.json")
-    panel_name = str(panel_metadata.get("name", args.cache_root.name))
+    panel_name, case_entries = load_panel_metadata(args.cache_root, args.config)
     selected_keys = set(args.case_key or [])
     prefix = safe_stem(panel_name if not selected_keys else "_".join(sorted(selected_keys)))
     formats = [item.strip().lower() for item in args.formats.split(",") if item.strip()]
 
     all_rows: list[dict[str, Any]] = []
-    for case_entry in panel_metadata["cases"]:
+    for case_entry in case_entries:
         if selected_keys and str(case_entry["key"]) not in selected_keys:
             continue
         case_dir = case_path(args.cache_root, case_entry)
@@ -218,7 +242,7 @@ def main() -> None:
         rows=all_rows,
         metric="density_error_rms",
         ylabel="RMS relative density error",
-        title="IPBF particle examples: RMS density error",
+        title=title_for(all_rows, "RMS density error"),
         output_base=args.output_dir / f"{prefix}_density_error_rms",
         formats=formats,
         dpi=args.dpi,
@@ -227,7 +251,7 @@ def main() -> None:
         rows=all_rows,
         metric="density_error_max",
         ylabel="Max relative density error",
-        title="IPBF particle examples: max density error",
+        title=title_for(all_rows, "max density error"),
         output_base=args.output_dir / f"{prefix}_density_error_max",
         formats=formats,
         dpi=args.dpi,
@@ -236,7 +260,7 @@ def main() -> None:
         rows=all_rows,
         metric="particle_center_y",
         ylabel="Mean particle height (m)",
-        title="IPBF particle examples: mean particle height",
+        title=title_for(all_rows, "mean particle height"),
         output_base=args.output_dir / f"{prefix}_particle_center_y",
         formats=formats,
         dpi=args.dpi,
@@ -245,7 +269,7 @@ def main() -> None:
         rows=all_rows,
         metric="particle_std_xz",
         ylabel="Horizontal spread (m)",
-        title="IPBF particle examples: horizontal spread",
+        title=title_for(all_rows, "horizontal spread"),
         output_base=args.output_dir / f"{prefix}_particle_spread_xz",
         formats=formats,
         dpi=args.dpi,
@@ -254,7 +278,7 @@ def main() -> None:
         rows=all_rows,
         metric="max_speed",
         ylabel="Max particle speed (m/s)",
-        title="IPBF particle examples: max particle speed",
+        title=title_for(all_rows, "max particle speed"),
         output_base=args.output_dir / f"{prefix}_max_speed",
         formats=formats,
         dpi=args.dpi,
