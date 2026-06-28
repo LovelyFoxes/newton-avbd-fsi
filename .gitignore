@@ -81,3 +81,5 @@ docs/_static/viser/
 /.warp-cache
 /.blender/renders
 /.blender/usd
+/.codex_tmp
+/.blender
