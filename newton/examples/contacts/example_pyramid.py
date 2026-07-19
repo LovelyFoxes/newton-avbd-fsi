@@ -17,14 +17,14 @@ import warp as wp
 import newton
 import newton.examples
 
-DEFAULT_NUM_PYRAMIDS = 20
-DEFAULT_PYRAMID_SIZE = 20
+DEFAULT_NUM_PYRAMIDS = 25
+DEFAULT_PYRAMID_SIZE = 40
 CUBE_HALF = 0.4
 CUBE_SPACING = 2.1 * CUBE_HALF
 PYRAMID_SPACING = 2.0 * CUBE_SPACING
 Y_STACK = 15.0
 
-WRECKING_BALL_RADIUS = 2.0
+WRECKING_BALL_RADIUS = 5.0
 WRECKING_BALL_DENSITY_MULT = 100.0
 RAMP_LENGTH = 20.0
 RAMP_WIDTH = 5.0
@@ -43,6 +43,7 @@ class Example:
         self.sim_dt = self.frame_dt / self.sim_substeps
 
         self.viewer = viewer
+        self.viewer._paused = True
         self.test_mode = args.test
         self.world_count = args.world_count
 
